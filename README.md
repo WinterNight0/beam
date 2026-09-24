@@ -83,8 +83,66 @@ printf '# beam known_peers v1\nbob    ed25519 %s  added=2026-01-01T00:00:00Z\n' 
 head -c 5M /dev/urandom > payload.bin      # something worth sending
 ```
 
-On Windows use `$env:BEAM_DIR` and `%USERPROFILE%\beam-demo` instead; the
-commands are otherwise identical.
+<details>
+<summary><strong>The same setup in PowerShell</strong></summary>
+
+Every command below was run on Windows PowerShell 5.1.
+
+```powershell
+$demo = "$env:USERPROFILE\beam-demo"
+New-Item -ItemType Directory -Force -Path "$demo\alice", "$demo\bob", "$demo\inbox" | Out-Null
+Set-Location $demo
+
+$env:BEAM_DIR = "$demo\alice"; beam init
+$env:BEAM_DIR = "$demo\bob";   beam init
+
+# Each side stores the other's public key, which `beam pair` will automate in M4.
+$env:BEAM_DIR = "$demo\alice"; $aliceKey = (beam whoami --json | ConvertFrom-Json).public_key
+$env:BEAM_DIR = "$demo\bob";   $bobKey   = (beam whoami --json | ConvertFrom-Json).public_key
+
+"# beam known_peers v1`nalice  ed25519 $aliceKey  added=2026-01-01T00:00:00Z" |
+    Set-Content "$demo\bob\known_peers" -Encoding utf8
+"# beam known_peers v1`nbob  ed25519 $bobKey  added=2026-01-01T00:00:00Z" |
+    Set-Content "$demo\alice\known_peers" -Encoding utf8
+
+# 5 MiB of something worth sending
+$bytes = New-Object byte[] (5MB)
+(New-Object Random 1).NextBytes($bytes)
+[System.IO.File]::WriteAllBytes("$demo\payload.bin", $bytes)
+
+beam peers        # should list the other side
+```
+
+`Set-Content -Encoding utf8` writes a byte-order mark on PowerShell 5.1. beam
+ignores a leading BOM in `known_peers` for exactly this reason, so the natural
+command works rather than failing with a baffling parse error on line 1.
+
+**Terminal 1 — the receiver.**
+
+```powershell
+$demo = "$env:USERPROFILE\beam-demo"
+$env:BEAM_DIR = "$demo\bob"
+beam listen --addr 127.0.0.1:7777 --out "$demo\inbox"
+```
+
+**Terminal 2 — the sender.**
+
+```powershell
+$demo = "$env:USERPROFILE\beam-demo"
+$env:BEAM_DIR = "$demo\alice"
+beam send bob "$demo\payload.bin" --addr 127.0.0.1:7777
+```
+
+Answer the prompt in terminal 1 with `y`, then check the two hashes match:
+
+```powershell
+Get-FileHash "$demo\payload.bin" -Algorithm SHA256
+Get-FileHash "$demo\inbox\payload.bin" -Algorithm SHA256
+```
+
+The table of things to try below applies unchanged; only the shell differs.
+
+</details>
 
 **Terminal 1 — the receiver.**
 

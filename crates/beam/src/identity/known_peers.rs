@@ -153,6 +153,13 @@ impl KnownPeers {
 
     /// Parses the contents of a `known_peers` file.
     pub fn parse(data: &str) -> Result<Self, ParseError> {
+        // Several Windows editors, and PowerShell 5.1's `Set-Content -Encoding
+        // utf8`, put a byte-order mark at the start of a file. It is not
+        // whitespace, so without this the first line would be read as a peer
+        // entry and rejected — a baffling failure for a file that looks
+        // perfectly fine in an editor.
+        let data = data.strip_prefix('\u{feff}').unwrap_or(data);
+
         let mut lines = Vec::new();
         let mut names: Vec<(String, usize)> = Vec::new();
         let mut keys: Vec<(String, String)> = Vec::new();
@@ -414,6 +421,16 @@ mod tests {
             }],
             "an unknown attribute was not preserved"
         );
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_ignored() {
+        // What PowerShell 5.1 writes with `Set-Content -Encoding utf8`, which
+        // is what a Windows user following the README would most naturally
+        // reach for.
+        let input = format!("\u{feff}{}", line_for(0, "alice"));
+        let known = KnownPeers::parse(&input).expect("a BOM should not break parsing");
+        assert!(known.lookup("alice").is_some());
     }
 
     #[test]

@@ -23,6 +23,7 @@ pull request (ADR-0014), so the gate is enforced rather than remembered.
 | Integration | `crates/beam/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
 | Failure | `crates/beam/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
 | Security | `tests/transfer.rs::accept_rules`, `tests/cli.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
+| End to end | `crates/beam/tests/end_to_end.rs` | two real `beam` processes, talking over a real socket, with the prompt answered only once it has actually appeared |
 
 Command-level tests never spawn a process and never touch the real `~/.beam`:
 every test gets a `TempDir` passed via the `--beam-dir` flag. Lints are part of
@@ -77,6 +78,36 @@ the gate, not advisory — `clippy` runs with `-D warnings` and the workspace se
 | Refusal | a declined transfer leaves nothing on disk |
 | Integrity (S-12) | a chunk whose bytes do not match its announced hash is refused and asked for again, and only the correct bytes are written; a chunk that never verifies fails the transfer with nothing written; the sender re-sends a chunk it is NAKed |
 | Malformed requests | a replayed transfer id is refused without a prompt (S-11); a hostile file name is refused before anything is created; a chunk count that does not match the declared size is refused |
+
+### End-to-end tests — `tests/end_to_end.rs`
+
+Every other test calls the library directly. That is fast, and blind to
+anything that only goes wrong in a whole program.
+
+The bug that prompted these tests is the example. `main.rs` held a `StdoutLock`
+for the duration of the run, so the thread that draws the Accept prompt blocked
+forever the first time it tried to write to stdout. Every unit test, every
+command test and all nineteen engine tests passed. The program was unusable.
+
+These tests spawn `beam listen` and `beam send` as real processes and **wait for
+the prompt to appear on the child's output before answering it**. That is the
+part that matters: a prompt that never arrives is a timeout and a failed test,
+not a mystery discovered by hand later.
+
+| Test | What it covers |
+|------|----------------|
+| `two_processes_complete_a_transfer` | `listen` on port 0 reports the address it actually got; the prompt appears and names the sender and fingerprint; answering `y` completes the transfer; the received bytes equal the sent bytes; both processes exit cleanly |
+| `answering_no_between_two_processes_saves_nothing` | answering `n` is honoured across the process boundary: the sender exits non-zero and is told it was declined, and nothing is written |
+
+**No pseudo-terminal is involved, and these run on Windows CI.** The prompt is
+written to stdout whether or not stdout is a terminal, and the deadlock was
+about the lock rather than the tty, so pipes reproduce it. Output is pumped a
+byte at a time because the prompt ends in `[y/N]: ` with no newline — a
+line-buffered reader would not see it until something else produced a newline,
+which is a mistake worth recording since it cost an afternoon during M2.
+
+The child's stdout and stderr are merged into one stream, because beam reports a
+completed transfer on stdout and a refused one on stderr.
 
 ### The six Accept rules — `tests/transfer.rs::accept_rules` and `tests/cli.rs`
 
@@ -137,5 +168,7 @@ warning and does not update `known_peers` (S-8); the progress line reports
   the real stdout from a blocking thread. What it shows is asserted through
   the engine instead, in `s6_the_prompt_shows_who_what_and_how_big`.
 - `beam listen` blocks until a peer connects, so its success path has no
-  command-level test; it is covered by the two-process run in the manual
-  script in `README.md` and by the engine's integration tests.
+  *command-level* test; it is covered by `tests/end_to_end.rs`, which runs it as
+  a real process, and by the manual walkthrough in `README.md`.
+- The progress line's rendering is not asserted anywhere. It adapts to whether
+  stdout is a terminal, and the end-to-end tests see the non-terminal form.
