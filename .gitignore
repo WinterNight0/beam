@@ -11,3 +11,7 @@
 .idea/
 .DS_Store
 Thumbs.db
+
+# spike crates build into their own target directories
+/spike/*/target/
+/spike/*/*/target/

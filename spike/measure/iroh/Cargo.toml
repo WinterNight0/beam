@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "probe-iroh"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+iroh = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }

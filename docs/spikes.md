@@ -8,6 +8,9 @@ otherwise.
 
 ## SPIKE-001 — P2P transport library
 
+**Status: complete (2026-09-24). Findings in [`spikes/transport.md`](spikes/transport.md);
+recommendation is iroh, awaiting a decision. An ADR follows the decision.**
+
 **Run before:** M4 (signaling server and pairing)
 **Timebox:** 2 days
 **Outcome:** an ADR recording the choice and the runner-up
