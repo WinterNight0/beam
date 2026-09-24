@@ -616,10 +616,10 @@ where
         };
 
         if start.index != index {
-            return Err(TransferError::OutOfOrder {
-                expected: "the next chunk in order",
-                got: "a chunk out of order",
-            });
+            return Err(TransferError::BadRequest(format!(
+                "expected chunk {index} next, but the peer sent chunk {}",
+                start.index
+            )));
         }
         // Bounds the buffer below: a peer cannot make us reserve more than the
         // size it already committed to in the request.

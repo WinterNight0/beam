@@ -163,6 +163,10 @@ enum Command {
         /// Where to connect. Development only; peer discovery arrives in M4.
         #[arg(long, hide = true, value_name = "HOST:PORT")]
         addr: Option<SocketAddr>,
+        /// Chunk size in bytes. Development only; it exists so tests can make
+        /// a small file span many chunks without writing gigabytes.
+        #[arg(long, hide = true, value_name = "BYTES")]
+        chunk_size: Option<u32>,
     },
 
     /// List or clear partially received transfers
@@ -276,14 +280,19 @@ impl App {
             Command::Listen { addr, out } => {
                 self.listen(addr.unwrap_or(DEFAULT_LISTEN_ADDR), out, io)
             }
-            Command::Send { peer, file, addr } => {
+            Command::Send {
+                peer,
+                file,
+                addr,
+                chunk_size,
+            } => {
                 let addr = addr.ok_or_else(|| {
                     CommandError::Message(
                         "M2 needs `--addr <host:port>` to reach the peer;                          finding a peer by name arrives in M4"
                             .to_string(),
                     )
                 })?;
-                self.send(&peer, &file, addr, io)
+                self.send(&peer, &file, addr, chunk_size, io)
             }
             Command::Transfers { clear, id, yes } => self.transfers(clear, id.as_deref(), yes, io),
             Command::Newcode => Err(stubs::not_implemented("newcode", "M4")),

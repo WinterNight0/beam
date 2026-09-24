@@ -441,3 +441,156 @@ fn help_lists_every_planned_command() {
         );
     }
 }
+
+/// Writes a fake partial transfer, the way an interrupted session would leave
+/// one, so the listing and clearing commands can be tested without a peer.
+fn seed_partial(dir: &Path, id: &str, file_name: &str, size: u64, have_chunks: u32) {
+    let work = dir.join("tmp").join(id);
+    std::fs::create_dir_all(&work).expect("create partial dir");
+
+    let chunk_size = 1024u32;
+    let chunk_count = size.div_ceil(u64::from(chunk_size)) as u32;
+    let mut bits = vec![0u8; chunk_count.div_ceil(8) as usize];
+    for i in 0..have_chunks.min(chunk_count) {
+        bits[(i / 8) as usize] |= 1 << (i % 8);
+    }
+    use base64::Engine as _;
+    let have = base64::engine::general_purpose::STANDARD.encode(&bits);
+
+    let state = serde_json::json!({
+        "version": 1,
+        "peer_fingerprint": "SHA256:0000000000000000000000000000000000000000000000000000000000000000",
+        "file_name": file_name,
+        "file_sha256": "0".repeat(64),
+        "size": size,
+        "chunk_size": chunk_size,
+        "chunk_count": chunk_count,
+        "created": "2026-09-01T00:00:00Z",
+        "updated": "2026-09-01T00:00:00Z",
+        "have": have,
+    });
+    std::fs::write(
+        work.join("state.json"),
+        serde_json::to_string_pretty(&state).expect("serialise"),
+    )
+    .expect("write state");
+    std::fs::write(work.join("part"), vec![0u8; size as usize]).expect("write part");
+}
+
+#[test]
+fn transfers_says_so_when_there_are_none() {
+    let (_tmp, dir) = initialised();
+    let outcome = run(&dir, "", &["transfers"]);
+    assert_eq!(outcome.code, EXIT_OK, "{}", outcome.stderr);
+    assert!(
+        outcome.stdout.contains("No partially received transfers"),
+        "{}",
+        outcome.stdout
+    );
+}
+
+#[test]
+fn transfers_lists_what_is_partly_received() {
+    let (_tmp, dir) = initialised();
+    seed_partial(&dir, "aaaabbbbccccdddd", "project.zip", 10_240, 5);
+
+    let outcome = run(&dir, "", &["transfers"]);
+    assert_eq!(outcome.code, EXIT_OK, "{}", outcome.stderr);
+    for expected in ["ID", "FILE", "project.zip", "50%"] {
+        assert!(
+            outcome.stdout.contains(expected),
+            "listing is missing {expected:?}:\n{}",
+            outcome.stdout
+        );
+    }
+
+    let json: Value =
+        serde_json::from_str(&run(&dir, "", &["transfers", "--json"]).stdout).expect("valid JSON");
+    let list = json.as_array().expect("an array");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["file_name"], "project.zip");
+    assert_eq!(list[0]["percent"], 50);
+    assert_eq!(
+        list[0]["expired"], true,
+        "a partial from 2026-09-01 is stale"
+    );
+}
+
+#[test]
+fn clearing_transfers_asks_first() {
+    let (_tmp, dir) = initialised();
+    seed_partial(&dir, "aaaabbbbccccdddd", "project.zip", 10_240, 5);
+
+    // Declining keeps it, exactly like `beam remove`.
+    let declined = run(&dir, "n\n", &["transfers", "--clear"]);
+    assert_eq!(declined.code, EXIT_OK, "{}", declined.stderr);
+    assert!(declined.stdout.contains("Cancelled"), "{}", declined.stdout);
+    assert!(
+        run(&dir, "", &["transfers"]).stdout.contains("project.zip"),
+        "a declined clear deleted the partial anyway"
+    );
+
+    // The prompt says what is about to be lost.
+    assert!(
+        declined.stdout.contains("project.zip") && declined.stdout.contains("of"),
+        "the confirmation did not say what would be discarded:\n{}",
+        declined.stdout
+    );
+
+    let confirmed = run(&dir, "y\n", &["transfers", "--clear"]);
+    assert_eq!(confirmed.code, EXIT_OK, "{}", confirmed.stderr);
+    assert!(
+        run(&dir, "", &["transfers"])
+            .stdout
+            .contains("No partially received transfers"),
+        "the partial survived a confirmed clear"
+    );
+}
+
+#[test]
+fn clearing_one_transfer_leaves_the_others() {
+    let (_tmp, dir) = initialised();
+    seed_partial(&dir, "aaaabbbbccccdddd", "keep-me.zip", 4_096, 2);
+    seed_partial(&dir, "11112222333344ff", "delete-me.zip", 4_096, 2);
+
+    // The id may be given in the short form the listing prints.
+    let outcome = run(&dir, "", &["transfers", "--clear", "11112222", "--yes"]);
+    assert_eq!(outcome.code, EXIT_OK, "{}", outcome.stderr);
+
+    let listing = run(&dir, "", &["transfers"]).stdout;
+    assert!(listing.contains("keep-me.zip"), "{listing}");
+    assert!(!listing.contains("delete-me.zip"), "{listing}");
+}
+
+#[test]
+fn clearing_an_unknown_transfer_is_an_error() {
+    let (_tmp, dir) = initialised();
+    seed_partial(&dir, "aaaabbbbccccdddd", "project.zip", 4_096, 2);
+
+    let outcome = run(
+        &dir,
+        "",
+        &["transfers", "--clear", "nothing-like-this", "--yes"],
+    );
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(
+        outcome.stderr.contains("no partial transfer starts with"),
+        "{}",
+        outcome.stderr
+    );
+}
+
+#[test]
+fn an_ambiguous_transfer_id_is_refused_rather_than_guessed() {
+    let (_tmp, dir) = initialised();
+    seed_partial(&dir, "aaaa1111", "one.zip", 4_096, 2);
+    seed_partial(&dir, "aaaa2222", "two.zip", 4_096, 2);
+
+    let outcome = run(&dir, "", &["transfers", "--clear", "aaaa", "--yes"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(outcome.stderr.contains("matches 2"), "{}", outcome.stderr);
+    assert!(
+        run(&dir, "", &["transfers"]).stdout.contains("one.zip"),
+        "an ambiguous id deleted something anyway"
+    );
+}

@@ -217,6 +217,7 @@ impl App {
         peer_name: &str,
         file: &Path,
         addr: SocketAddr,
+        chunk_size: Option<u32>,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
         let (identity, known_peers) = self.identity_and_peers()?;
@@ -237,6 +238,14 @@ impl App {
 
         let mut options = SendOptions::new(file, encode_public_key(&identity.verifying_key()));
         options.accept_timeout = DEFAULT_ACCEPT_TIMEOUT;
+        if let Some(chunk_size) = chunk_size {
+            if chunk_size == 0 {
+                return Err(CommandError::Message(
+                    "--chunk-size must be at least 1".to_string(),
+                ));
+            }
+            options.chunk_size = chunk_size;
+        }
 
         let runtime = self.runtime()?;
         let result = runtime.block_on(async {

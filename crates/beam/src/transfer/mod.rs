@@ -28,7 +28,7 @@ pub use message::{
     Reject, RejectReason, TransferId, TransferRequest,
 };
 pub use partial::{
-    DEFAULT_MAX_AGE, Partial, PartialError, PartialKey, PartialStore, PartialSummary,
+    DEFAULT_MAX_AGE, Partial, PartialError, PartialKey, PartialState, PartialStore, PartialSummary,
 };
 pub use paths::{NameError, reserve_destination, sanitize_file_name};
 pub use receiver::{Prompt, PromptRequest, ReceiveOptions, ReceiveSummary, receive_file};

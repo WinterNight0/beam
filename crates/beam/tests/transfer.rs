@@ -31,6 +31,7 @@ use tempfile::TempDir;
 #[derive(Clone)]
 struct ScriptedPrompt {
     answer: bool,
+    thinking: Duration,
     asked: Arc<Mutex<Vec<PromptRequest>>>,
 }
 
@@ -38,7 +39,20 @@ impl ScriptedPrompt {
     fn new(answer: bool) -> Self {
         Self {
             answer,
+            thinking: Duration::ZERO,
             asked: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A prompt that takes a moment, as a person does.
+    ///
+    /// Needed by any test that turns on something arriving *while* the prompt
+    /// is open: a prompt answering in nanoseconds can win a race no real person
+    /// would, which makes such a test flaky rather than strict.
+    fn deliberate(answer: bool) -> Self {
+        Self {
+            thinking: Duration::from_millis(300),
+            ..Self::new(answer)
         }
     }
 
@@ -50,6 +64,9 @@ impl ScriptedPrompt {
 impl Prompt for ScriptedPrompt {
     fn confirm(&mut self, request: &PromptRequest) -> std::io::Result<bool> {
         self.asked.lock().expect("prompt log").push(request.clone());
+        if !self.thinking.is_zero() {
+            std::thread::sleep(self.thinking);
+        }
         Ok(self.answer)
     }
 }
@@ -357,7 +374,7 @@ mod accept_rules {
     async fn s4_data_before_accept_aborts_and_discards() {
         let pair = paired();
         let dirs = dirs();
-        let prompt = ScriptedPrompt::new(true);
+        let prompt = ScriptedPrompt::deliberate(true);
 
         let (mut client, server) = tokio::io::duplex(64 * 1024);
 

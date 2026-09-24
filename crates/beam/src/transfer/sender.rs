@@ -31,6 +31,9 @@ pub struct SendOptions {
     pub sender_public_key: String,
     /// How long to wait for the peer to answer the prompt.
     pub accept_timeout: Duration,
+    /// The chunk size to propose. Configurable so tests can make a small file
+    /// span several chunks without writing gigabytes.
+    pub chunk_size: u32,
     /// How many times to re-send a chunk that failed its hash.
     pub max_chunk_attempts: u32,
     /// How the peers are connected, for the progress line.
@@ -44,6 +47,7 @@ impl SendOptions {
             path: path.into(),
             sender_public_key: public_key.into(),
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
+            chunk_size: CHUNK_SIZE,
             max_chunk_attempts: DEFAULT_CHUNK_ATTEMPTS,
             path_kind: PathKind::Direct,
         }
@@ -79,7 +83,7 @@ where
     // Hash the whole file first, so file_sha256 binds this transfer to exact
     // contents before the peer is asked to agree to anything.
     let (file_sha256, size) = hash_whole_file(&options.path, reporter).await?;
-    let plan = ChunkPlan::new(size, CHUNK_SIZE);
+    let plan = ChunkPlan::new(size, options.chunk_size.max(1));
 
     let transfer_id = TransferId::generate().map_err(|e| {
         TransferError::io(
@@ -119,7 +123,9 @@ where
         .map_err(|e| TransferError::io("open", options.path.display(), e))?;
 
     let mut sent = 0u64;
-    for index in 0..plan.chunk_count() {
+    // Only what the receiver said it has not got. On a first attempt that is
+    // every chunk; on a resume it is the gap.
+    for index in have.missing() {
         let bytes = read_chunk(&mut file, &options.path, plan, index).await?;
         send_chunk(
             stream,
@@ -131,7 +137,7 @@ where
         .await?;
         sent += bytes.len() as u64;
         reporter.report(Progress::Transferring {
-            done: sent,
+            done: skipped + sent,
             total: size,
             path: options.path_kind,
         });

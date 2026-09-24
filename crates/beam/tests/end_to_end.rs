@@ -309,3 +309,190 @@ fn answering_no_between_two_processes_saves_nothing() {
         "a declined transfer saved something"
     );
 }
+
+/// Kills a process mid-transfer and resumes, for real.
+///
+/// The in-process resume tests model an interruption by dropping a future.
+/// These kill an operating-system process instead, which is the case the
+/// crash-consistency rules in ADR-0022 actually exist for: a `SIGKILL` gives
+/// nothing a chance to tidy up, so what survives is exactly what had already
+/// reached the disk.
+mod killed {
+    use super::*;
+
+    /// A chunk size small enough that a 2 MiB file takes a while in chunks.
+    const CHUNK: &str = "65536";
+
+    /// Runs a transfer, kills `victim` once some chunks have landed, then runs
+    /// it again and checks the file arrives intact.
+    fn interrupt_and_resume(victim: Victim) {
+        let demo = demo(2 * 1024 * 1024);
+        let work = demo.bob.join("tmp");
+
+        // --- first attempt, cut short -------------------------------------
+        {
+            let mut listener = Watched::spawn(
+                &demo.bob,
+                &[
+                    "listen",
+                    "--addr",
+                    "127.0.0.1:0",
+                    "--out",
+                    demo.inbox.to_str().expect("utf-8 path"),
+                ],
+            );
+            let addr = listener.listening_on();
+
+            let mut sender = Command::new(BEAM)
+                .args([
+                    "send",
+                    "bob",
+                    demo.payload.to_str().expect("utf-8 path"),
+                    "--addr",
+                    &addr,
+                    "--chunk-size",
+                    CHUNK,
+                ])
+                .env("BEAM_DIR", &demo.alice)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn send");
+
+            listener.wait_for("[y/N]: ");
+            listener.answer("y");
+
+            wait_for_partial_progress(&work);
+
+            match victim {
+                Victim::Sender => {
+                    sender.kill().expect("kill the sender");
+                    let _ = sender.wait();
+                }
+                Victim::Receiver => {
+                    // Dropping `Watched` kills the listener.
+                    drop(listener);
+                    let _ = sender.kill();
+                    let _ = sender.wait();
+                }
+            }
+        }
+
+        let carried = partial_chunks(&work);
+        assert!(
+            carried > 0,
+            "nothing survived the interruption, so there is nothing to resume"
+        );
+        assert!(
+            !demo.inbox.join("payload.bin").exists(),
+            "an interrupted transfer produced a file"
+        );
+
+        // --- second attempt, all the way ----------------------------------
+        let mut listener = Watched::spawn(
+            &demo.bob,
+            &[
+                "listen",
+                "--addr",
+                "127.0.0.1:0",
+                "--out",
+                demo.inbox.to_str().expect("utf-8 path"),
+            ],
+        );
+        let addr = listener.listening_on();
+
+        let sender = Command::new(BEAM)
+            .args([
+                "send",
+                "bob",
+                demo.payload.to_str().expect("utf-8 path"),
+                "--addr",
+                &addr,
+                "--chunk-size",
+                CHUNK,
+            ])
+            .env("BEAM_DIR", &demo.alice)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn send");
+
+        // Every resume is accepted afresh (S-2), and the prompt says so.
+        listener.wait_for("Incoming file (resuming)");
+        listener.wait_for("Already have");
+        listener.wait_for("[y/N]: ");
+        listener.answer("y");
+        listener.wait_for("saved as payload.bin");
+
+        let sent = sender.wait_with_output().expect("wait for send");
+        assert!(
+            sent.status.success(),
+            "the resumed send failed: {}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+        let said = String::from_utf8_lossy(&sent.stdout);
+        assert!(
+            said.contains("already there"),
+            "the sender did not report skipping anything: {said}"
+        );
+
+        assert_eq!(
+            std::fs::read(demo.inbox.join("payload.bin")).expect("read result"),
+            std::fs::read(&demo.payload).expect("read source"),
+            "the resumed file differs from the one that was sent"
+        );
+    }
+
+    enum Victim {
+        Sender,
+        Receiver,
+    }
+
+    #[test]
+    fn killing_the_sender_mid_transfer_then_resuming() {
+        interrupt_and_resume(Victim::Sender);
+    }
+
+    #[test]
+    fn killing_the_receiver_mid_transfer_then_resuming() {
+        interrupt_and_resume(Victim::Receiver);
+    }
+
+    /// Waits until a partial reports at least two stored chunks.
+    fn wait_for_partial_progress(work: &Path) {
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            if partial_chunks(work) >= 2 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no chunks reached the disk within {PATIENCE:?}");
+    }
+
+    /// How many chunks the partials under `work` claim, read straight from the
+    /// state files rather than through beam, so the test is checking the disk.
+    fn partial_chunks(work: &Path) -> u32 {
+        let Ok(entries) = std::fs::read_dir(work) else {
+            return 0;
+        };
+        let mut total = 0;
+        for entry in entries.flatten() {
+            let state = entry.path().join("state.json");
+            let Ok(text) = std::fs::read_to_string(&state) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let Some(have) = json["have"].as_str() else {
+                continue;
+            };
+            use base64::Engine as _;
+            if let Ok(bits) = base64::engine::general_purpose::STANDARD.decode(have) {
+                total += bits.iter().map(|b| b.count_ones()).sum::<u32>();
+            }
+        }
+        total
+    }
+}
