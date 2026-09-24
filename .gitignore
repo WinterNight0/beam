@@ -1,0 +1,15 @@
+# build output
+/bin/
+*.exe
+*.exe~
+*.test
+
+# local beam state accidentally created in the repo
+/.beam/
+/.beam-test/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
