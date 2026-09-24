@@ -89,22 +89,20 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(&Sha256::digest(bytes))
 }
 
-/// How much of a hashing pass is done, for the progress line.
-pub type HashProgress<'a> = &'a mut dyn FnMut(u64, u64);
-
 /// Reads a stream to the end and returns its SHA-256 and its length.
 ///
 /// The sender hashes the whole file before it sends the request, so that
 /// `file_sha256` binds it to exact contents from the outset. On a large file
 /// that pass takes a while with nothing else happening, so `progress` is called
 /// as it goes and the caller can say so rather than looking frozen.
-pub async fn hash_stream<R>(
+pub async fn hash_stream<R, F>(
     reader: &mut R,
     total: u64,
-    progress: HashProgress<'_>,
+    mut progress: F,
 ) -> std::io::Result<(String, u64)>
 where
     R: AsyncRead + Unpin,
+    F: FnMut(u64, u64),
 {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 256 * 1024];
@@ -218,7 +216,7 @@ mod tests {
         let mut reader = data.as_slice();
 
         let mut seen = Vec::new();
-        let (digest, len) = hash_stream(&mut reader, data.len() as u64, &mut |done, total| {
+        let (digest, len) = hash_stream(&mut reader, data.len() as u64, |done, total| {
             seen.push((done, total))
         })
         .await
@@ -236,9 +234,7 @@ mod tests {
     #[tokio::test]
     async fn hashing_an_empty_stream_reports_the_empty_digest() {
         let mut reader: &[u8] = &[];
-        let (digest, len) = hash_stream(&mut reader, 0, &mut |_, _| {})
-            .await
-            .expect("hash");
+        let (digest, len) = hash_stream(&mut reader, 0, |_, _| {}).await.expect("hash");
         assert_eq!(digest, sha256_hex(b""));
         assert_eq!(len, 0);
     }
