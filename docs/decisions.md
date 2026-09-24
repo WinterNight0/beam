@@ -355,3 +355,198 @@ seconds and keeps the job definition uniform. macOS is deliberately not in the
 matrix yet: no code is macOS-specific, and the runners are the expensive ones.
 Add it when a milestone introduces platform-specific behaviour beyond the Unix
 and Windows split that already exists.
+
+---
+
+## ADR-0015 — Framing: length-prefixed frames, with chunks kept separate
+
+**Status:** accepted (M2)
+
+**Context.** CLAUDE.md leaves the message encoding open ("JSON or length-prefixed
+binary, decide in design"). Two sizes are in play and conflating them would be a
+mistake: a *chunk* is 4 MiB and is the unit of hashing and, from M3, of resume; a
+*frame* is what one read off the wire produces.
+
+**Decision.** Every message is one frame:
+
+```
+[1 byte type][4 bytes u32 big-endian payload length][payload]
+```
+
+with the payload capped at 64 KiB. A 4 MiB chunk is announced by one
+`CHUNK_START` frame and then carried by about 64 `CHUNK_DATA` frames. Control
+payloads are JSON with `deny_unknown_fields`; `CHUNK_DATA` payloads are raw
+binary prefixed with the chunk index.
+
+The declared length is compared with the limit **before any buffer is
+allocated**. A peer announcing a four-gigabyte frame costs five bytes of work.
+
+**Chunk hashes live in `CHUNK_START`, not in `TRANSFER_REQUEST`.** This departs
+from the sketch in CLAUDE.md. A 10 GiB file is 2560 chunks, and 2560 hashes is
+about 80 KiB raw and more once encoded — past the frame limit. Keeping them in
+the request would mean two different limits, one for control frames and one for
+data, which is two chances to get a bound wrong. Moving them makes one limit
+cover the whole protocol, and costs nothing: the hash for a chunk still arrives
+before that chunk's bytes, so the receiver still verifies before writing.
+
+**Integrity is anchored by `file_sha256` in `TRANSFER_REQUEST`.** That value is
+committed before the receiver agrees to anything, and the assembled file is
+checked against it before the destination name is even reserved. Per-chunk
+hashes localise damage so a single bad chunk can be re-requested instead of the
+whole file; they are not what makes the transfer trustworthy end to end. A
+sender that lies about a chunk hash is caught by the whole-file hash regardless.
+
+**Consequences.** One limit to enforce, one place to enforce it. JSON control
+messages stay readable in a packet dump and cost a few hundred bytes each, which
+is irrelevant next to the payload. `deny_unknown_fields` means a peer inventing
+fields is refused rather than half-understood — the opposite of the choice made
+for `known_peers` attributes in ADR-0005, and deliberately so: an unknown
+attribute in a local file the user may have edited is probably a newer beam,
+while an unknown field arriving over a socket is probably a probe.
+
+This also sets up M3: `ACCEPT` already carries a `have_bitmap` field, always
+`None` in M2, so adding resume does not change the wire format.
+
+---
+
+## ADR-0016 — The transfer engine is generic over its byte stream
+
+**Status:** accepted (M2)
+
+**Context.** M2 runs over TCP, M5 replaces that with a WebRTC data channel, and
+M7 adds a relay. The transfer engine must not be rewritten each time.
+
+**Decision.** `send_file` and `receive_file` are generic over
+`AsyncRead + AsyncWrite + Unpin`. There is no transport trait of beam's own: the
+tokio traits already say everything the engine needs. `PathKind` is carried
+alongside, purely so the progress line can say `[Direct P2P]` or `[Relay]`.
+
+**Consequences.** Tests drive both halves over `tokio::io::duplex`, an in-memory
+pipe, with no sockets and no ports — which is why the engine's test suite runs in
+two seconds. One test repeats the happy path over a real `TcpStream` so that
+"works in memory" cannot quietly diverge from "works on a socket". M5's job
+becomes writing an adapter that presents a data channel as an `AsyncRead +
+AsyncWrite`, and the engine and all its tests come along unchanged.
+
+One wrinkle worth recording: the state machine in CLAUDE.md puts `Connecting`
+after `AwaitingAccept`, which fits WebRTC, where ICE should not start until the
+receiver has agreed. On a plain TCP stream the connection already exists, so in
+M2 that state is entered and left in consecutive statements. M5 gives it real
+work.
+
+---
+
+## ADR-0017 — Incoming file names are reduced, not trusted
+
+**Status:** accepted (M2)
+
+**Context.** The file name in `TRANSFER_REQUEST` is chosen entirely by the
+sender. It is the most obviously hostile input in the protocol: it decides what
+path the receiver opens.
+
+**Decision.** A name is first reduced to a bare base name by splitting on both
+`/` and `\`, whatever platform is running — a name from a Windows peer must be
+cut apart on a Unix receiver too. What survives is then refused if it is:
+
+- empty, `.` or `..`;
+- carrying a control character;
+- carrying `:` — a drive letter (`C:evil.txt` is relative to another drive) or an
+  NTFS alternate data stream (`report.pdf:hidden`);
+- carrying `<`, `>`, `"`, `|`, `?` or `*`;
+- ending in a dot or a space, which Windows silently strips, so that `evil.txt.`
+  and `evil.txt` would be the same file there but different names here;
+- a Windows device name (`CON`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`), with or
+  without an extension;
+- longer than 255 bytes.
+
+Separators are stripped rather than rejected because the useful part of
+`../../etc/passwd` is still `passwd`, and a receiver that refuses the whole
+transfer over a path-flavoured name is annoying without being safer.
+
+A name that already exists becomes `report (1).pdf`, `report (2).pdf` and so on,
+and the name actually used is reported to both sides. A leading dot belongs to
+the stem, so `.gitignore` collides as `.gitignore (1)` rather than
+` (1).gitignore`.
+
+The destination is taken by **creating** it with `create_new`, not by checking
+whether it exists. That closes the window between deciding a name is free and
+using it.
+
+**Consequences.** The test that matters asserts the property rather than the
+spelling: for every hostile input, the file actually opened is a direct child of
+the destination directory. Testing the exact output string for each input would
+pass while still being wrong, if the list of inputs missed a trick; asserting the
+parent directory cannot.
+
+An existing file is never overwritten (D-7), and nothing is written under the
+destination name until the contents have been verified (D-6): the part file is
+assembled under `~/.beam/tmp/<transfer_id>/`, hashed, and only then renamed over
+the reserved placeholder.
+
+---
+
+## ADR-0018 — M2 connects over a plain TCP address given on the command line
+
+**Status:** accepted (M2), to be replaced in M4 and M5
+
+**Context.** M2 is specified as "plain TCP on localhost (no server, no crypto
+yet)". There is no discovery until M4 and no WebRTC until M5, but the two
+commands still need to find each other.
+
+**Decision.** `beam listen --addr <host:port>` and
+`beam send <peer> <file> --addr <host:port>`. Both flags are hidden from
+`--help`, because they are scaffolding rather than part of the product. `listen`
+defaults to `127.0.0.1:7777`; `send` has no default and says plainly that
+`--addr` is needed until M4 rather than failing obscurely.
+
+Binding anywhere that is not loopback prints a six-line warning naming exactly
+what is missing: no encryption, and an identity that is claimed rather than
+proven (ADR-0019).
+
+**Consequences.** Two peers on one machine, or two machines on a trusted LAN,
+can exercise the whole transfer engine now. M4 replaces `--addr` on `send` with
+a lookup by Short ID through the signaling server; M5 replaces the `TcpStream`
+with a data channel. Because the engine is generic over its stream (ADR-0016),
+neither change reaches the transfer code.
+
+The warning is deliberately long. A short one would be read as boilerplate, and
+the thing being warned about — that anyone who can reach the port and knows a
+paired peer's public key can impersonate it — is not boilerplate.
+
+---
+
+## ADR-0019 — In M2 the sender's identity is claimed, not proven
+
+**Status:** accepted (M2), resolved in M6
+
+**Context.** The receiver checks the sender's public key against its own
+`known_peers` before showing a prompt, which satisfies the letter of S-7. It does
+not satisfy the intent.
+
+**Decision.** Record the gap plainly rather than let the passing S-7 test imply
+more than it proves.
+
+`TRANSFER_REQUEST` carries the sender's public key. The receiver checks that the
+key is one it has paired with. **Nothing in M2 proves the sender holds the
+matching private key.** A public key is public: anyone who has seen one — from a
+`beam peers` listing over somebody's shoulder, from a screenshot, from the wire —
+can put it in a request and be recognised as that peer.
+
+The Noise KK handshake in M6 is what closes this, by requiring both sides to
+prove possession of their static keys before any transfer message is exchanged.
+
+**Consequences.** M2 is safe to use on loopback and defensible on a trusted LAN.
+It is not safe on an untrusted network, which is why `listen` warns on a
+non-loopback bind (ADR-0018).
+
+Every test that turns on this gap carries a `STRENGTHEN IN M6:` comment, so the
+work is greppable rather than remembered. Today
+`s7_an_unknown_sender_is_refused_without_a_prompt` proves only that an
+*unrecognised* key is turned away. When M6 lands it gains a sibling that presents
+a known peer's public key without its private key and expects a refusal — the
+test that would fail today.
+
+The same gap applies in the other direction: `beam send alice` checks that
+`alice` is in the local `known_peers`, but nothing proves the machine at `--addr`
+is alice. In M2 the peer name on the sending side buys a sanity check and no
+more.

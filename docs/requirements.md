@@ -37,6 +37,7 @@ convenience loses.
 | S-5 | An unanswered request expires (default 60 s) and counts as a Reject. | M2 |
 | S-6 | The Accept prompt shows sender name, sender fingerprint, file name and size. | M2 |
 | S-7 | The receiver only accepts requests from peers present in its own `known_peers`; unknown senders are rejected without prompting. | M2 |
+| S-7a | The sender's identity is *proven*, not merely claimed. In M2 the receiver checks the public key a sender presents against `known_peers`, but nothing proves the sender holds the matching private key; see ADR-0019. Tests that turn on this gap are marked `STRENGTHEN IN M6:`. | M6 |
 | S-8 | A changed peer key is a hard abort with an SSH-style warning. A stored key is never updated automatically; the user must re-pair. | M6 |
 | S-9 | Private keys never leave the device and are never sent to the signaling server. | M1 |
 | S-10 | Peer authentication uses a Noise KK handshake (`snow`) bound to the WebRTC DTLS fingerprints, so the signaling server cannot mount a MITM. | M6 |
@@ -56,6 +57,7 @@ convenience loses.
 | D-6 | An incoming file is assembled under `~/.beam/tmp/<transfer_id>/` and only moved into place after its full SHA-256 verifies. | M2 |
 | D-7 | An existing destination file is never silently overwritten. | M2 |
 | D-8 | Received chunks are tracked with a bitmap, not a single resume index. | M3 |
+| D-9 | A transfer may only be resumed when the `file_sha256` and `size` in the new request match the stored transfer. The receiver persists the hashes of the chunks it has already verified, so resumed chunks are checked against the same values as the first attempt. A mismatch starts over as a new transfer. | M3 |
 
 ## 4. Non-functional requirements
 

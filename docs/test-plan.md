@@ -18,11 +18,11 @@ pull request (ADR-0014), so the gate is enforced rather than remembered.
 
 | Level | Where | What it covers |
 |-------|-------|----------------|
-| Unit | `#[cfg(test)]` modules inside `crates/beam/src/identity/`, later `src/transfer/` | derivations, parsing, state machine transitions |
+| Unit | `#[cfg(test)]` modules inside `crates/beam/src/` | derivations, parsing, framing, chunk arithmetic, state machine transitions, path safety |
 | Command | `crates/beam/tests/cli.rs` | whole commands driven through `cli::execute` with in-memory streams and a temporary `--beam-dir` |
-| Integration | from M2 | two engines over a real socket on localhost, then client↔server and client↔relay |
-| Failure | from M2 | interruption, corruption, disconnection, disk full, cancel, crash-and-resume |
-| Security | from M2 | the S-* requirements in `requirements.md`, each with a test that tries to break it |
+| Integration | `crates/beam/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
+| Failure | `crates/beam/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
+| Security | `tests/transfer.rs::accept_rules`, `tests/cli.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
 
 Command-level tests never spawn a process and never touch the real `~/.beam`:
 every test gets a `TempDir` passed via the `--beam-dir` flag. Lints are part of
@@ -53,34 +53,61 @@ the gate, not advisory — `clippy` runs with `-D warnings` and the workspace se
 | `remove` (F-5) | the prompt shows the fingerprint; answering `n` keeps the peer; end-of-input keeps the peer; `y` removes only that peer and leaves the other; `--yes` skips the prompt; unknown peer exits 1 |
 | CLI contract (N-5) | stubbed commands exit 2 and say which milestone they belong to; an unknown command exits 1; `--help` lists every planned command; `version` prints |
 
+## Implemented (M2)
+
+### Unit tests — `src/transfer/`, `src/transport/`, `src/hex.rs`
+
+| Area | Cases |
+|------|-------|
+| Framing (ADR-0015) | every message round-trips; messages stream back to back; an empty stream reads as a clean close and a half-written frame as truncated; a frame declaring 4 GiB is refused *before* allocating; a frame exactly at the 64 KiB limit is accepted; encoding refuses to produce an over-sized frame; unknown frame types, short `CHUNK_DATA` payloads and malformed JSON are refused |
+| Messages | transfer ids round-trip through hex and reject wrong lengths and non-hex; two generated ids differ; `TRANSFER_REQUEST` round-trips through JSON; unknown JSON fields are refused; `ACCEPT` defaults to no bitmap; only chunk messages report themselves as carrying file data |
+| Chunk arithmetic | empty file, smaller than one chunk, exact multiple, one byte over; chunk lengths always sum to the file size across a grid of sizes and chunk sizes; a realistic 9 MB plan; a declared chunk count that does not match the size is refused, as is a zero chunk size; SHA-256 against known vectors; hashing a stream matches hashing a buffer and reports progress |
+| Path safety (ADR-0017) | ordinary names pass through unchanged; seven traversal forms reduce to a base name; twelve names that cannot be reduced are refused with the specific reason; Windows device names refused with or without an extension, while `console.log` and `com10.txt` pass; over-long names refused at the boundary; extensions split as a person would expect; collisions become `report (1).pdf`; `.gitignore` keeps its name; reserving a name creates the file; **and, for every hostile input, the file actually opened is a direct child of the destination directory** |
+| State machine | all 12 states × 13 events checked against a hand-written transition table, so both legal transitions and refusals are covered; terminal states accept nothing; cancel and fail work from every live state; file data is allowed in exactly one state; the happy path walks to `Completed`; an interruption round-trips; an illegal event leaves the state untouched; a finished transfer cannot be restarted |
+| Transport | `PathKind` labels; loopback detection for IPv4, IPv6 and non-loopback addresses |
+| Hex | round-trip, case-insensitive decoding, wrong length and non-hex refused |
+| Terminal output | byte counts format the way a person says them; percentages are bounded and an empty file reads as complete; tables line up; `confirm` says no to everything but `y`/`yes`, including end of input |
+
+### Integration tests — `tests/transfer.rs`
+
+| Area | Cases |
+|------|-------|
+| Happy paths | a file arrives byte for byte, with both sides agreeing on the transfer id and the saved name; an empty file transfers; a file spanning two chunks and a short third transfers; the same happy path over a real `TcpStream` (ADR-0016) |
+| Naming | a colliding name becomes `report (1).pdf`, the existing file is untouched, and both sides are told the final name |
+| Refusal | a declined transfer leaves nothing on disk |
+| Integrity (S-12) | a chunk whose bytes do not match its announced hash is refused and asked for again, and only the correct bytes are written; a chunk that never verifies fails the transfer with nothing written; the sender re-sends a chunk it is NAKed |
+| Malformed requests | a replayed transfer id is refused without a prompt (S-11); a hostile file name is refused before anything is created; a chunk count that does not match the declared size is refused |
+
+### The six Accept rules — `tests/transfer.rs::accept_rules` and `tests/cli.rs`
+
+| Rule | Test | What it proves |
+|------|------|----------------|
+| S-1 — a person accepts every transfer, with no bypass | `s1_the_prompt_is_the_only_route_to_accepting`, plus `listen_has_no_flag_that_could_stand_in_for_the_prompt` and `no_command_offers_an_auto_accept_switch` in `tests/cli.rs` | refusing at the prompt stops the transfer dead, and the CLI carries no flag that could answer for the person. The CLI test is an **allowlist** of `listen`'s flags, so any new flag fails the test until somebody has decided it is not a bypass |
+| S-3 — no file bytes before ACCEPT | `s3_the_sender_emits_no_file_bytes_before_accept` | a hand-written peer that never accepts records every frame the sender sends. It sees exactly one: `TRANSFER_REQUEST` |
+| S-4 — data before ACCEPT is discarded and the transfer aborts | `s4_data_before_accept_aborts_and_discards` | a rude sender pushes chunks straight after the request; the receiver returns `DataBeforeAccept`, and both the destination and the work directory are empty afterwards |
+| S-5 — silence is a Reject | `s5_an_unanswered_request_expires_as_a_reject` and `s5_the_default_deadline_is_sixty_seconds` | the first proves the mechanism with a 200 ms deadline — the person is asked, nobody answers, both sides see `Expired`, nothing is written. The second asserts the real deadline is 60 s. Split in two because a test that waits a minute does not get run, and `tokio::time::pause` cannot help: its clock only advances while the runtime is idle, and the prompt deliberately occupies a blocking thread |
+| S-6 — the prompt shows sender, fingerprint, name and size | `s6_the_prompt_shows_who_what_and_how_big` | all four fields are captured from the real prompt call. The name shown is the one the *receiver* stored, not one the sender supplied — `TRANSFER_REQUEST` has no nickname field at all |
+| S-7 — only peers in `known_peers` may ask | `s7_an_unknown_sender_is_refused_without_a_prompt` | an unrecognised key is refused, the sender is told why, nothing is written, **and the prompt is never called**. Marked `STRENGTHEN IN M6:` — see below |
+
+**What S-7's test does not prove.** It shows that an *unrecognised* key is turned
+away. It does not show that a sender presenting a *recognised* key holds the
+matching private key, because in M2 nothing checks that (ADR-0019, requirement
+S-7a). When the Noise KK handshake lands in M6, this test gains a sibling that
+replays a known peer's public key without its private key and expects a refusal —
+a test that would fail today.
+
 ## Planned
-
-### M2 — transfer engine over TCP on localhost
-
-Unit: chunk splitting at boundaries (empty file, smaller than one chunk, exact
-multiple, one byte over); per-chunk and whole-file hashing; the state machine —
-every legal transition, and every illegal transition rejected.
-
-Integration: send and receive a file end to end; the received bytes and SHA-256
-match the source; the destination is only written after verification.
-
-Security, one test per requirement: DATA arriving before ACCEPT aborts the
-transfer and discards what was received (S-3, S-4); a request from a peer absent
-from `known_peers` is rejected with no prompt shown (S-7); an unanswered request
-expires after 60 s and is treated as a Reject (S-5); the Accept prompt contains
-the sender name, fingerprint, file name and size (S-6); there is no code path,
-flag or config key that accepts without the prompt (S-1); a tampered chunk fails
-its hash and is re-requested (S-12); an existing destination file is not
-overwritten (D-7).
-
-Failure: connection dropped mid-transfer; corrupted chunk; duplicate chunk;
-cancel from either side; disk full while writing the temp file.
 
 ### M3 — resume
 
 Bitmap set/clear/count/serialisation; resume after an interruption transfers
 only missing chunks; a resumed transfer prompts for a new Accept (S-2); a
 replayed transfer ID is rejected (S-11); crash and restart mid-transfer.
+
+D-9: a resume whose `file_sha256` or `size` differs from the stored transfer is
+refused and starts over as a new transfer; chunks already verified are checked
+against the hashes the receiver persisted on the first attempt, not against
+whatever the sender announces the second time.
 
 ### M4 — signaling server and pairing
 
@@ -106,3 +133,9 @@ warning and does not update `known_peers` (S-8); the progress line reports
   what the type system prevents. It is enforced by the types instead —
   `Zeroizing` and `ZeroizeOnDrop` — and by review.
 - macOS is not in the CI matrix (ADR-0014).
+- The Accept prompt's own rendering is not covered by a test: it writes to
+  the real stdout from a blocking thread. What it shows is asserted through
+  the engine instead, in `s6_the_prompt_shows_who_what_and_how_big`.
+- `beam listen` blocks until a peer connects, so its success path has no
+  command-level test; it is covered by the two-process run in the manual
+  script in `README.md` and by the engine's integration tests.
