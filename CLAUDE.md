@@ -37,16 +37,22 @@ beam newcode                   # regenerate pairing code
 
 ## Technology
 
-- Language: Go (single module named `beam`; note the folder name contains a space).
-- CLI: `cobra` (or stdlib `flag` if simpler). Optional TUI later with Bubble Tea.
-- Identity keys: Ed25519 (stdlib `crypto/ed25519`).
-- Pairing: an established PAKE library (e.g. `schollz/pake`, used by croc). Check that it
+- Language: **Rust** (edition 2024, MSRV 1.88). The project was specified in Go and
+  M0/M1 were first built that way; it moved to Rust at the team's request. See
+  ADR-0010 in `docs/decisions.md`. The Go implementation is preserved in commit
+  `a1ae4ec`.
+- Build: cargo workspace; `make check` = `cargo fmt --check` + `cargo clippy -D warnings`
+  + `cargo test`. `unsafe_code = "forbid"` workspace-wide.
+- CLI: `clap` (derive).
+- Identity keys: Ed25519 (`ed25519-dalek`), PKCS#8 PEM via the `pkcs8` feature.
+- Pairing: an established PAKE crate (`spake2` is the likely choice). Check that it
   is maintained before adopting; propose alternatives if not.
-- Peer authentication after pairing: Noise Protocol **KK** handshake (`flynn/noise`),
+- Peer authentication after pairing: Noise Protocol **KK** handshake (`snow`),
   bound to the WebRTC DTLS fingerprints (channel binding) so the signaling server cannot
   perform MITM.
-- P2P transport: WebRTC data channels via `pion/webrtc` (ICE/STUN; TURN relay fallback).
-- Signaling server: Go + WebSocket. Stateless-ish; in-memory presence with heartbeats.
+- P2P transport: WebRTC data channels via `webrtc-rs` (ICE/STUN; TURN relay fallback).
+- Async runtime: `tokio`, introduced at M2 with the transfer engine.
+- Signaling server: Rust + WebSocket. Stateless-ish; in-memory presence with heartbeats.
 - Local storage: files under `~/.beam/` (plain text / JSON); SQLite only if needed later.
 
 ## Identity model
@@ -80,21 +86,27 @@ explicit, unit-tested state machine.
 ## Suggested layout
 
 ```
-cmd/beam/            CLI entry point
-cmd/beam-server/     signaling server
-internal/identity/   keygen, fingerprint, short ID, known_peers
-internal/pairing/    PAKE pairing flow
-internal/auth/       Noise KK handshake + channel binding
-internal/transport/  WebRTC connection, ICE, relay
-internal/signaling/  client for the signaling server
-internal/transfer/   protocol messages, state machine, chunking, resume, integrity
-internal/ui/         prompts, progress bar
-docs/                requirements, diagrams, test plan, design decisions
+crates/beam/
+  src/main.rs          CLI entry point
+  src/cli/             command definitions (kept out of main so they are testable)
+  src/identity/        keygen, fingerprint, short ID, known_peers
+  src/pairing/         PAKE pairing flow
+  src/auth/            Noise KK handshake + channel binding
+  src/transport/       WebRTC connection, ICE, relay
+  src/signaling/       client for the signaling server
+  src/transfer/        protocol messages, state machine, chunking, resume, integrity
+  src/ui.rs            prompts, progress bar
+  tests/               command-level and integration tests
+crates/beam-server/    signaling server
+docs/                  requirements, diagrams, test plan, design decisions
 ```
+
+New areas start as modules of the `beam` library crate and are promoted to their
+own workspace crates only if compile times demand it.
 
 ## Milestones (do them in order; stop for review after each)
 
-- **M0** Project skeleton, Go module, CLI commands stubbed, Makefile, CI-ready `go test ./...`.
+- **M0** Project skeleton, cargo workspace, CLI commands stubbed, Makefile, CI-ready `cargo test`.
 - **M1** Identity: `init`, `whoami`, `peers`, `rename`, `remove`, known_peers file handling.
 - **M2** Transfer engine over plain TCP on localhost (no server, no crypto yet):
   request → Accept prompt → chunks → per-chunk hash → final hash → atomic commit.
@@ -103,7 +115,7 @@ docs/                requirements, diagrams, test plan, design decisions
 - **M5** Replace TCP with WebRTC data channels (STUN), keep the same transfer engine.
 - **M6** Noise KK mutual authentication bound to DTLS fingerprints; key-mismatch abort.
 - **M7** TURN relay fallback; show `[Direct P2P]` or `[Relay]` in the progress line.
-- Stretch (only if time allows): TUI, transfer history, bandwidth limit, folder transfer.
+- Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.
 
 ## Testing expectations
 
@@ -118,6 +130,6 @@ docs/                requirements, diagrams, test plan, design decisions
 ## Working style
 
 - Plan before coding each milestone; keep changes small and reviewable.
-- Write tests alongside code. Run `go vet` and `go test ./...` before declaring done.
+- Write tests alongside code. Run `make check` (fmt, clippy, tests) before declaring done.
 - Record design decisions in `docs/decisions.md` (short ADR-style entries); this project is
   graded on software engineering artifacts, not only working code.

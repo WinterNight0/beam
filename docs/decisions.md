@@ -6,7 +6,7 @@ Short ADR-style entries. Each records what was decided, why, and what it costs.
 
 ## ADR-0001 — Go module named `beam`, single module
 
-**Status:** accepted (M0)
+**Status:** superseded by ADR-0010 (the project moved to Rust)
 
 **Context.** The project lives in a directory whose path contains spaces and is
 inside OneDrive. A module path derived from a repository URL would tie the code
@@ -20,9 +20,9 @@ the module path can be renamed in one commit.
 
 ---
 
-## ADR-0002 — Command implementations live in `internal/cli`, not `package main`
+## ADR-0002 — Command implementations live outside the binary crate
 
-**Status:** accepted (M0)
+**Status:** accepted (M0), paths updated by ADR-0011
 
 **Context.** The suggested layout puts the CLI under `cmd/beam/`. Code in
 `package main` can only be tested through a compiled binary, which makes
@@ -41,7 +41,7 @@ CLAUDE.md.
 
 ## ADR-0003 — Key file formats
 
-**Status:** accepted (M1)
+**Status:** accepted (M1), PEM label amended by ADR-0013
 
 **Context.** Identity keys must be stored on disk in a format that is stable,
 inspectable, and produced by established libraries rather than hand-rolled.
@@ -168,7 +168,7 @@ error, 2 means not implemented yet.
 
 ## ADR-0009 — cobra as the only runtime dependency so far
 
-**Status:** accepted (M0)
+**Status:** superseded by ADR-0012 (the project moved to Rust)
 
 **Context.** CLAUDE.md allows `cobra` or stdlib `flag`, and requires that new
 dependencies be justified.
@@ -182,3 +182,133 @@ shell completion come for free, which matters for a CLI-only product. The cost
 is three modules in `go.sum`. Cryptographic and networking dependencies
 (`pake`, `flynn/noise`, `pion/webrtc`) are deliberately *not* added yet; each
 will be proposed with its own ADR at the milestone that needs it.
+
+---
+
+## ADR-0010 — The implementation language moves from Go to Rust
+
+**Status:** accepted (M1, replacing the Go implementation)
+
+**Context.** M0 and M1 were built in Go, as the project brief specified, and
+passed with 47 tests. The team then asked for Rust instead, wanting a systems
+language closer to the machine.
+
+**Decision.** Port the project to Rust. The Go implementation is preserved in
+commit `a1ae4ec` and can be recovered from git at any time; the working tree
+holds only Rust from here on. `CLAUDE.md` was updated so the brief and the code
+do not contradict each other.
+
+**Consequences.** The whole downstream stack changes with it, and each
+replacement must be checked for maintenance status at the milestone that needs
+it, per the project's own dependency rule:
+
+| Planned (Go) | Rust replacement | Needed at |
+|---|---|---|
+| `pion/webrtc` | `webrtc-rs` | M5 |
+| `flynn/noise` | `snow` | M6 |
+| `schollz/pake` | `spake2` | M4 |
+| goroutines + `net` | `tokio` | M2 |
+
+Nothing about the file formats, the identity model or the security rules
+changed: `known_peers`, the fingerprint and the short ID are byte-for-byte what
+the Go version produced, which the fixed test vectors in
+`crates/beam/src/identity/vectors.rs` pin down. Those vectors were carried over
+unchanged from the Go tests and still pass, which is the evidence that the port
+is faithful rather than merely compiling.
+
+---
+
+## ADR-0011 — Cargo workspace with a library crate and two binaries
+
+**Status:** accepted (M0, replaces the Go layout in ADR-0001)
+
+**Context.** The suggested layout (`cmd/`, `internal/`) is a Go convention. Rust
+needs an equivalent that keeps the command code testable, which is the point
+ADR-0002 made.
+
+**Decision.** A Cargo workspace:
+
+```
+crates/beam/          lib + bin `beam`
+  src/identity/       keys, fingerprints, short IDs, known_peers, store
+  src/cli/            command definitions
+  src/ui.rs           terminal output helpers
+  tests/cli.rs        command-level tests
+crates/beam-server/   bin `beam-server` (M4)
+```
+
+`src/main.rs` is a handful of lines that calls `beam::cli::execute(args, io)`
+and turns the returned code into an `ExitCode`. Later milestones add
+`src/transfer/`, `src/transport/`, `src/auth/` and `src/signaling/` as modules
+of the same library crate; they are promoted to their own crates only if
+compile times demand it.
+
+**Consequences.** `cli::execute` takes its streams as `&mut dyn BufRead` and
+`&mut dyn Write`, so `tests/cli.rs` drives whole commands against a
+`TempDir` with no process spawning — the same property the Go version had.
+Unit tests live in `#[cfg(test)]` modules beside the code they test, which is
+the Rust convention and lets them reach private helpers.
+
+---
+
+## ADR-0012 — Rust dependencies for M0/M1
+
+**Status:** accepted (M0, replaces ADR-0009)
+
+**Context.** The Go version needed exactly one dependency because the standard
+library covers crypto, hashing, base64 and home-directory lookup. Rust's
+standard library covers none of those, so the same functionality costs more
+crates. The project rule is that each one is justified.
+
+**Decision.**
+
+| Crate | Why |
+|---|---|
+| `clap` (derive) | subcommands, help, flag validation — the cobra equivalent |
+| `ed25519-dalek` (`pkcs8`, `pem`) | Ed25519 signing keys and PKCS#8 encoding, from RustCrypto |
+| `sha2` | SHA-256 for fingerprints |
+| `base64` | public key encoding |
+| `getrandom` | operating-system entropy for key generation |
+| `time` | RFC 3339 `added=` timestamps |
+| `serde` + `serde_json` | `--json` output |
+| `thiserror` | error enums that carry structure instead of strings |
+| `tempfile` | same-directory temporary files for atomic writes |
+| `dirs` | locating the home directory across platforms |
+
+**Consequences.** Ten direct dependencies against Go's one. All are widely used
+and maintained, and the cryptographic ones are RustCrypto's, so ADR rule 4 (do
+not invent cryptography) still holds. `rand_core` was considered and dropped:
+version 0.10 no longer exposes an `OsRng` feature, and `getrandom` is the same
+entropy source with a smaller surface. Networking and PAKE crates are
+deliberately absent until the milestones that need them.
+
+---
+
+## ADR-0013 — Handling private key material in Rust
+
+**Status:** accepted (M1, amends ADR-0003)
+
+**Context.** Rust gives finer control over key material than Go did, and with it
+three decisions that Go never forced.
+
+**Decision.**
+
+1. **PEM label.** The Go version wrapped PKCS#8 DER in a custom `BEAM PRIVATE
+   KEY` label. The `pkcs8` crate fixes the label at the standard `PRIVATE KEY`,
+   and fighting it would mean re-wrapping the PEM by hand. The standard label
+   is used instead. The file is still PKCS#8 and still mode 0600.
+2. **`Debug` is implemented by hand, never derived.** A derived `Debug` on
+   `Identity` would print the private key into any log line or panic message
+   that formats it. The manual impl shows the fingerprint and comment and
+   nothing else.
+3. **Seed zeroization is best-effort.** `Identity::generate` fills a 32-byte
+   seed, hands it to `SigningKey::from_bytes`, then overwrites it and passes it
+   through `std::hint::black_box` so the write is not elided. `SigningKey`
+   itself zeroizes on drop. This is weaker than the `zeroize` crate, which was
+   not in the approved dependency set; adding it is a one-line change and the
+   obvious follow-up if key hygiene is graded.
+
+**Consequences.** Points 1 and 2 are strictly better than the Go version. Point
+3 is slightly weaker in theory, and the residual risk is a stack copy of a seed
+that is already overwritten. `unsafe_code = "forbid"` is set workspace-wide, so
+no part of beam can reach for raw memory tricks to do better.

@@ -1,8 +1,6 @@
 # build output
-/bin/
-*.exe
-*.exe~
-*.test
+/target/
+*.pdb
 
 # local beam state accidentally created in the repo
 /.beam/

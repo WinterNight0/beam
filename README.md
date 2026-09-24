@@ -12,18 +12,18 @@ with can ask.
 
 ## Build
 
-Requires Go 1.24 or newer.
+Requires Rust 1.88 or newer (edition 2024). On Windows you also need the MSVC
+build tools, which `rustup` will point you at.
 
 ```
-make build            # binaries in ./bin
-make check            # gofmt, go vet, go test
-go run ./cmd/beam --help
+cargo build --release      # binaries in ./target/release
+cargo run -p beam -- --help
+make check                 # cargo fmt --check, clippy -D warnings, cargo test
 ```
 
 On Windows without `make`:
 
 ```
-go build -o bin\ ./cmd/...
 powershell -ExecutionPolicy Bypass -File scripts\check.ps1
 ```
 
@@ -89,13 +89,19 @@ comes from the PAKE during pairing and from the stored public key afterwards.
 ## Layout
 
 ```
-cmd/beam/            CLI entry point
-cmd/beam-server/     signaling server (M4)
-internal/cli/        command definitions
-internal/identity/   keys, fingerprints, Short IDs, known_peers
-internal/ui/         terminal output helpers
-docs/                requirements, design decisions, test plan
+crates/beam/
+  src/main.rs          CLI entry point
+  src/cli/             command definitions
+  src/identity/        keys, fingerprints, Short IDs, known_peers, store
+  src/ui.rs            terminal output helpers
+  tests/cli.rs         command-level tests
+crates/beam-server/    signaling server (M4)
+docs/                  requirements, design decisions, test plan
 ```
+
+The project was originally written in Go; see ADR-0010 in
+[docs/decisions.md](docs/decisions.md) for why it moved to Rust and what that
+changed. The Go implementation is preserved in commit `a1ae4ec`.
 
 See [docs/requirements.md](docs/requirements.md),
 [docs/decisions.md](docs/decisions.md) and [docs/test-plan.md](docs/test-plan.md).

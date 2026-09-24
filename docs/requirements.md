@@ -39,7 +39,7 @@ convenience loses.
 | S-7 | The receiver only accepts requests from peers present in its own `known_peers`; unknown senders are rejected without prompting. | M2 |
 | S-8 | A changed peer key is a hard abort with an SSH-style warning. A stored key is never updated automatically; the user must re-pair. | M6 |
 | S-9 | Private keys never leave the device and are never sent to the signaling server. | M1 |
-| S-10 | Peer authentication uses a Noise KK handshake bound to the WebRTC DTLS fingerprints, so the signaling server cannot mount a MITM. | M6 |
+| S-10 | Peer authentication uses a Noise KK handshake (`snow`) bound to the WebRTC DTLS fingerprints, so the signaling server cannot mount a MITM. | M6 |
 | S-11 | Transfer IDs are random; replayed or expired IDs are rejected. | M2/M3 |
 | S-12 | Every chunk is verified against its hash before it is written, and the whole file against its SHA-256 before it is committed. | M2 |
 | S-13 | No cryptography is invented: only established, maintained libraries are used. | all |
@@ -62,14 +62,23 @@ convenience loses.
 | ID | Requirement |
 |----|-------------|
 | N-1 | Terminal only. No GUI, no daemon the user did not start. |
-| N-2 | Runs on Windows, macOS and Linux from a single Go binary with no runtime dependencies. |
+| N-2 | Runs on Windows, macOS and Linux from a single Rust binary with no runtime dependencies. |
 | N-3 | Default chunk size 4 MiB. |
-| N-4 | `go vet ./...` and `go test ./...` pass before any milestone is called done. |
+| N-4 | `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` pass before any milestone is called done. |
 | N-5 | Exit codes: 0 success, 1 error, 2 not implemented yet. |
 | N-6 | Nicknames are local labels. There is no global username registry, and a peer is not notified when it is renamed. |
 
-## 5. Out of scope
+## 5. Implementation language
 
-Folder transfer, transfer history, bandwidth limiting and a Bubble Tea TUI are
+The project was specified in Go and M0/M1 were first built that way; it moved to
+Rust at the team's request. See ADR-0010 in `decisions.md` for the switch and
+the library replacements it forces (`webrtc-rs`, `snow`, `spake2`, `tokio`).
+Nothing in sections 1-4 changed as a result: the file formats, the identity
+derivations and every security rule are unchanged, and the same fixed test
+vectors pass in both implementations.
+
+## 6. Out of scope
+
+Folder transfer, transfer history, bandwidth limiting and a `ratatui` TUI are
 stretch goals, attempted only after M7. Multi-file transfers, a web client and
 any kind of account system are out of scope entirely.

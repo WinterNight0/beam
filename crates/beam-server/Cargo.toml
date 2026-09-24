@@ -1,0 +1,10 @@
+[package]
+name = "beam-server"
+description = "Signaling server that helps two beam peers find each other"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
