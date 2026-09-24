@@ -130,6 +130,12 @@ pub enum RejectReason {
     /// The request did not make sense: bad file name, inconsistent sizes, a
     /// replayed transfer id.
     BadRequest,
+    /// Another beam session on the receiver is already working on this exact
+    /// transfer, and two sessions must not write to one partial (ADR-0022).
+    Busy,
+    /// There is not enough free space to finish, so nobody is asked to agree
+    /// to something that cannot succeed.
+    NoSpace,
 }
 
 impl RejectReason {
@@ -140,6 +146,8 @@ impl RejectReason {
             Self::UnknownPeer => "the peer has not paired with you",
             Self::Expired => "the peer did not answer in time",
             Self::BadRequest => "the peer rejected the request as malformed",
+            Self::Busy => "the peer is already receiving this file in another session",
+            Self::NoSpace => "the peer does not have enough free disk space",
         }
     }
 }

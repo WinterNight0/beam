@@ -69,11 +69,25 @@ impl Prompt for TerminalPrompt {
 
         let mut out = std::io::stdout().lock();
         writeln!(out)?;
-        writeln!(out, "Incoming file")?;
+        match &request.resume {
+            Some(_) => writeln!(out, "Incoming file (resuming)")?,
+            None => writeln!(out, "Incoming file")?,
+        }
         ui::field(&mut out, "From", &request.peer_name)?;
         ui::field(&mut out, "Fingerprint", &request.fingerprint)?;
         ui::field(&mut out, "File", &request.file_name)?;
         ui::field(&mut out, "Size", &ui::format_bytes(request.size))?;
+        if let Some(resume) = &request.resume {
+            let mut already = format!(
+                "{} ({}%)",
+                ui::format_bytes(resume.have_bytes),
+                ui::percent(resume.have_bytes, request.size)
+            );
+            if let Some(age) = resume.age {
+                already.push_str(&format!(", from {}", ui::format_age(age)));
+            }
+            ui::field(&mut out, "Already have", &already)?;
+        }
         write!(out, "Accept? [y/N]: ")?;
         out.flush()?;
 
@@ -206,6 +220,10 @@ impl Reporter for TerminalReporter {
             Progress::Verifying => {
                 self.finish();
                 self.line("Verifying...");
+            }
+            Progress::Rechecking => {
+                self.finish();
+                self.line("Checking what is already here...");
             }
         }
     }

@@ -57,6 +57,22 @@ pub enum TransferError {
     #[error("the finished file does not match the hash the sender promised; nothing was saved")]
     VerificationFailed,
 
+    /// A second session tried to work on a partial that is already in use.
+    #[error("another beam session is already receiving this file")]
+    PartialInUse,
+
+    /// The receiver has not got room for this transfer.
+    #[error(transparent)]
+    Space(Box<super::storage::SpaceError>),
+
+    /// Something went wrong with the stored partial itself.
+    #[error(transparent)]
+    Partial(Box<super::partial::PartialError>),
+
+    /// A have-bitmap that does not describe this transfer.
+    #[error("the peer sent a have-bitmap that does not fit this transfer: {0}")]
+    Bitmap(#[from] super::bitmap::BitmapError),
+
     #[error(transparent)]
     Name(#[from] NameError),
 
@@ -112,6 +128,9 @@ pub enum Progress {
     },
     /// Checking the whole-file hash.
     Verifying,
+    /// Re-hashing what is already on disk from an earlier session, before
+    /// offering any of it to the sender as "already have".
+    Rechecking,
 }
 
 /// Somewhere to send [`Progress`].

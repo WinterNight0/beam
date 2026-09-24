@@ -86,6 +86,24 @@ pub fn percent(done: u64, total: u64) -> u8 {
     ((done.min(total) as f64 / total as f64) * 100.0).round() as u8
 }
 
+/// How long ago something happened, in the words a person would use.
+pub fn format_age(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    // Truncating rather than rounding, so a value never overflows into the next
+    // unit's name: 3599 seconds is "59 minutes ago", not "60 minutes ago".
+    let (value, unit) = match seconds {
+        0..90 => (seconds.max(1), "second"),
+        90..3600 => (seconds / 60, "minute"),
+        3600..86_400 => (seconds / 3600, "hour"),
+        _ => (seconds / 86_400, "day"),
+    };
+    if value == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{value} {unit}s ago")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +125,20 @@ mod tests {
         assert_eq!(percent(50, 100), 50);
         assert_eq!(percent(100, 100), 100);
         assert_eq!(percent(200, 100), 100, "progress ran past the end");
+    }
+
+    #[test]
+    fn ages_read_the_way_a_person_would_say_them() {
+        use std::time::Duration;
+        assert_eq!(format_age(Duration::from_secs(1)), "1 second ago");
+        assert_eq!(format_age(Duration::from_secs(45)), "45 seconds ago");
+        assert_eq!(format_age(Duration::from_secs(120)), "2 minutes ago");
+        assert_eq!(format_age(Duration::from_secs(3600)), "1 hour ago");
+        assert_eq!(format_age(Duration::from_secs(7200)), "2 hours ago");
+        assert_eq!(format_age(Duration::from_secs(86_400)), "1 day ago");
+        assert_eq!(format_age(Duration::from_secs(2 * 86_400)), "2 days ago");
+        // Never "0 seconds ago", which reads as though nothing happened.
+        assert_eq!(format_age(Duration::from_millis(10)), "1 second ago");
     }
 
     #[test]

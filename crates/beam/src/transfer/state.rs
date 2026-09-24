@@ -4,6 +4,13 @@
 //! the sender and receiver, so that the rule "no file bytes before ACCEPT"
 //! (S-3) is something a test can check rather than something a reader has to
 //! trace by hand.
+//!
+//! There is no `Interrupted` or `Reconnecting` state. A transfer that loses its
+//! connection simply fails; resuming is a *new* transfer that happens to find
+//! data already on disk, and it goes through the whole machine from the top,
+//! prompt included. That is what makes "every resume needs a new Accept" (S-2)
+//! a property of the design rather than a rule somebody has to remember to
+//! enforce. See ADR-0020.
 
 /// Where a transfer has got to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -16,10 +23,6 @@ pub enum State {
     Connecting,
     /// Chunks are moving.
     Transferring,
-    /// The link dropped mid-transfer (reachable from M3).
-    Interrupted,
-    /// Trying to get the link back (reachable from M3).
-    Reconnecting,
     /// All chunks are in; checking the whole-file hash.
     Verifying,
 
@@ -37,13 +40,11 @@ pub enum State {
 
 impl State {
     /// Every state, for exhaustive tests.
-    pub const ALL: [State; 12] = [
+    pub const ALL: [State; 10] = [
         State::Requested,
         State::AwaitingAccept,
         State::Connecting,
         State::Transferring,
-        State::Interrupted,
-        State::Reconnecting,
         State::Verifying,
         State::Completed,
         State::Rejected,
@@ -82,12 +83,6 @@ pub enum Event {
     TimedOut,
     /// The byte stream is ready.
     Connected,
-    /// The link dropped (M3).
-    LinkLost,
-    /// A reconnection attempt began (M3).
-    ReconnectStarted,
-    /// The link is back (M3).
-    Reconnected,
     /// Every chunk has been stored.
     ChunksDone,
     /// The whole-file hash matched.
@@ -102,15 +97,12 @@ pub enum Event {
 
 impl Event {
     /// Every event, for exhaustive tests.
-    pub const ALL: [Event; 13] = [
+    pub const ALL: [Event; 10] = [
         Event::RequestSent,
         Event::Accepted,
         Event::Declined,
         Event::TimedOut,
         Event::Connected,
-        Event::LinkLost,
-        Event::ReconnectStarted,
-        Event::Reconnected,
         Event::ChunksDone,
         Event::Verified,
         Event::VerificationFailed,
@@ -150,13 +142,7 @@ pub fn next(state: State, event: Event) -> Option<State> {
 
         (State::Connecting, Event::Connected) => State::Transferring,
 
-        (State::Transferring, Event::LinkLost) => State::Interrupted,
         (State::Transferring, Event::ChunksDone) => State::Verifying,
-
-        (State::Interrupted, Event::ReconnectStarted) => State::Reconnecting,
-
-        (State::Reconnecting, Event::Reconnected) => State::Transferring,
-        (State::Reconnecting, Event::LinkLost) => State::Interrupted,
 
         (State::Verifying, Event::Verified) => State::Completed,
         (State::Verifying, Event::VerificationFailed) => State::Failed,
@@ -219,21 +205,13 @@ mod tests {
     ///
     /// `Cancel` and `Fail` are not listed: they are allowed from every
     /// non-terminal state and are checked separately.
-    const LEGAL: [(State, Event, State); 11] = [
+    const LEGAL: [(State, Event, State); 7] = [
         (State::Requested, Event::RequestSent, State::AwaitingAccept),
         (State::AwaitingAccept, Event::Accepted, State::Connecting),
         (State::AwaitingAccept, Event::Declined, State::Rejected),
         (State::AwaitingAccept, Event::TimedOut, State::Expired),
         (State::Connecting, Event::Connected, State::Transferring),
-        (State::Transferring, Event::LinkLost, State::Interrupted),
         (State::Transferring, Event::ChunksDone, State::Verifying),
-        (
-            State::Interrupted,
-            Event::ReconnectStarted,
-            State::Reconnecting,
-        ),
-        (State::Reconnecting, Event::Reconnected, State::Transferring),
-        (State::Reconnecting, Event::LinkLost, State::Interrupted),
         (State::Verifying, Event::Verified, State::Completed),
     ];
 
@@ -342,16 +320,22 @@ mod tests {
     }
 
     #[test]
-    fn an_interruption_round_trip_returns_to_transferring() {
+    fn a_lost_connection_ends_the_transfer_rather_than_reconnecting() {
+        // There is deliberately no way back from a broken transfer. Resuming is
+        // a new transfer, with a new prompt (S-2, ADR-0020).
         let mut machine = Machine::new();
         for event in [Event::RequestSent, Event::Accepted, Event::Connected] {
             machine.apply(event).expect("legal");
         }
-        machine.apply(Event::LinkLost).expect("legal");
-        assert!(!machine.file_data_allowed(), "allowed while interrupted");
-        machine.apply(Event::ReconnectStarted).expect("legal");
-        machine.apply(Event::Reconnected).expect("legal");
-        assert_eq!(machine.state(), State::Transferring);
+        machine.apply(Event::Fail).expect("legal");
+        assert_eq!(machine.state(), State::Failed);
+        assert!(machine.state().is_terminal());
+        for event in Event::ALL {
+            assert!(
+                machine.apply(event).is_err(),
+                "a failed transfer accepted {event:?}"
+            );
+        }
     }
 
     #[test]

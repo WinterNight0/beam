@@ -7,13 +7,23 @@
 //! * silence is a Reject (S-5);
 //! * anything carrying file bytes that arrives before ACCEPT ends the transfer
 //!   and everything received is discarded (S-4).
+//!
+//! From M3 a request may find a partial transfer already on disk. That does not
+//! soften any of the above: a resume is an ordinary transfer that happens to
+//! start with some chunks already present, and it is prompted for like any
+//! other (S-2). What the partial changes is which chunks are asked for, and
+//! what survives a failure — see ADR-0021 and ADR-0022.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
+
+use std::time::Duration as StdDuration;
+
+use time::OffsetDateTime;
 
 use crate::identity::{Fingerprint, KnownPeers, decode_public_key};
 use crate::transport::PathKind;
@@ -27,8 +37,10 @@ use super::message::{
     Accept, Cancel, ChunkAck, ChunkNak, Complete, Message, NakReason, Reject, RejectReason,
     TransferId, TransferRequest,
 };
+use super::partial::{Partial, PartialError, PartialKey, PartialStore};
 use super::paths::{reserve_destination, sanitize_file_name};
 use super::state::{Event, Machine};
+use super::storage::{check_space, commit};
 
 /// What the person answering the prompt is shown (S-6).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +51,19 @@ pub struct PromptRequest {
     pub fingerprint: String,
     pub file_name: String,
     pub size: u64,
+    /// Present when data for this file is already on disk, so the person can
+    /// see they are continuing something rather than starting it (S-2).
+    pub resume: Option<ResumeInfo>,
+}
+
+/// What is already on disk for a transfer being resumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeInfo {
+    pub have_bytes: u64,
+    pub have_chunks: u32,
+    pub chunk_count: u32,
+    /// How long ago the partial was last written to, if that is known.
+    pub age: Option<StdDuration>,
 }
 
 /// Asks a person whether to accept a transfer.
@@ -64,6 +89,8 @@ pub struct ReceiveOptions {
     pub max_chunk_attempts: u32,
     /// How the peers are connected, for the progress line.
     pub path_kind: PathKind,
+    /// How long an untouched partial survives.
+    pub max_partial_age: StdDuration,
 }
 
 impl ReceiveOptions {
@@ -75,7 +102,13 @@ impl ReceiveOptions {
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             max_chunk_attempts: DEFAULT_CHUNK_ATTEMPTS,
             path_kind: PathKind::Direct,
+            max_partial_age: super::partial::DEFAULT_MAX_AGE,
         }
+    }
+
+    /// The store of partial transfers under the tmp directory.
+    pub fn partials(&self) -> PartialStore {
+        PartialStore::new(&self.tmp_dir)
     }
 }
 
@@ -88,6 +121,11 @@ pub struct ReceiveSummary {
     /// The name the file was saved under, after any collision renaming.
     pub final_name: String,
     pub bytes: u64,
+    /// How many bytes this session actually had to receive. Less than `bytes`
+    /// when a partial was resumed.
+    pub received_now: u64,
+    /// Whether this session continued an earlier one.
+    pub resumed: bool,
 }
 
 /// A stream of messages from the peer.
@@ -172,70 +210,182 @@ where
         return Err(TransferError::Rejected(RejectReason::UnknownPeer));
     };
 
-    let prompt_request = PromptRequest {
-        peer_name: peer_name.clone(),
-        fingerprint: fingerprint.to_string(),
-        file_name: file_name.clone(),
+    // Find or start the partial. Matched on what the sender cannot change
+    // without changing the file, never on the transfer id it chose (ADR-0021).
+    let key = PartialKey {
+        peer_fingerprint: fingerprint,
+        file_sha256: request.file_sha256.clone(),
         size: request.size,
+        chunk_size: request.chunk_size,
+    };
+    let mut partial = match options.partials().open(&key, &file_name, plan).await {
+        Ok(partial) => partial,
+        Err(PartialError::Busy) => {
+            refuse(&mut writer, request.transfer_id, RejectReason::Busy).await;
+            machine.apply(Event::Declined)?;
+            return Err(TransferError::PartialInUse);
+        }
+        Err(e) => {
+            machine.apply(Event::Fail)?;
+            return Err(TransferError::Partial(Box::new(e)));
+        }
     };
 
-    match decide(
-        &mut incoming,
-        prompt,
-        prompt_request,
-        options.accept_timeout,
-    )
-    .await?
-    {
-        Decision::Accept => {}
-        Decision::Decline => {
-            refuse(&mut writer, request.transfer_id, RejectReason::Declined).await;
-            machine.apply(Event::Declined)?;
-            return Err(TransferError::Rejected(RejectReason::Declined));
-        }
-        Decision::Expired => {
-            refuse(&mut writer, request.transfer_id, RejectReason::Expired).await;
-            machine.apply(Event::TimedOut)?;
-            return Err(TransferError::Rejected(RejectReason::Expired));
-        }
-    }
-
-    write_message(
-        &mut writer,
-        &Message::Accept(Accept {
-            transfer_id: request.transfer_id,
-            have_bitmap: None,
-        }),
-    )
-    .await?;
-    machine.apply(Event::Accepted)?;
-    machine.apply(Event::Connected)?;
-
-    // From here on there is a working directory to clean up on any failure.
-    let work_dir = options.tmp_dir.join(request.transfer_id.to_string());
-    let outcome = accept_and_store(
+    // Everything from here can fail, and what happens to the partial when it
+    // does is one decision made in one place, below.
+    let outcome = receive_into_partial(
         &mut incoming,
         &mut writer,
         &mut machine,
         &request,
         plan,
         &file_name,
-        &work_dir,
+        &peer_name,
+        &fingerprint,
+        &mut partial,
         options,
+        prompt,
         reporter,
     )
     .await;
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    // The retention rules (ADR-0022), in one place so they cannot drift apart:
+    //
+    // * a finished transfer has become a file, so the partial has served its
+    //   purpose;
+    // * a partial that produced a file failing its whole-file hash will fail
+    //   the same way next time, so keeping it would only waste a later session;
+    // * a partial holding nothing is clutter — this covers a fresh request that
+    //   was declined, expired, or aborted before a single chunk landed;
+    // * anything else keeps what it has, which is the entire point of M3. In
+    //   particular a peer that sends data before ACCEPT cannot destroy a
+    //   partial an earlier, well-behaved session built.
+    let holds_nothing = partial.bitmap().count() == 0;
+    match &outcome {
+        Ok(_) => discard(&partial),
+        Err(TransferError::VerificationFailed) => discard(&partial),
+        Err(_) if holds_nothing => discard(&partial),
+        Err(_) => {}
+    }
 
-    let final_name = outcome?;
+    let (final_name, received_now, resumed) = outcome?;
     Ok(ReceiveSummary {
         transfer_id: request.transfer_id,
         peer_name,
         fingerprint: fingerprint.to_string(),
         final_name,
         bytes: request.size,
+        received_now,
+        resumed,
     })
+}
+
+/// Re-checks the partial, asks the person, and runs the transfer.
+///
+/// Split out from [`receive_file`] so that every way this can fail passes
+/// through one retention decision rather than each early return having to
+/// remember the rules.
+#[allow(clippy::too_many_arguments)]
+async fn receive_into_partial<W, P, R>(
+    incoming: &mut Incoming,
+    writer: &mut W,
+    machine: &mut Machine,
+    request: &TransferRequest,
+    plan: ChunkPlan,
+    file_name: &str,
+    peer_name: &str,
+    fingerprint: &Fingerprint,
+    partial: &mut Partial,
+    options: &ReceiveOptions,
+    prompt: P,
+    reporter: &mut R,
+) -> Result<(String, u64, bool), TransferError>
+where
+    W: AsyncWrite + Unpin,
+    P: Prompt + Send + 'static,
+    R: Reporter,
+{
+    // Disk is no more trustworthy than the wire: everything the bitmap claims
+    // is re-hashed before it is offered to the sender as "already have".
+    if !partial.is_new() {
+        reporter.report(Progress::Rechecking);
+        partial
+            .reverify()
+            .await
+            .map_err(|e| TransferError::Partial(Box::new(e)))?;
+    }
+
+    let have_bytes = partial.have_bytes();
+    let resume = (have_bytes > 0).then(|| ResumeInfo {
+        have_bytes,
+        have_chunks: partial.bitmap().count(),
+        chunk_count: plan.chunk_count(),
+        age: partial
+            .updated_at()
+            .and_then(|t| (OffsetDateTime::now_utc() - t).try_into().ok()),
+    });
+
+    // Asked before the prompt, so nobody is interrupted to agree to something
+    // that cannot finish. A refusal here keeps the partial: freeing some space
+    // and trying again is exactly the right next move.
+    if let Err(e) = check_space(
+        partial.dir(),
+        &options.out_dir,
+        request.size.saturating_sub(have_bytes),
+        request.size,
+    ) {
+        refuse(writer, request.transfer_id, RejectReason::NoSpace).await;
+        machine.apply(Event::Declined)?;
+        return Err(TransferError::Space(Box::new(e)));
+    }
+
+    let prompt_request = PromptRequest {
+        peer_name: peer_name.to_string(),
+        fingerprint: fingerprint.to_string(),
+        file_name: file_name.to_string(),
+        size: request.size,
+        resume: resume.clone(),
+    };
+
+    match decide(incoming, prompt, prompt_request, options.accept_timeout).await? {
+        Decision::Accept => {}
+        Decision::Decline => {
+            // Saying "not now" must not throw away what an earlier session
+            // already fetched (ADR-0022).
+            refuse(writer, request.transfer_id, RejectReason::Declined).await;
+            machine.apply(Event::Declined)?;
+            return Err(TransferError::Rejected(RejectReason::Declined));
+        }
+        Decision::Expired => {
+            refuse(writer, request.transfer_id, RejectReason::Expired).await;
+            machine.apply(Event::TimedOut)?;
+            return Err(TransferError::Rejected(RejectReason::Expired));
+        }
+    }
+
+    write_message(
+        writer,
+        &Message::Accept(Accept {
+            transfer_id: request.transfer_id,
+            have_bitmap: Some(partial.bitmap().encode()),
+        }),
+    )
+    .await?;
+    machine.apply(Event::Accepted)?;
+    machine.apply(Event::Connected)?;
+
+    let (final_name, received_now) = accept_and_store(
+        incoming, writer, machine, request, plan, file_name, partial, options, reporter,
+    )
+    .await?;
+
+    Ok((final_name, received_now, resume.is_some()))
+}
+
+/// Removes a partial's directory, releasing its lock first.
+fn discard(partial: &Partial) {
+    let dir = partial.dir().to_path_buf();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// What the person decided, or that they never got the chance.
@@ -342,41 +492,39 @@ async fn accept_and_store<W, R>(
     request: &TransferRequest,
     plan: ChunkPlan,
     file_name: &str,
-    work_dir: &Path,
+    partial: &mut Partial,
     options: &ReceiveOptions,
     reporter: &mut R,
-) -> Result<String, TransferError>
+) -> Result<(String, u64), TransferError>
 where
     W: AsyncWrite + Unpin,
     R: Reporter,
 {
-    tokio::fs::create_dir_all(work_dir)
-        .await
-        .map_err(|e| TransferError::io("create", work_dir.display(), e))?;
     tokio::fs::create_dir_all(&options.out_dir)
         .await
         .map_err(|e| TransferError::io("create", options.out_dir.display(), e))?;
 
-    let part_path = work_dir.join("part");
-    let mut part = tokio::fs::File::create(&part_path)
-        .await
-        .map_err(|e| TransferError::io("create", part_path.display(), e))?;
+    let already_had = partial.have_bytes();
+    let mut done = already_had;
+    let mut received_now = 0u64;
 
-    let mut received = 0u64;
-    for index in 0..plan.chunk_count() {
-        let bytes =
+    // Only the chunks that are actually missing. The sender is told the same
+    // thing through the have-bitmap in ACCEPT, so the two agree; a sender that
+    // sends something else anyway is caught by the out-of-order check.
+    let wanted: Vec<u32> = partial.bitmap().missing().collect();
+    for index in wanted {
+        let (bytes, digest) =
             receive_chunk(incoming, writer, plan, index, options.max_chunk_attempts).await?;
 
-        part.seek(std::io::SeekFrom::Start(plan.offset_of(index)))
+        partial
+            .store_chunk(index, &bytes, &digest)
             .await
-            .map_err(|e| TransferError::io("seek in", part_path.display(), e))?;
-        part.write_all(&bytes)
-            .await
-            .map_err(|e| TransferError::io("write", part_path.display(), e))?;
+            .map_err(|e| TransferError::Partial(Box::new(e)))?;
 
-        received += bytes.len() as u64;
+        done += bytes.len() as u64;
+        received_now += bytes.len() as u64;
         reporter.report(Progress::Transferring {
-            done: received,
+            done,
             total: plan.size(),
             path: options.path_kind,
         });
@@ -384,10 +532,7 @@ where
         write_message(writer, &Message::ChunkAck(ChunkAck { index })).await?;
     }
 
-    part.flush()
-        .await
-        .map_err(|e| TransferError::io("flush", part_path.display(), e))?;
-    drop(part);
+    let part_path = partial.part_path();
 
     // The sender says it has finished before the whole-file hash is checked.
     match incoming.next().await? {
@@ -407,8 +552,10 @@ where
     machine.apply(Event::ChunksDone)?;
     reporter.report(Progress::Verifying);
 
-    // On failure the caller removes the work directory, so a file that does
-    // not match its promised hash is never left anywhere.
+    // Every chunk passed its own hash on the way in, but that only says the
+    // pieces arrived intact — this says the file is the one that was promised.
+    // The caller discards the partial when this fails, because a partial that
+    // cannot produce the right file will not produce it next time either.
     verify(&part_path, &request.file_sha256).await?;
 
     // Reserve the name by creating the file, then move the verified part over
@@ -419,7 +566,10 @@ where
             .map_err(|e| TransferError::io("create a file in", options.out_dir.display(), e))?;
     drop(placeholder);
 
-    tokio::fs::rename(&part_path, &destination)
+    // A rename when the partial and the destination share a volume, a copy
+    // when they do not — which `--out D:\...` on Windows makes ordinary.
+    // See ADR-0023.
+    commit(&part_path, &destination)
         .await
         .map_err(|e| TransferError::io("move the finished file to", destination.display(), e))?;
 
@@ -433,17 +583,21 @@ where
     )
     .await?;
 
-    Ok(final_name)
+    let _ = already_had;
+    Ok((final_name, received_now))
 }
 
 /// Collects one chunk, verifying it before it is handed back to be written.
+///
+/// Returns the bytes and the hash they were checked against, which the partial
+/// stores so a later session can check them again.
 async fn receive_chunk<W>(
     incoming: &mut Incoming,
     writer: &mut W,
     plan: ChunkPlan,
     index: u32,
     max_attempts: u32,
-) -> Result<Vec<u8>, TransferError>
+) -> Result<(Vec<u8>, String), TransferError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -507,7 +661,7 @@ where
 
         match reason {
             // Verified before it is written, which is the whole point (S-12).
-            None => return Ok(buffer),
+            None => return Ok((buffer, start.sha256)),
             Some(reason) => {
                 write_message(writer, &Message::ChunkNak(ChunkNak { index, reason })).await?;
                 if attempt == max_attempts {

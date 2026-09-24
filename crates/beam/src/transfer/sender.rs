@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite};
 
 use crate::transport::PathKind;
 
+use super::bitmap::ChunkBitmap;
 use super::chunk::{ChunkPlan, hash_stream, sha256_hex};
 use super::engine::{
     DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, Progress, Reporter, TransferError,
@@ -53,7 +54,11 @@ impl SendOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SendSummary {
     pub transfer_id: TransferId,
+    /// Bytes actually put on the wire. Less than the file size when the
+    /// receiver already had some of it.
     pub bytes_sent: u64,
+    /// Bytes the receiver already had, and so were never sent.
+    pub bytes_skipped: u64,
     /// The name the receiver actually saved the file under, which may differ
     /// from the name that was sent if it collided with an existing file.
     pub final_name: Option<String>,
@@ -99,10 +104,15 @@ where
     machine.apply(Event::RequestSent)?;
     reporter.report(Progress::AwaitingAccept);
 
-    await_decision(stream, &mut machine, options.accept_timeout).await?;
+    let have = await_decision(stream, &mut machine, options.accept_timeout, plan).await?;
     reporter.report(Progress::Accepted {
         path: options.path_kind,
     });
+
+    let skipped: u64 = (0..plan.chunk_count())
+        .filter(|i| have.get(*i))
+        .map(|i| u64::from(plan.len_of(i)))
+        .sum();
 
     let mut file = tokio::fs::File::open(&options.path)
         .await
@@ -159,16 +169,21 @@ where
     Ok(SendSummary {
         transfer_id,
         bytes_sent: sent,
+        bytes_skipped: skipped,
         final_name,
     })
 }
 
 /// Waits for ACCEPT or REJECT, and treats silence as a Reject (S-5).
+///
+/// Returns what the receiver says it already has, which decides which chunks
+/// get sent.
 async fn await_decision<S>(
     stream: &mut S,
     machine: &mut Machine,
     accept_timeout: Duration,
-) -> Result<(), TransferError>
+    plan: ChunkPlan,
+) -> Result<ChunkBitmap, TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -185,13 +200,29 @@ where
     };
 
     match message {
-        Message::Accept(_) => {
+        Message::Accept(accept) => {
+            // A have-bitmap decides which chunks are never sent, so it is
+            // checked rather than trusted: exactly the right length, and no
+            // bits past the end of the transfer. Anything else aborts instead
+            // of being repaired, because the repair would be a guess about
+            // which parts of a file to skip. See ADR-0024.
+            let have = match accept.have_bitmap {
+                Some(text) => match ChunkBitmap::decode(&text, plan.chunk_count()) {
+                    Ok(have) => have,
+                    Err(e) => {
+                        machine.apply(Event::Fail)?;
+                        return Err(e.into());
+                    }
+                },
+                None => ChunkBitmap::new(plan.chunk_count()),
+            };
+
             machine.apply(Event::Accepted)?;
             // On a plain byte stream the connection already exists, so this
             // state is entered and left at once. From M5 it is where ICE
             // happens. See ADR-0016.
             machine.apply(Event::Connected)?;
-            Ok(())
+            Ok(have)
         }
         Message::Reject(reject) => {
             machine.apply(Event::Declined)?;

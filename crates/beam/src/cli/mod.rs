@@ -67,6 +67,9 @@ pub enum CommandError {
     /// enum is as big as its biggest variant.
     #[error(transparent)]
     Transfer(Box<crate::transfer::TransferError>),
+
+    #[error(transparent)]
+    Partial(Box<crate::transfer::PartialError>),
     #[error("{0}")]
     Message(String),
 }
@@ -160,6 +163,23 @@ enum Command {
         /// Where to connect. Development only; peer discovery arrives in M4.
         #[arg(long, hide = true, value_name = "HOST:PORT")]
         addr: Option<SocketAddr>,
+    },
+
+    /// List or clear partially received transfers
+    ///
+    /// A transfer that was interrupted, declined or left unanswered keeps what
+    /// it already received, so that sending the same file again continues
+    /// rather than starting over. Partials older than seven days are removed
+    /// when `beam listen` starts.
+    Transfers {
+        /// Delete partials instead of listing them
+        #[arg(long)]
+        clear: bool,
+        /// Which partial to delete; all of them if left out
+        id: Option<String>,
+        /// Do not ask for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Regenerate this device's pairing code
@@ -265,6 +285,7 @@ impl App {
                 })?;
                 self.send(&peer, &file, addr, io)
             }
+            Command::Transfers { clear, id, yes } => self.transfers(clear, id.as_deref(), yes, io),
             Command::Newcode => Err(stubs::not_implemented("newcode", "M4")),
             Command::Version => stubs::version(io),
         }
