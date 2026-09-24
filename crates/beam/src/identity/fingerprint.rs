@@ -6,6 +6,8 @@ use std::str::FromStr;
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
+use crate::hex;
+
 /// Length in bytes of a peer fingerprint (SHA-256).
 pub const FINGERPRINT_SIZE: usize = 32;
 
@@ -30,12 +32,7 @@ impl Fingerprint {
 
     /// The canonical lowercase hex form (64 characters).
     pub fn hex(&self) -> String {
-        let mut out = String::with_capacity(FINGERPRINT_SIZE * 2);
-        for byte in self.0 {
-            out.push(hex_digit(byte >> 4));
-            out.push(hex_digit(byte & 0x0f));
-        }
-        out
+        hex::encode(&self.0)
     }
 
     /// An abbreviated display form for dense output such as tables.
@@ -73,12 +70,8 @@ impl fmt::Debug for Fingerprint {
 
 /// Why a string could not be read as a fingerprint.
 #[derive(Debug, thiserror::Error)]
-pub enum ParseFingerprintError {
-    #[error("fingerprint must be {expected} hex characters, got {actual}")]
-    Length { expected: usize, actual: usize },
-    #[error("fingerprint is not valid hex")]
-    NotHex,
-}
+#[error("invalid fingerprint: {0}")]
+pub struct ParseFingerprintError(#[from] crate::hex::HexError);
 
 impl FromStr for Fingerprint {
     type Err = ParseFingerprintError;
@@ -93,36 +86,9 @@ impl FromStr for Fingerprint {
         };
         let digits: String = body.chars().filter(|c| *c != ':').collect();
 
-        let expected = FINGERPRINT_SIZE * 2;
-        if digits.len() != expected {
-            return Err(ParseFingerprintError::Length {
-                expected,
-                actual: digits.len(),
-            });
-        }
         let mut bytes = [0u8; FINGERPRINT_SIZE];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            let hi = hex_value(digits.as_bytes()[i * 2])?;
-            let lo = hex_value(digits.as_bytes()[i * 2 + 1])?;
-            *byte = (hi << 4) | lo;
-        }
+        hex::decode_into(&digits, &mut bytes)?;
         Ok(Self(bytes))
-    }
-}
-
-fn hex_digit(nibble: u8) -> char {
-    char::from(match nibble {
-        0..=9 => b'0' + nibble,
-        _ => b'a' + nibble - 10,
-    })
-}
-
-fn hex_value(c: u8) -> Result<u8, ParseFingerprintError> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(ParseFingerprintError::NotHex),
     }
 }
 
