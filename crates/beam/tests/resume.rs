@@ -656,6 +656,128 @@ async fn an_empty_transfer_still_completes() {
     assert_eq!(partial_count(&world), 0);
 }
 
+/// Retention, the case that has to delete: the pieces all arrive intact, and
+/// the file they make is still not the one that was promised.
+///
+/// Each chunk passes its own hash, so nothing is caught on the way in. Only the
+/// whole-file hash catches it, and by then a complete partial exists. Keeping
+/// it would guarantee that the next session re-checks the same bytes and fails
+/// in exactly the same way, so it goes.
+#[tokio::test]
+async fn a_file_that_fails_its_final_hash_is_discarded_and_never_written() {
+    let world = world(SMALL_CHUNK as usize * 4);
+
+    let (mut client, server) = tokio::io::duplex(128 * 1024);
+    let known_peers = world.known_peers.clone();
+    let options = world.receive_options();
+    let receiver = tokio::spawn(async move {
+        receive_file(
+            server,
+            &known_peers,
+            &options,
+            ScriptedPrompt::new(true),
+            &mut SilentReporter,
+            &mut HashSet::new(),
+        )
+        .await
+    });
+
+    let plan = beam::transfer::ChunkPlan::new(world.payload.len() as u64, SMALL_CHUNK);
+    let transfer_id = TransferId::generate().expect("id");
+
+    // The lie: a whole-file hash that belongs to different contents. Every
+    // chunk hash below is honest, so the receiver has no reason to object until
+    // it checks the assembled file.
+    let promised = beam::transfer::sha256_hex(b"some other file entirely");
+    assert_ne!(promised, beam::transfer::sha256_hex(&world.payload));
+
+    write_message(
+        &mut client,
+        &Message::TransferRequest(TransferRequest {
+            transfer_id,
+            sender_public_key: encode_public_key(&world.sender.verifying_key()),
+            file_name: "payload.bin".to_string(),
+            size: world.payload.len() as u64,
+            chunk_size: SMALL_CHUNK,
+            chunk_count: plan.chunk_count(),
+            file_sha256: promised,
+        }),
+    )
+    .await
+    .expect("write request");
+
+    match read_message(&mut client).await.expect("read accept") {
+        Message::Accept(_) => {}
+        other => panic!("unexpected {}", other.kind_name()),
+    }
+
+    for index in 0..plan.chunk_count() {
+        let offset = plan.offset_of(index) as usize;
+        let body = &world.payload[offset..offset + plan.len_of(index) as usize];
+        write_message(
+            &mut client,
+            &Message::ChunkStart(beam::transfer::ChunkStart {
+                index,
+                len: body.len() as u32,
+                sha256: beam::transfer::sha256_hex(body),
+            }),
+        )
+        .await
+        .expect("write chunk start");
+        for slice in body.chunks(beam::transfer::MAX_CHUNK_DATA) {
+            write_message(
+                &mut client,
+                &Message::ChunkData {
+                    index,
+                    bytes: slice.to_vec(),
+                },
+            )
+            .await
+            .expect("write chunk data");
+        }
+        match read_message(&mut client).await.expect("read ack") {
+            // Every chunk is accepted: the damage is invisible piece by piece.
+            Message::ChunkAck(ack) => assert_eq!(ack.index, index),
+            other => panic!("chunk {index} was not accepted: {}", other.kind_name()),
+        }
+    }
+
+    write_message(
+        &mut client,
+        &Message::Complete(beam::transfer::Complete {
+            transfer_id,
+            final_name: None,
+        }),
+    )
+    .await
+    .expect("write complete");
+
+    let outcome = receiver.await.expect("receiver task");
+    assert!(
+        matches!(outcome, Err(TransferError::VerificationFailed)),
+        "expected VerificationFailed, got {outcome:?}"
+    );
+
+    assert_eq!(
+        partial_count(&world),
+        0,
+        "a partial that cannot produce the promised file was kept"
+    );
+    let left_behind: Vec<String> = std::fs::read_dir(&world.out)
+        .expect("read out")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        left_behind.is_empty(),
+        "the destination gained {left_behind:?} from a file that failed its hash"
+    );
+    assert!(
+        !world.work.join("payload.bin").exists(),
+        "the part file was left where the partial used to be"
+    );
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

@@ -160,6 +160,7 @@ Retention, rule by rule, against the table in ADR-0022:
 | Rule | Test |
 |---|---|
 | A finished transfer discards its partial | `a_finished_transfer_leaves_no_partial` |
+| A partial whose file fails the whole-file hash is discarded, and nothing reaches the destination | `a_file_that_fails_its_final_hash_is_discarded_and_never_written` — every chunk hash is honest, so only the final check catches it |
 | A declined resume keeps it | `declining_a_resume_keeps_the_partial_for_next_time` |
 | A declined *fresh* transfer keeps nothing | `declining_a_fresh_transfer_leaves_nothing_behind` |
 | An interruption keeps it | `an_interrupted_transfer_resumes_and_sends_only_what_is_missing` |
