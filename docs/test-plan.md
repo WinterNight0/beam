@@ -253,20 +253,31 @@ question you have not seen is exactly what S-1 forbids.
 
 ## Planned
 
-### M4 — signaling server and pairing
+### M4 — rendezvous server and pairing
 
-Presence registration and heartbeat expiry; lookup by Short ID; server restart;
-server unreachable; a successful PAKE pairing writes exactly one `known_peers`
-entry on each side; a wrong pairing code fails on both sides and writes nothing;
-`newcode` invalidates the previous code.
+Registration and expiry; lookup by Short ID returns an iroh endpoint address;
+server restart; server unreachable; a Short ID that is not registered; a
+successful SPAKE2 pairing writes exactly one `known_peers` entry on each side; a
+wrong pairing code fails on both sides and writes nothing; `newcode` invalidates
+the previous code; the relay URL is read from configuration; and a test that
+beam never installs n0's discovery services (S-17).
 
-### M5–M7 — WebRTC, Noise, relay
+### M5 — the iroh transport
 
-The M2 transfer tests re-run unchanged over a data channel; ICE failure falls
-back to relay; the Noise KK handshake is bound to the DTLS fingerprint and a
-substituted fingerprint aborts; a changed peer key aborts with the SSH-style
-warning and does not update `known_peers` (S-8); the progress line reports
-`[Direct P2P]` or `[Relay]` correctly (F-11).
+The M2 and M3 transfer tests re-run unchanged over an iroh stream, which is the
+point of ADR-0016 and what the spike prototype already demonstrated once. The
+progress line reports `[Direct P2P]` or `[Relay]` from `IncomingAddr` (F-11).
+
+### M6 — threat model and the security tests that back it
+
+A written `docs/threat-model.md`, and tests proving impersonation fails at the
+transport level rather than at ours: an unknown key; a known key held by someone
+without the matching secret key; a rendezvous server returning the wrong address
+for a Short ID; and a peer that re-ran `beam init`, which must fail with a
+message telling the user to re-pair (S-8).
+
+Every `STRENGTHEN IN M6:` marker is removed as its case becomes covered, and
+S-7a moves from "outstanding" to "met".
 
 ## Known gaps
 

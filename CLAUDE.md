@@ -45,14 +45,19 @@ beam newcode                   # regenerate pairing code
   + `cargo test`. `unsafe_code = "forbid"` workspace-wide.
 - CLI: `clap` (derive).
 - Identity keys: Ed25519 (`ed25519-dalek`), PKCS#8 PEM via the `pkcs8` feature.
-- Pairing: an established PAKE crate (`spake2` is the likely choice). Check that it
-  is maintained before adopting; propose alternatives if not.
-- Peer authentication after pairing: Noise Protocol **KK** handshake (`snow`),
-  bound to the WebRTC DTLS fingerprints (channel binding) so the signaling server cannot
-  perform MITM.
-- P2P transport: WebRTC data channels via `webrtc-rs` (ICE/STUN; TURN relay fallback).
+- Pairing: `spake2` (PAKE). Check that it is maintained before adopting; propose
+  alternatives if not.
+- P2P transport: **iroh, pinned to `=1.2.0`** (QUIC, hole punching, relay fallback).
+  Chosen by SPIKE-001; see ADR-0025. The exact pin is deliberate: a silent minor
+  bump changes network behaviour.
+- Peer authentication: **provided by the transport.** iroh's endpoint identity *is*
+  an Ed25519 keypair, so `~/.beam/id_ed25519` is the peer identity and a connection
+  cannot exist without the peer proving possession of its private key. There is no
+  Noise KK layer; see ADR-0025 for what replaced it.
 - Async runtime: `tokio`, introduced at M2 with the transfer engine.
-- Signaling server: Rust + WebSocket. Stateless-ish; in-memory presence with heartbeats.
+- Rendezvous server: Rust + WebSocket. Maps a Short ID to an iroh endpoint address.
+  **beam does not use n0's discovery service**; see `docs/n0-data.md`.
+- Relay: configurable. n0's relay during development, self-hosted `iroh-relay` later.
 - Local storage: files under `~/.beam/` (plain text / JSON); SQLite only if needed later.
 
 ## Identity model
@@ -98,13 +103,12 @@ crates/beam/
   src/cli/             command definitions (kept out of main so they are testable)
   src/identity/        keygen, fingerprint, short ID, known_peers
   src/pairing/         PAKE pairing flow
-  src/auth/            Noise KK handshake + channel binding
-  src/transport/       WebRTC connection, ICE, relay
-  src/signaling/       client for the signaling server
+  src/transport/       iroh endpoint, connection, relay configuration
+  src/rendezvous/      client for the rendezvous server
   src/transfer/        protocol messages, state machine, chunking, resume, integrity
   src/ui.rs            prompts, progress bar
   tests/               command-level and integration tests
-crates/beam-server/    signaling server
+crates/beam-server/    rendezvous server
 docs/                  requirements, diagrams, test plan, design decisions
 ```
 
@@ -118,10 +122,17 @@ own workspace crates only if compile times demand it.
 - **M2** Transfer engine over plain TCP on localhost (no server, no crypto yet):
   request → Accept prompt → chunks → per-chunk hash → final hash → atomic commit.
 - **M3** Resume with bitmap + interruption tests. Resume requires a new Accept. `beam transfers` lists and clears partials.
-- **M4** Signaling server + presence + `listen`/`pair` using PAKE.
-- **M5** Replace TCP with WebRTC data channels (STUN), keep the same transfer engine.
-- **M6** Noise KK mutual authentication bound to DTLS fingerprints; key-mismatch abort.
-- **M7** TURN relay fallback; show `[Direct P2P]` or `[Relay]` in the progress line.
+- **M4** Rendezvous server mapping Short ID → iroh endpoint address. `listen` shows the
+  Short ID and a pairing code; `beam pair` uses `spake2` to exchange and confirm public
+  keys. Relay URL is configurable (n0's relay for development). **Do not use n0's DNS
+  discovery** — the address comes from our own server. See `docs/n0-data.md`.
+- **M5** Use the iroh transport in real `send`/`listen`, keeping the same transfer
+  engine. Show `[Direct P2P]` or `[Relay]` in the progress line. Absorbs the old M7.
+- **M6** Replaces Noise KK. Write `docs/threat-model.md`. Add security tests proving
+  impersonation fails at the transport level: an unknown key, a known key without its
+  secret key, a rendezvous server returning a wrong address, and a peer that re-ran
+  `beam init` (must fail with a clear "re-pair" message). Remove every
+  `STRENGTHEN IN M6:` marker and make S-7a pass.
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.
 
 ## Testing expectations

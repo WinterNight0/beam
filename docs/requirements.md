@@ -18,11 +18,13 @@ Requirement IDs are stable. Tests reference them.
 | F-5 | `beam remove <name>` forgets a peer, after confirmation. | M1 |
 | F-6 | `beam listen` waits for incoming transfers and shows the Short ID and pairing code. | M2/M4 |
 | F-7 | `beam send <peer> <file>` sends a file to a paired peer. | M2 |
-| F-8 | `beam pair <ID> --name <name>` performs first-time pairing using a Short ID and a pairing code. | M4 |
+| F-8 | `beam pair <ID> --name <name>` performs first-time pairing using a Short ID and a pairing code, exchanging and confirming public keys with `spake2`. | M4 |
+| F-13 | A rendezvous server maps a Short ID to an iroh endpoint address. beam never uses n0's DNS discovery. | M4 |
+| F-14 | The relay URL is configurable; n0's relay is the development default and a self-hosted `iroh-relay` replaces it later. | M4 |
 | F-9 | `beam newcode` regenerates this device's pairing code. | M4 |
 | F-10 | A transfer resumes after an interruption without re-sending verified chunks. Resuming is triggered only by running `beam send` again: there is no automatic reconnection and no `beam resume`. | M3 |
 | F-12 | `beam transfers` lists partially received transfers; `beam transfers --clear` deletes them after confirmation. | M3 |
-| F-11 | The progress line states whether the connection is `[Direct P2P]` or `[Relay]`. | M7 |
+| F-11 | The progress line states whether the connection is `[Direct P2P]` or `[Relay]`. | M5 |
 
 ## 2. Security requirements
 
@@ -38,10 +40,12 @@ convenience loses.
 | S-5 | An unanswered request expires (default 60 s) and counts as a Reject. | M2 |
 | S-6 | The Accept prompt shows sender name, sender fingerprint, file name and size. | M2 |
 | S-7 | The receiver only accepts requests from peers present in its own `known_peers`; unknown senders are rejected without prompting. | M2 |
-| S-7a | The sender's identity is *proven*, not merely claimed. In M2 the receiver checks the public key a sender presents against `known_peers`, but nothing proves the sender holds the matching private key; see ADR-0019. Tests that turn on this gap are marked `STRENGTHEN IN M6:`. | M6 |
-| S-8 | A changed peer key is a hard abort with an SSH-style warning. A stored key is never updated automatically; the user must re-pair. | M6 |
+| S-7a | The sender's identity is *proven*, not merely claimed. In M2–M4 the receiver checks the public key a sender presents against `known_peers`, but nothing proves the sender holds the matching private key; see ADR-0019. Satisfied in M5 by the transport (ADR-0025) and demonstrated by tests in M6. Tests that turn on the gap are marked `STRENGTHEN IN M6:`. | M5/M6 |
+| S-8 | A changed peer key is a hard abort with an SSH-style warning. A stored key is never updated automatically; the user must re-pair. A peer that re-ran `beam init` therefore fails to connect, with a message that says to re-pair. | M6 |
 | S-9 | Private keys never leave the device and are never sent to the signaling server. | M1 |
-| S-10 | Peer authentication uses a Noise KK handshake (`snow`) bound to the WebRTC DTLS fingerprints, so the signaling server cannot mount a MITM. | M6 |
+| S-10 | Peer authentication is provided by the transport: iroh's QUIC/TLS proves possession of the Ed25519 private key behind an endpoint id before a connection exists, so a rendezvous server returning a wrong address cannot mount a MITM. | M5 |
+| S-16 | A written threat model (`docs/threat-model.md`) states what an attacker can and cannot do, backed by tests that demonstrate each claim. | M6 |
+| S-17 | beam publishes nothing to third-party infrastructure by default beyond relayed (encrypted) traffic; what would otherwise be published, and how to disable it, is documented in `docs/n0-data.md`. | M4 |
 | S-11 | Transfer IDs are random; replayed or expired IDs are rejected. | M2/M3 |
 | S-14 | A partial transfer is matched by (sender fingerprint, file_sha256, size, chunk_size) and never by a sender-supplied transfer ID, so no peer can attach to another peer's partial. | M3 |
 | S-15 | A have-bitmap from a peer is validated — exact length, no bits past the end — and a bad one aborts the transfer rather than being repaired. | M3 |
@@ -82,8 +86,9 @@ convenience loses.
 ## 5. Implementation language
 
 The project was specified in Go and M0/M1 were first built that way; it moved to
-Rust at the team's request. See ADR-0010 in `decisions.md` for the switch and
-the library replacements it forces (`webrtc-rs`, `snow`, `spake2`, `tokio`).
+Rust at the team's request. See ADR-0010 in `decisions.md`. The transport was
+then chosen by SPIKE-001: **iroh**, not WebRTC, which removes the need for a
+Noise KK layer — see ADR-0025.
 Nothing in sections 1-4 changed as a result: the file formats, the identity
 derivations and every security rule are unchanged, and the same fixed test
 vectors pass in both implementations.

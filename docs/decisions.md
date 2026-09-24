@@ -2,8 +2,8 @@
 
 Short ADR-style entries. Each records what was decided, why, and what it costs.
 
-Decisions still to be made are tracked in `spikes.md`; the P2P transport
-library (SPIKE-001, due before M4) is the open one.
+Decisions still to be made are tracked in `spikes.md`. SPIKE-001, the P2P
+transport choice, is closed by ADR-0025.
 
 ---
 
@@ -773,3 +773,141 @@ but claims chunks that do not exist.
 Note what this does **not** protect against: a receiver can still claim to have
 chunks it does not have, and the transfer will then fail its whole-file hash.
 That is the receiver harming only itself, and the final hash catches it.
+
+---
+
+## ADR-0025 — iroh is the P2P transport
+
+**Status:** accepted (2026-09-24), resolves SPIKE-001, supersedes the WebRTC and
+Noise KK parts of the original brief
+
+**Context.** The brief named `pion/webrtc` (ported to Rust as `webrtc-rs`) with a
+Noise KK handshake for peer authentication. SPIKE-001 compared that against
+`str0m` and `iroh` before M4, because the choice decides how much of M4 exists.
+Full findings: [`spikes/transport.md`](spikes/transport.md).
+
+### Decision
+
+**Use `iroh`, pinned to `=1.2.0`.**
+
+The pin is exact, not a caret range. iroh is the transport: a silent minor bump
+changes how beam behaves on a network, and that is not something to discover
+from a CI failure on an unrelated branch. Bumping it is a deliberate change with
+the changelog read, and it gets its own commit.
+
+### What was measured
+
+On this project's Windows 11 machine, Rust 1.98.1, MSVC:
+
+| | webrtc-rs 0.21.0 | str0m 0.23.1 | **iroh 1.2.0** |
+|---|---|---|---|
+| Reached 1.0 | no, after 8 years | no | **yes, 2026-06-15** |
+| Commits, last 3 months | 100+, **89 by one person** | 55, 20 authors | 88, 17 authors |
+| Transitive dependencies | 172 | 87 | 246 |
+| Clean release build | 107 s | 163 s | 181 s |
+| Binary cost over beam | not measured | not measured | **+11 MiB** (2.34 → 13.33) |
+| Fits `AsyncRead + AsyncWrite` | no, message API | no, sans-IO | **yes, directly** |
+| Relay for CGNAT | run coturn | run coturn | **built in, self-hostable** |
+| Prototype built and run | no | no | **yes** |
+
+### Why, in order of weight
+
+1. **Our Ed25519 key is the peer identity, unchanged.**
+   `iroh::SecretKey::from_bytes(&[u8; 32])` wraps `ed25519_dalek::SigningKey` —
+   the type already in `~/.beam/id_ed25519`. The prototype proved the endpoint
+   id *is* beam's public key, byte for byte:
+
+   ```
+   beam public_key (base64) : 8LDnMTFuE5FKOlVDzsx8ktLxuZhkWhj+YriN0yI/cS8=
+   the same bytes as hex    : f0b0e731316e13914a3a5543cecc7c92d2f1b998645a18fe62b88dd3223f712f
+   iroh endpoint id         : f0b0e731316e13914a3a5543cecc7c92d2f1b998645a18fe62b88dd3223f712f
+   ```
+
+   `known_peers` needs no migration, and the fingerprint stays
+   `SHA256(public key)`.
+
+2. **Identity is proved by the transport, which closes S-7a.**
+   `connection.remote_id()` returns `PublicKey`, not `Result<PublicKey>`: there
+   is no state in which a connection exists but the peer is merely claimed.
+   Noise KK was planned to provide exactly this. It is no longer needed as a
+   mechanism — see the new M6 below for what replaces it.
+
+3. **The engine does not change.** iroh's streams implement `tokio::io::AsyncRead`
+   and `AsyncWrite`, so the adapter is `tokio::io::join(recv, send)`. The
+   prototype ran the real `send_file`/`receive_file` between two processes,
+   unmodified, with the Accept prompt and the `known_peers` check intact.
+
+4. **CGNAT has an answer on day one.** Thai mobile networks put both peers behind
+   carrier-grade NAT, where hole punching usually fails and a relay is the only
+   path. iroh does hole punching and falls back to a relay itself, and ships an
+   Asia-Pacific relay. With either WebRTC option we would have to stand up and
+   pay for coturn before a phone-to-laptop transfer worked at all.
+
+5. **Maintenance.** iroh is the only candidate past 1.0, and the only one whose
+   work is spread across a team. webrtc-rs is carried by one person and is
+   mid-rewrite onto a sans-IO core — six pre-releases in two months.
+
+### The two objections, and what we do about them
+
+**Objection 1: infrastructure that is not ours.** By default iroh publishes to
+n0's discovery service and relays through n0's servers. For a tool whose pitch
+is that a small server only helps peers find each other, that needs an answer
+rather than a shrug.
+
+*What we do:* **beam does not use n0's discovery at all.** M4 builds our own
+rendezvous server mapping Short ID to an iroh endpoint address, so the address
+comes from us. The relay URL is configuration, defaulting to n0's relay during
+development and moving to a self-hosted `iroh-relay` later. Exactly what would
+otherwise reach n0, and how each part is switched off, is written down in
+[`n0-data.md`](n0-data.md) — including the fact that the relay carries QUIC it
+cannot decrypt.
+
+**Objection 2: eleven megabytes, and a milestone that disappears.** The binary
+grows from 2.34 MiB to 13.33 MiB, and M6 stops being "implement Noise KK",
+which was a genuinely instructive piece of work for a software engineering
+course.
+
+*What we do:* the size is accepted — it is still one binary with no runtime
+dependencies (N-2), which is the property that was actually promised. The
+milestone is not deleted but **redirected**: M6 becomes a written threat model
+plus security tests that *prove* impersonation fails at the transport level,
+including a peer that re-ran `beam init`. Writing down what an attacker can and
+cannot do, and then demonstrating it, is the more valuable artifact of the two;
+it is also the one that would have been needed *anyway* alongside a hand-rolled
+Noise layer.
+
+### Consequences
+
+The roadmap changes; `CLAUDE.md` and `requirements.md` are updated to match.
+
+- **M4** keeps a server, but a much smaller one: Short ID → endpoint address,
+  plus SPAKE2 pairing. No ICE brokering, no presence heartbeats for their own
+  sake.
+- **M5** absorbs the old M7. Swapping TCP for iroh and showing
+  `[Direct P2P]`/`[Relay]` are the same small piece of work, because the tag is
+  a match on `IncomingAddr::Ip` vs `IncomingAddr::Relay`.
+- **M6** replaces Noise KK with a threat model and the tests that back it.
+- **M7** no longer exists as a separate milestone.
+
+What we give up: the trust now rests on iroh's TLS stack rather than on a Noise
+layer we wrote. That is one well-trodden protocol instead of two stacked ones,
+which is usually the safer bet, but it is a larger dependency and it should be
+recorded as such rather than glossed.
+
+### Still outstanding
+
+**The cross-network measurements have not been taken.** The prototype was run on
+localhost only. What remains unproven is the thing that actually decides whether
+beam is usable in Thailand: whether hole punching gets through mobile CGNAT, how
+often it falls back to a relay, and how slow the relayed path is.
+
+The steps are written out in [`spikes/transport.md`](spikes/transport.md) —
+tests A (home Wi-Fi to hotspot), B (the reverse, since NAT is often asymmetric),
+C (mobile to mobile) and D (forced relay). This decision is made without them on
+the strength of the other five criteria, and because every alternative is worse
+on this specific axis: webrtc-rs and str0m need a TURN server before the same
+test could even be run.
+
+If those tests come back showing frequent connection failures rather than
+merely relayed connections, that is the result that would reopen this ADR.
+Relayed-but-working is expected and is not a reason to revisit.

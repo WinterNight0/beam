@@ -8,8 +8,10 @@ otherwise.
 
 ## SPIKE-001 — P2P transport library
 
-**Status: complete (2026-09-24). Findings in [`spikes/transport.md`](spikes/transport.md);
-recommendation is iroh, awaiting a decision. An ADR follows the decision.**
+**Status: closed (2026-09-24). Decision: iroh, pinned to `=1.2.0` — ADR-0025.
+Findings in [`spikes/transport.md`](spikes/transport.md). The cross-network
+measurements (tests A–D in those findings) are still outstanding and would only
+reopen the decision if connections fail outright rather than merely relay.**
 
 **Run before:** M4 (signaling server and pairing)
 **Timebox:** 2 days
