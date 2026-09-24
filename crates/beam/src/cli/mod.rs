@@ -5,9 +5,12 @@
 
 mod identity_cmds;
 mod stubs;
+mod terminal;
+mod transfer_cmds;
 
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
@@ -19,6 +22,13 @@ use crate::identity::{PeerError, Store, StoreError};
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_NOT_IMPLEMENTED: i32 = 2;
+
+/// Where `beam listen` binds when `--addr` is not given.
+///
+/// Loopback, so that M2's unencrypted, unauthenticated transport is not exposed
+/// to the network by accident. See ADR-0018 and ADR-0019.
+const DEFAULT_LISTEN_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 7777);
 
 const LONG_ABOUT: &str = "\
 beam sends files directly between two computers.
@@ -52,6 +62,11 @@ pub enum CommandError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    /// Boxed because a transfer error is much larger than the others, and an
+    /// enum is as big as its biggest variant.
+    #[error(transparent)]
+    Transfer(Box<crate::transfer::TransferError>),
     #[error("{0}")]
     Message(String),
 }
@@ -127,7 +142,14 @@ enum Command {
     },
 
     /// Wait for incoming transfers and show the pairing code
-    Listen,
+    Listen {
+        /// Where to listen. Development only; peer discovery arrives in M4.
+        #[arg(long, hide = true, value_name = "HOST:PORT")]
+        addr: Option<SocketAddr>,
+        /// Directory to save received files in (default: the current directory)
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+    },
 
     /// Send a file to a paired peer
     Send {
@@ -135,6 +157,9 @@ enum Command {
         peer: String,
         /// The file to send
         file: PathBuf,
+        /// Where to connect. Development only; peer discovery arrives in M4.
+        #[arg(long, hide = true, value_name = "HOST:PORT")]
+        addr: Option<SocketAddr>,
     },
 
     /// Regenerate this device's pairing code
@@ -148,6 +173,11 @@ enum Command {
 pub(crate) struct App {
     pub(crate) store: Store,
     pub(crate) json: bool,
+}
+
+/// The command tree, for tests that need to inspect the CLI's own shape.
+pub fn command() -> clap::Command {
+    Cli::command()
 }
 
 /// Runs the command tree and returns the process exit code.
@@ -223,8 +253,18 @@ impl App {
             Command::Rename { old_name, new_name } => self.rename(&old_name, &new_name, io),
             Command::Remove { name, yes } => self.remove(&name, yes, io),
             Command::Pair { .. } => Err(stubs::not_implemented("pair", "M4")),
-            Command::Listen => Err(stubs::not_implemented("listen", "M2")),
-            Command::Send { .. } => Err(stubs::not_implemented("send", "M2")),
+            Command::Listen { addr, out } => {
+                self.listen(addr.unwrap_or(DEFAULT_LISTEN_ADDR), out, io)
+            }
+            Command::Send { peer, file, addr } => {
+                let addr = addr.ok_or_else(|| {
+                    CommandError::Message(
+                        "M2 needs `--addr <host:port>` to reach the peer;                          finding a peer by name arrives in M4"
+                            .to_string(),
+                    )
+                })?;
+                self.send(&peer, &file, addr, io)
+            }
             Command::Newcode => Err(stubs::not_implemented("newcode", "M4")),
             Command::Version => stubs::version(io),
         }

@@ -268,14 +268,9 @@ fn the_remove_prompt_shows_the_fingerprint() {
 }
 
 #[test]
-fn stubbed_commands_exit_two() {
+fn commands_that_wait_for_later_milestones_exit_two() {
     let (_tmp, dir) = initialised();
-    let cases: [&[&str]; 4] = [
-        &["listen"],
-        &["send", "alice", "file.txt"],
-        &["pair", "123456789", "--name", "alice"],
-        &["newcode"],
-    ];
+    let cases: [&[&str]; 2] = [&["pair", "123456789", "--name", "alice"], &["newcode"]];
     for args in cases {
         let outcome = run(&dir, "", args);
         assert_eq!(
@@ -288,6 +283,129 @@ fn stubbed_commands_exit_two() {
             "{args:?}: {}",
             outcome.stderr
         );
+    }
+}
+
+#[test]
+fn send_is_no_longer_a_stub() {
+    // A successful `listen` blocks until a peer connects, so it cannot be
+    // tested this way; `listen_without_an_identity_points_at_init` below covers
+    // the listen half by checking it fails for a real reason rather than by
+    // reporting itself unimplemented.
+    let (_tmp, dir) = initialised();
+    let outcome = run(
+        &dir,
+        "",
+        &["send", "alice", "nothing.txt", "--addr", "127.0.0.1:1"],
+    );
+    assert_ne!(
+        outcome.code, EXIT_NOT_IMPLEMENTED,
+        "send still reports itself as unimplemented"
+    );
+}
+
+#[test]
+fn send_without_an_address_explains_that_discovery_is_not_here_yet() {
+    let (_tmp, dir) = initialised();
+    seed_peers(&dir);
+    let outcome = run(&dir, "", &["send", "alice", "anything.txt"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(
+        outcome.stderr.contains("--addr") && outcome.stderr.contains("M4"),
+        "unhelpful error: {}",
+        outcome.stderr
+    );
+}
+
+#[test]
+fn send_to_an_unpaired_peer_fails_before_connecting() {
+    let (_tmp, dir) = initialised();
+    // Port 1 is not listening; reaching the network at all would hang or error
+    // differently, so this also shows the peer check comes first.
+    let outcome = run(
+        &dir,
+        "",
+        &["send", "nobody", "x.txt", "--addr", "127.0.0.1:1"],
+    );
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(
+        outcome.stderr.contains("peer not found"),
+        "unexpected error: {}",
+        outcome.stderr
+    );
+}
+
+#[test]
+fn listen_without_an_identity_points_at_init() {
+    let (_tmp, dir) = beam_dir();
+    let outcome = run(&dir, "", &["listen"]);
+    assert_eq!(
+        outcome.code, EXIT_ERROR,
+        "listen exited {} — a stub would exit {EXIT_NOT_IMPLEMENTED}",
+        outcome.code
+    );
+    assert!(
+        outcome.stderr.contains("beam init"),
+        "unexpected error: {}",
+        outcome.stderr
+    );
+}
+
+/// S-1, the CLI half: no flag on `beam listen` can stand in for a person
+/// answering the prompt.
+///
+/// This is an allowlist rather than a denylist on purpose. A denylist only
+/// catches the names somebody thought of in advance; an allowlist means any new
+/// flag on `listen` fails this test until somebody has looked at it and decided
+/// it is not an accept bypass.
+#[test]
+fn listen_has_no_flag_that_could_stand_in_for_the_prompt() {
+    let command = beam::cli::command();
+    let listen = command
+        .find_subcommand("listen")
+        .expect("listen is a subcommand");
+
+    let mut flags: Vec<&str> = listen
+        .get_arguments()
+        .filter_map(|arg| arg.get_long())
+        .collect();
+    flags.sort_unstable();
+
+    // `beam-dir`, `json` and `help` are added by clap from the root command,
+    // so what is listed here is exactly what `listen` declares for itself.
+    assert_eq!(
+        flags,
+        ["addr", "out"],
+        "the flags on `beam listen` changed; check that the new one cannot \
+         accept a transfer without a person answering the prompt (S-1)"
+    );
+}
+
+/// S-1 again, from the other direction: nothing anywhere in the CLI is named
+/// like an auto-accept switch.
+#[test]
+fn no_command_offers_an_auto_accept_switch() {
+    const FORBIDDEN: [&str; 8] = [
+        "accept",
+        "auto",
+        "auto-accept",
+        "trust",
+        "trusted",
+        "no-confirm",
+        "unattended",
+        "batch",
+    ];
+
+    let command = beam::cli::command();
+    for sub in command.get_subcommands() {
+        for arg in sub.get_arguments() {
+            let long = arg.get_long().unwrap_or_default();
+            assert!(
+                !FORBIDDEN.contains(&long),
+                "`beam {} --{long}` looks like a way to skip the Accept prompt",
+                sub.get_name()
+            );
+        }
     }
 }
 

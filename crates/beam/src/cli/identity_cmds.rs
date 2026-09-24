@@ -184,7 +184,7 @@ fn peer_json(peer: &Peer) -> PeerJson {
     }
 }
 
-fn write_json<T: Serialize>(io: &mut Io<'_>, value: &T) -> Result<(), CommandError> {
+pub(super) fn write_json<T: Serialize>(io: &mut Io<'_>, value: &T) -> Result<(), CommandError> {
     let text = serde_json::to_string_pretty(value)?;
     writeln!(io.out, "{text}")?;
     Ok(())
