@@ -79,9 +79,16 @@ Messages (JSON or length-prefixed binary, decide in design):
 - Transfer IDs are random; reject replayed/expired IDs.
 
 Transfer state machine:
-`Requested → AwaitingAccept → Connecting → Transferring → (Interrupted → Reconnecting) → Verifying → Completed`
+`Requested → AwaitingAccept → Connecting → Transferring → Verifying → Completed`
 with terminal states `Rejected`, `Expired`, `Failed`, `Cancelled`. Implement it as an
 explicit, unit-tested state machine.
+
+There is deliberately **no** `Interrupted`/`Reconnecting` pair: a broken transfer ends
+in `Failed`, and resuming is a *new* transfer that finds chunks already on disk and goes
+through the whole machine from the top, prompt included. That is what makes "resuming
+needs a new Accept" a property of the design rather than a rule to remember. Resume is
+triggered only by running `beam send` again — no automatic reconnection, no
+`beam resume`. See ADR-0020.
 
 ## Suggested layout
 
@@ -110,7 +117,7 @@ own workspace crates only if compile times demand it.
 - **M1** Identity: `init`, `whoami`, `peers`, `rename`, `remove`, known_peers file handling.
 - **M2** Transfer engine over plain TCP on localhost (no server, no crypto yet):
   request → Accept prompt → chunks → per-chunk hash → final hash → atomic commit.
-- **M3** Resume with bitmap + interruption tests. Resume requires a new Accept.
+- **M3** Resume with bitmap + interruption tests. Resume requires a new Accept. `beam transfers` lists and clears partials.
 - **M4** Signaling server + presence + `listen`/`pair` using PAKE.
 - **M5** Replace TCP with WebRTC data channels (STUN), keep the same transfer engine.
 - **M6** Noise KK mutual authentication bound to DTLS fingerprints; key-mismatch abort.

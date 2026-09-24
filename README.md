@@ -7,10 +7,10 @@ server only helps two peers find each other — it never stores your files. Ever
 incoming transfer has to be accepted by hand, and only peers you have paired
 with can ask.
 
-> **Status: milestone M2.** Identity management and file transfer work over a
-> TCP address you give by hand. Pairing (`pair`, `newcode`) is stubbed and exits
+> **Status: milestone M3.** Identity, file transfer and resume work over a TCP
+> address you give by hand. Pairing (`pair`, `newcode`) is stubbed and exits
 > with code 2. There is no encryption yet and the sender's identity is only
-> claimed, not proven — see [What M2 does not protect you from](#what-m2-does-not-protect-you-from).
+> claimed, not proven — see [What this does not protect you from](#what-this-does-not-protect-you-from).
 
 ## Build
 
@@ -40,6 +40,8 @@ beam remove alice              # forget a peer
 
 beam listen                    # wait for transfers
 beam send alice project.zip    # send a file to a paired peer
+beam transfers                 # list partly received transfers
+beam transfers --clear         # discard them
 
 beam pair <ID> --name alice    # first-time pairing          (M4)
 beam newcode                   # regenerate the pairing code (M4)
@@ -184,13 +186,72 @@ sha256sum payload.bin inbox/payload.bin    # the two hashes must match
 | Send the same file twice, answering `y` both times | The second is saved as `payload (1).bin`, and both terminals say so. The first is never overwritten |
 | Pipe the answer: `echo y \| beam listen ...` | It does **not** work, on purpose. Each prompt discards anything typed before it appeared, so you cannot pre-answer a question you have not seen |
 | Delete `alice` from `bob/known_peers`, then send | Bob refuses without showing a prompt at all, and Alice is told the peer has not paired with her |
-| Interrupt the sender mid-transfer with Ctrl+C | The transfer fails and `inbox/` gains nothing. Resuming rather than starting over is M3 |
+| Interrupt the sender mid-transfer with Ctrl+C, then send the same file again | The second run says `(resuming)` and `Already have`, sends only the rest, and the finished file still matches. `beam transfers` shows the partial in between |
+| Interrupt it, then answer `n` | The partial survives; `beam transfers` still lists it, and sending again picks it up |
+| Interrupt it, then edit `payload.bin` and send again | It starts from zero, because it is now a different file |
 | `beam listen --addr 0.0.0.0:7777` | It works, and prints a warning explaining why you should not |
 
-## What M2 does not protect you from
+## Resuming
 
-M2 is the transfer engine, not the security model. Two things are missing, and
-both arrive later:
+If a transfer stops part-way — the link drops, a laptop closes, somebody hits
+Ctrl+C — what already arrived is kept. **Send the same file again and it carries
+on from where it stopped.**
+
+```
+beam send bob big.iso --addr 127.0.0.1:7777     # interrupted at 40%
+beam send bob big.iso --addr 127.0.0.1:7777     # continues from 40%
+```
+
+There is no `beam resume` and nothing reconnects by itself. Running `send` again
+is the whole interface.
+
+A resume is a new transfer that happens to find data on disk, so **it is
+accepted like any other**, and the prompt says what it is:
+
+```
+Incoming file (resuming)
+  From          alice
+  Fingerprint   SHA256:dd0ab8817907e2c7...
+  File          big.iso
+  Size          4.0 GiB
+  Already have  1.6 GiB (40%), from 2 hours ago
+Accept? [y/N]:
+```
+
+Saying no keeps what you already have, so you can accept it later. What is
+waiting:
+
+```
+beam transfers
+ID        FILE      SIZE     HAVE  UPDATED
+3f9a1c22  big.iso   4.0 GiB  40%   2 hours ago
+
+beam transfers --clear            # discard everything, after confirming
+beam transfers --clear 3f9a1c22   # discard one
+```
+
+Partials are dropped after seven days without use, tidied up when `beam listen`
+starts.
+
+A few things worth knowing:
+
+- **Edit the file and it starts over.** The transfer is identified by the file's
+  SHA-256, so a changed file is a different transfer. The old partial is left
+  alone rather than quietly mixed in.
+- **What is on disk is re-checked, not assumed.** Every chunk already held is
+  re-hashed before the sender is told about it. A chunk damaged since last time
+  is simply fetched again.
+- **A partial belongs to one peer.** It is matched on the sender's fingerprint
+  as well as the file, so nobody else can attach to it or learn it exists.
+- **One session at a time.** A partial is locked while it is in use; a second
+  `beam listen` receiving the same file is told so rather than both writing.
+- **Space is checked before you are asked**, so you are not interrupted to agree
+  to something that cannot finish. Only the missing bytes have to fit.
+
+## What this does not protect you from
+
+This is the transfer engine, not the security model. Two things are missing,
+and both arrive later:
 
 - **There is no encryption.** Anyone who can see the network path can read the
   file. WebRTC brings DTLS in M5.
@@ -203,11 +264,13 @@ So: use `127.0.0.1` for now. `beam listen` warns when you bind anywhere else,
 and that warning is worth reading rather than dismissing. See ADR-0018 and
 ADR-0019 in [docs/decisions.md](docs/decisions.md).
 
-What *does* hold in M2, and has tests that try to break it: every transfer is
-accepted by hand, no flag or config can skip the prompt, unknown senders are
-refused without a prompt, data arriving before ACCEPT ends the transfer, every
-chunk is verified before it is written, the whole file is verified before it is
-saved, and an existing file is never overwritten.
+What *does* hold, and has tests that try to break it: every transfer is
+accepted by hand — including every resume — and no flag or config can skip the
+prompt; unknown senders are refused without a prompt; data arriving before
+ACCEPT ends the transfer; every chunk is verified before it is written and
+re-verified before it is reused; the whole file is verified before it is saved;
+an existing file is never overwritten; and a partial transfer belongs to the one
+peer it came from.
 
 ## Files
 
@@ -217,12 +280,18 @@ Everything lives in `~/.beam/`:
 id_ed25519        private key, PEM-wrapped PKCS#8, mode 0600 — never leaves this device
 id_ed25519.pub    ed25519 <base64 key> <comment>
 known_peers       one peer per line; the trust root for receiving
-tmp/<transfer_id>/  a file being assembled, removed when the transfer ends
+tmp/<id>/         a transfer in progress: state.json, part, hashes, lock
 ```
 
 A received file is built under `tmp/`, verified against the SHA-256 the sender
-committed to before you accepted, and only then moved into place. A transfer
-that fails at any point leaves nothing behind.
+committed to before you accepted, and only then moved into place — by a rename
+when it can, by a copy when the destination is on another drive.
+
+Inside a `tmp/<id>/` directory, `state.json` records which chunks have arrived
+and `hashes` records what each one should be. The bitmap in `state.json` is
+always written **after** the chunk data has been flushed, so a crash loses the
+claim rather than the data: the chunk is fetched again instead of being trusted
+when it should not be.
 
 `known_peers` is plain text and safe to read:
 

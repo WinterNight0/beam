@@ -550,3 +550,226 @@ The same gap applies in the other direction: `beam send alice` checks that
 `alice` is in the local `known_peers`, but nothing proves the machine at `--addr`
 is alice. In M2 the peer name on the sending side buys a sanity check and no
 more.
+
+---
+
+## ADR-0020 — Resume is a new transfer, not a reconnection
+
+**Status:** accepted (M3), amends the state machine in ADR-0008's milestone
+
+**Context.** CLAUDE.md sketches the state machine with
+`Transferring → Interrupted → Reconnecting → Transferring`. That shape implies
+beam reconnects on its own and picks up where it left off. It also sits badly
+beside the rule that resuming needs a new Accept (S-2): if the machine can walk
+back into `Transferring` by itself, the Accept has to be bolted on somewhere,
+and a rule bolted on is a rule that can come off.
+
+**Decision.** `Interrupted` and `Reconnecting` are removed. A transfer that
+loses its connection ends in `Failed`. Resuming is what happens when somebody
+runs `beam send <peer> <file>` again: a new transfer, with a new transfer id,
+which goes through the whole machine from `Requested`, prompt included. It
+simply finds that some chunks are already on disk.
+
+There is no automatic reconnection and no `beam resume` command.
+
+**Consequences.** S-2 stops being a rule anybody has to remember: there is no
+code path that reaches `Transferring` without passing through the prompt, and a
+test asserts exactly that by walking all 10 states against all 10 events. The
+state machine shrank from 12 states and 13 events to 10 and 10.
+
+The cost is that an interruption always needs a person. A large transfer over a
+flaky link will stop and wait rather than healing itself. That is the right
+trade for a tool whose whole point is that nothing arrives without somebody
+agreeing to it, and it can be revisited — a future milestone could reconnect
+*automatically within one accepted session*, which is a different thing from
+resuming across sessions and would not weaken S-2.
+
+`CLAUDE.md` was updated so the brief and the code agree.
+
+---
+
+## ADR-0021 — A partial is matched by what the sender cannot forge
+
+**Status:** accepted (M3)
+
+**Context.** When a request arrives, the receiver has to decide whether it
+continues something already on disk. The obvious key is the transfer id, and it
+is the wrong one: the sender chooses it, so anyone who could guess or replay one
+could attach to somebody else's partial — reading how much of it exists, or
+worse, contributing chunks to it.
+
+**Decision.** A partial is matched on
+
+```
+(sender fingerprint, file_sha256, size, chunk_size)
+```
+
+and never on the transfer id. Each session uses a fresh random transfer id,
+which identifies the session and nothing else. The partial's directory name is
+chosen locally and is not derived from anything the sender sent.
+
+**Consequences.** Every field in the key is one the sender cannot change without
+changing which file is being sent. The fingerprint is the strongest of them: a
+partial belongs to one peer, so `a_partial_is_never_offered_to_a_different_peer`
+holds even before the identity is *proven* (which is still M6's job, ADR-0019) —
+an unrecognised key never gets as far as the matching step.
+
+Two files with identical contents from the same peer share a partial, which is
+correct: they are the same bytes.
+
+A consequence worth stating plainly: if the source file changes between
+sessions, `file_sha256` changes, no partial matches, and the transfer starts
+fresh. The old partial is left alone rather than deleted, because it still
+belongs to the file as it was, and nothing has said that file is unwanted. This
+is requirement D-9.
+
+---
+
+## ADR-0022 — Crash consistency, retention, and expiry of partials
+
+**Status:** accepted (M3)
+
+**Context.** A partial is state that outlives the process. Three questions have
+to be answered once, in one place, or they drift: what order things are written
+in, what survives a failure, and when stale data goes away.
+
+### Layout
+
+```
+~/.beam/tmp/<id>/state.json   metadata and the have-bitmap, replaced atomically
+~/.beam/tmp/<id>/part         the file being assembled
+~/.beam/tmp/<id>/hashes       32 bytes per chunk, at fixed offsets
+~/.beam/tmp/<id>/lock         held while a session is using this partial
+```
+
+The chunk hashes are a separate fixed-layout file rather than a field in
+`state.json`, so `state.json` stays about a kilobyte whatever the file size. In
+the JSON, a 10 GiB transfer would mean rewriting roughly a megabyte of metadata
+after every 4 MiB chunk — tens of gigabytes of writes to record a few hundred
+kilobytes of fact.
+
+The lock is its own file because `state.json` is replaced by rename on every
+write, and a lock held on a file that has been renamed away quietly stops
+meaning anything.
+
+### Write ordering
+
+For each chunk, in this order:
+
+1. write the chunk into `part` and `fsync`;
+2. write its hash into `hashes` and `fsync`;
+3. set the bit in the bitmap and replace `state.json` atomically.
+
+**The bitmap is the last thing written.** A crash between any two steps loses
+the *claim* rather than the data: the chunk is asked for again, which costs
+bandwidth, instead of being counted as present when it is not, which would cost
+correctness. The only direction this can be wrong in is the safe one.
+
+### Retention
+
+Decided in one place in `receive_file`, so the rules cannot drift apart:
+
+| Outcome | Partial | Why |
+|---|---|---|
+| Completed | discarded | it became the file |
+| Whole-file hash failed | discarded | it will fail the same way next time |
+| Anything else, holding no chunks | discarded | nothing to keep, and an empty directory is clutter in `beam transfers` |
+| Declined at the prompt | **kept** | "not now" must not throw away an earlier session's work |
+| Unanswered, expired | **kept** | same |
+| Connection lost | **kept** | this is what resume is for |
+| Not enough disk space | **kept** | free some space and try again |
+| Chunk failed its hash repeatedly | **kept** | the chunks that did verify are still good |
+| Another session holds the lock | **untouched** | it is not this session's to change |
+
+A peer sending data before ACCEPT (S-4) falls under "holding no chunks" when the
+request was fresh, and under "anything else" when a partial already existed —
+so a rude peer cannot destroy what a well-behaved session built.
+
+Unknown peers, dangerous file names and malformed requests are refused *before*
+a partial is opened, so there is nothing to retain or discard.
+
+### Expiry
+
+Partials expire after **7 days** without being written to. The sweep runs **when
+`beam listen` starts**: the one moment beam is both long-lived and certainly
+idle. Running it on every request would put a directory scan in the path of
+every transfer; running it from `beam transfers` would mean the act of looking
+at something destroys it. A partial another session is using is skipped.
+
+`beam transfers` lists partials and marks stale ones `expired` without deleting
+them; `beam transfers --clear` deletes, after a confirmation that says what is
+about to be lost.
+
+**Consequences.** Two `fsync` calls per 4 MiB chunk, which is the price of the
+guarantee. The bitmap can understate what is on disk after a crash, never
+overstate it. The retention table is the specification the tests in
+`tests/resume.rs` check case by case.
+
+---
+
+## ADR-0023 — Committing a finished file across a volume boundary
+
+**Status:** accepted (M3), fixes a bug in M2
+
+**Context.** M2 committed a finished file with a single `rename` from
+`~/.beam/tmp/...` into `--out`. A rename cannot cross volumes. `--out` on
+another drive is entirely ordinary — `D:\Downloads` on Windows, a mounted disk
+on Linux — so M2 would have failed at the last step of an otherwise successful
+transfer, after all the bytes had been moved. This was found by asking the
+question, not by hitting it: the machine this was built on has one volume.
+
+**Decision.** `commit` tries the rename first, and on a cross-volume error falls
+back to copying into a temporary file **inside the destination directory**,
+`fsync`ing it, and renaming from there. The last step is therefore always a
+rename within one volume.
+
+Free space is checked on both volumes before the prompt (requirement N-7): the
+partial's volume needs the bytes still missing, and the destination's needs the
+whole file — but only when they really are different volumes, since otherwise
+the commit is a rename and costs nothing.
+
+**Consequences.** A crash during the copy leaves a temporary file in the
+destination directory rather than a half-written download wearing the
+destination's name, and the temporary is removed on any error path.
+
+Testing this honestly is awkward: a second volume cannot be assumed on a
+developer machine or a CI runner. So the copy path is a separate public function
+with its own tests, which run everywhere and cover the behaviour that matters —
+identical contents, the reserved placeholder replaced, nothing left behind on
+failure. What the tests cannot cover is the *dispatch*: that a real cross-volume
+rename produces the error we recognise. That is a manual step, written down in
+`docs/test-plan.md` rather than assumed.
+
+`same_volume` compares `st_dev` on Unix and the canonical path prefix on
+Windows, and answers "not the same" when it cannot tell — the conservative way
+round, since being wrong that way only costs a copy and a stricter space check.
+
+---
+
+## ADR-0024 — A have-bitmap is validated, not trusted
+
+**Status:** accepted (M3)
+
+**Context.** The bitmap in ACCEPT decides which chunks the sender does not send.
+A receiver that sends a wrong one — through a bug, or deliberately — makes the
+sender skip parts of a file.
+
+**Decision.** The sender checks that the bitmap is exactly `ceil(count / 8)`
+bytes, and that no bits are set past the last chunk. Either failure aborts the
+transfer. Neither is repaired.
+
+The encoding is standard base64 of a little-endian bit array: chunk `i` is bit
+`i % 8` of byte `i / 8`.
+
+**Consequences.** Repairing a bad bitmap would mean guessing which parts of a
+file to skip, which is exactly the decision that must not be guessed. Aborting
+turns a silent wrong file into a loud failure.
+
+The length check is the one that does the work: a bitmap valid for some *other*
+transfer is almost always the wrong length for this one, and is refused. The
+padding-bits check catches the narrower case of a bitmap that is the right size
+but claims chunks that do not exist.
+
+Note what this does **not** protect against: a receiver can still claim to have
+chunks it does not have, and the transfer will then fail its whole-file hash.
+That is the receiver harming only itself, and the final hash catches it.

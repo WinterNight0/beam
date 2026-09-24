@@ -8,6 +8,8 @@ powershell -File scripts\check.ps1          # the same, on Windows without make
 cargo test known_peers                      # one area
 cargo test --lib                            # unit tests only
 cargo test --test cli                       # command-level tests only
+cargo test --test resume                    # resume and retention
+cargo test --test end_to_end                # two real processes
 ```
 
 `make check` is the gate: a milestone is not done until it passes. CI runs the
@@ -23,7 +25,9 @@ pull request (ADR-0014), so the gate is enforced rather than remembered.
 | Integration | `crates/beam/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
 | Failure | `crates/beam/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
 | Security | `tests/transfer.rs::accept_rules`, `tests/cli.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
-| End to end | `crates/beam/tests/end_to_end.rs` | two real `beam` processes, talking over a real socket, with the prompt answered only once it has actually appeared |
+| Resume | `crates/beam/tests/resume.rs` | partial transfers: what carries over, what is re-fetched, and what survives a failure |
+| End to end | `crates/beam/tests/end_to_end.rs` | two real `beam` processes, talking over a real socket, with the prompt answered only once it has actually appeared — including killing one of them mid-transfer |
+| Manual | `docs/test-plan.md` | the few things one machine cannot honestly automate: a real second volume, a real full disk |
 
 Command-level tests never spawn a process and never touch the real `~/.beam`:
 every test gets a `TempDir` passed via the `--beam-dir` flag. Lints are part of
@@ -127,18 +131,126 @@ S-7a). When the Noise KK handshake lands in M6, this test gains a sibling that
 replays a known peer's public key without its private key and expects a refusal —
 a test that would fail today.
 
+## Implemented (M3)
+
+### Unit tests
+
+| Area | Cases |
+|------|-------|
+| Bitmap (S-15, ADR-0024) | a new bitmap holds nothing; set and clear touch one chunk only; every index in a range of lengths can be set independently; out-of-range indices are ignored rather than panicking; a full bitmap is complete; an empty transfer is complete immediately; round-trip through the encoding for eight lengths; the encoded length is one bit per chunk; **decoding refuses a bitmap of the wrong length, one with bits past the end of the transfer, one that is not base64, and one that is valid for a different transfer** |
+| Free space (N-7) | a directory is on the same volume as itself; a path that does not exist is treated as a different volume, which is the conservative answer; free space is reported for a real directory; a transfer that fits is allowed; one larger than the disk is refused with a message naming what was needed and what was free; **only the missing bytes have to fit**, so a nearly finished resume is not refused over the size it already has |
+| Commit (D-13, ADR-0023) | the rename path moves the file and removes the part file; **the copy path produces identical contents**, replaces the placeholder the receiver reserved, and leaves nothing behind when it fails |
+| State machine (S-2, ADR-0020) | all 10 states × 10 events against a hand-written table; `Interrupted` and `Reconnecting` are gone, and a lost connection ends in `Failed` with no way back |
+| Age formatting | reads the way a person would say it, and never "0 seconds ago" |
+
+### Resume tests — `tests/resume.rs`
+
+| Required case | Test | What it establishes |
+|---|---|---|
+| Interrupted, then resumed | `an_interrupted_transfer_resumes_and_sends_only_what_is_missing` | the second session prompts again (S-2) and says it is a resume; the sender skips exactly the bytes already held; the finished file matches; no partial is left |
+| A stored chunk is corrupted on disk | `a_corrupted_stored_chunk_is_re_fetched_rather_than_trusted` | the damaged chunk is dropped from the bitmap and re-requested, and the finished file is correct |
+| The source file changed between sessions | `a_changed_source_file_starts_over_instead_of_resuming` | nothing is reused, the prompt does not call it a resume, the new file is correct, and the old partial is left alone (D-9) |
+| A malformed have-bitmap | `a_malformed_have_bitmap_aborts_the_sender` | four kinds — too short, too long, bits past the end, not base64 — each abort the sender |
+| A resume from a peer that is not paired | `a_partial_is_never_offered_to_a_different_peer` | a stranger asking for the same file is refused before the prompt, learns nothing, and leaves the partial untouched (S-14) |
+| A second session for the same partial | `a_second_session_for_the_same_partial_is_refused` | refused with `Busy`, no prompt shown, partial undamaged (D-12) |
+| A resume declined at the prompt | `declining_a_resume_keeps_the_partial_for_next_time` | the partial survives *and is then used* by a third session that completes |
+
+Retention, rule by rule, against the table in ADR-0022:
+
+| Rule | Test |
+|---|---|
+| A finished transfer discards its partial | `a_finished_transfer_leaves_no_partial` |
+| A declined resume keeps it | `declining_a_resume_keeps_the_partial_for_next_time` |
+| A declined *fresh* transfer keeps nothing | `declining_a_fresh_transfer_leaves_nothing_behind` |
+| An interruption keeps it | `an_interrupted_transfer_resumes_and_sends_only_what_is_missing` |
+| A peer sending data before ACCEPT cannot destroy an existing partial | `data_before_accept_cannot_destroy_an_existing_partial` |
+| A blocked second session changes nothing | `a_second_session_for_the_same_partial_is_refused` |
+| A stranger's request changes nothing | `a_partial_is_never_offered_to_a_different_peer` |
+
+### Killed-process tests — `tests/end_to_end.rs`
+
+| Test | What it covers |
+|---|---|
+| `killed::killing_the_sender_mid_transfer_then_resuming` | the sender is killed outright; the partial on disk is what had been flushed; the next run prompts as a resume, says "Already have", and produces the right file |
+| `killed::killing_the_receiver_mid_transfer_then_resuming` | the same with the receiver killed, which is the case the write ordering in ADR-0022 exists for: a `SIGKILL` gives nothing a chance to tidy up |
+
+### `beam transfers` — `tests/cli.rs`
+
+Empty state; listing with percentage and a stale entry marked expired; `--json`;
+confirmation before clearing, with the prompt naming what is about to be lost;
+declining keeps the partial; clearing one by an abbreviated id leaves the others;
+an unknown id and an ambiguous id are both errors rather than guesses.
+
+### Two flaky tests, and why they were flaky
+
+Worth recording, because both were found by running the suite repeatedly rather
+than once, and both would have failed in CI eventually.
+
+- **Interrupting on a timer is a race the test loses.** An in-memory pipe moves
+  a few hundred kilobytes in microseconds, so a transfer meant to be cut short
+  sometimes finished first, and the test then found no partial. Interruptions
+  are now driven by a hand-written sender that sends exactly *n* chunks and
+  hangs up, which leaves the same partial every time.
+- **A prompt that answers instantly can win a race no person would.** The tests
+  about data arriving *while the prompt is open* depend on the data winning. A
+  prompt returning in nanoseconds sometimes beat it. Those tests now use a
+  prompt that takes 300 ms, as a person does.
+
+## Manual test steps
+
+Some things cannot honestly be covered by an automated test on one machine.
+These are short, and worth running before a release.
+
+### Cross-volume commit (D-13, ADR-0023)
+
+The copy path has unit tests, but nothing automated proves that a *real*
+cross-volume rename produces the error that triggers it. Needs a second volume:
+another drive, a USB stick, or a mounted image.
+
+```bash
+# Linux: a small tmpfs makes a second volume without extra hardware
+sudo mkdir -p /mnt/beamtest && sudo mount -t tmpfs -o size=64M tmpfs /mnt/beamtest
+sudo chown "$USER" /mnt/beamtest
+
+beam listen --addr 127.0.0.1:7777 --out /mnt/beamtest      # ~/.beam is on / 
+# from another terminal, send a file and accept it
+sha256sum payload.bin /mnt/beamtest/payload.bin            # must match
+sudo umount /mnt/beamtest
+```
+
+```powershell
+# Windows: any second drive letter will do
+beam listen --addr 127.0.0.1:7777 --out D:\beam-inbox
+# from another terminal, send a file and accept it
+Get-FileHash payload.bin -Algorithm SHA256
+Get-FileHash D:\beam-inbox\payload.bin -Algorithm SHA256   # must match
+```
+
+Expected: the transfer completes, the hashes match, and no `.beam-commit-*`
+file is left in the destination directory.
+
+### Too little disk space (N-7)
+
+```bash
+# Linux: a tiny tmpfs as the destination
+sudo mount -t tmpfs -o size=1M tmpfs /mnt/beamtest
+beam listen --addr 127.0.0.1:7777 --out /mnt/beamtest
+# send something larger than 1 MiB
+```
+
+Expected: the sender is told the peer has not enough free disk space, **no
+prompt appears on the receiver**, and nothing is written.
+
+### The prompt cannot be answered in advance
+
+```bash
+echo y | beam listen --addr 127.0.0.1:7777
+```
+
+Expected: the piped `y` is discarded and the prompt still waits. Answering a
+question you have not seen is exactly what S-1 forbids.
+
 ## Planned
-
-### M3 — resume
-
-Bitmap set/clear/count/serialisation; resume after an interruption transfers
-only missing chunks; a resumed transfer prompts for a new Accept (S-2); a
-replayed transfer ID is rejected (S-11); crash and restart mid-transfer.
-
-D-9: a resume whose `file_sha256` or `size` differs from the stored transfer is
-refused and starts over as a new transfer; chunks already verified are checked
-against the hashes the receiver persisted on the first attempt, not against
-whatever the sender announces the second time.
 
 ### M4 — signaling server and pairing
 
@@ -170,5 +282,10 @@ warning and does not update `known_peers` (S-8); the progress line reports
 - `beam listen` blocks until a peer connects, so its success path has no
   *command-level* test; it is covered by `tests/end_to_end.rs`, which runs it as
   a real process, and by the manual walkthrough in `README.md`.
+- The cross-volume *dispatch* — that a real cross-volume rename produces the
+  error that triggers the copy path — is a manual step above, not an automated
+  test. The copy path itself is covered.
+- Disk-space exhaustion is checked by unit tests against absurd sizes rather
+  than by actually filling a disk; the manual step above does it for real.
 - The progress line's rendering is not asserted anywhere. It adapts to whether
   stdout is a terminal, and the end-to-end tests see the non-terminal form.
