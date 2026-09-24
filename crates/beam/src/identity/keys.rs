@@ -7,6 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use ed25519_dalek::{PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SigningKey, VerifyingKey};
+use zeroize::Zeroizing;
 
 use super::{Fingerprint, ShortId};
 
@@ -46,16 +47,15 @@ pub struct Identity {
 
 impl Identity {
     /// Creates a fresh keypair from operating-system entropy.
+    ///
+    /// The seed lives in a [`Zeroizing`] buffer, so it is wiped when this
+    /// function returns however it returns, and `SigningKey` is
+    /// `ZeroizeOnDrop`, so the key itself is wiped when the `Identity` is
+    /// dropped. See ADR-0013.
     pub fn generate(comment: &str) -> Result<Self, KeyError> {
-        let mut seed = [0u8; SECRET_KEY_LENGTH];
-        getrandom::fill(&mut seed)?;
+        let mut seed = Zeroizing::new([0u8; SECRET_KEY_LENGTH]);
+        getrandom::fill(seed.as_mut_slice())?;
         let signing = SigningKey::from_bytes(&seed);
-
-        // `SigningKey` zeroizes its own copy when dropped. Clear ours too; the
-        // `black_box` stops the compiler eliding a write to a dead local. See
-        // ADR-0011 for why this is best-effort rather than the `zeroize` crate.
-        seed.fill(0);
-        std::hint::black_box(&seed);
 
         Ok(Self {
             signing,
@@ -102,10 +102,13 @@ impl Identity {
     }
 
     /// Encodes the private key as PEM-wrapped PKCS#8.
-    pub fn to_pkcs8_pem(&self) -> Result<String, KeyError> {
+    ///
+    /// The result stays inside [`Zeroizing`] all the way to the file write:
+    /// copying it into a plain `String` would leave the secret in a heap
+    /// allocation that nothing wipes.
+    pub fn to_pkcs8_pem(&self) -> Result<Zeroizing<String>, KeyError> {
         self.signing
             .to_pkcs8_pem(LineEnding::LF)
-            .map(|pem| pem.to_string())
             .map_err(KeyError::Encode)
     }
 
@@ -202,7 +205,11 @@ mod tests {
     fn private_key_round_trips_through_pem() {
         let identity = Identity::from_signing_key(signing_key("alpha"), "laptop");
         let pem = identity.to_pkcs8_pem().expect("encode");
-        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----"), "{pem}");
+        // Deliberately not printing `pem` on failure: it is a private key.
+        assert!(
+            pem.starts_with("-----BEGIN PRIVATE KEY-----"),
+            "unexpected PEM header"
+        );
 
         let loaded = Identity::from_pkcs8_pem(&pem, "laptop").expect("decode");
         assert_eq!(loaded.signing_key(), identity.signing_key());

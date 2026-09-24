@@ -77,7 +77,14 @@ Nothing in sections 1-4 changed as a result: the file formats, the identity
 derivations and every security rule are unchanged, and the same fixed test
 vectors pass in both implementations.
 
-## 6. Out of scope
+## 6. Open investigations
+
+Before M4 the team runs SPIKE-001, a timeboxed comparison of `webrtc-rs`,
+`str0m` and `iroh` as the P2P transport, and records the choice as an ADR. The
+result can change how much of M4 there is to build, which is why it happens
+before that milestone rather than before M5. See `spikes.md`.
+
+## 7. Out of scope
 
 Folder transfer, transfer history, bandwidth limiting and a `ratatui` TUI are
 stretch goals, attempted only after M7. Multi-file transfers, a web client and

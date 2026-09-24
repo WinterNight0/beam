@@ -10,7 +10,9 @@ cargo test --lib                            # unit tests only
 cargo test --test cli                       # command-level tests only
 ```
 
-`make check` is the gate: a milestone is not done until it passes.
+`make check` is the gate: a milestone is not done until it passes. CI runs the
+same three commands on `ubuntu-latest` and `windows-latest` for every push and
+pull request (ADR-0014), so the gate is enforced rather than remembered.
 
 ## Test levels
 
@@ -99,8 +101,8 @@ warning and does not update `known_peers` (S-8); the progress line reports
 
 - File permissions are only asserted on Unix-like systems; on Windows the mode
   bits carry no meaning (ADR-0004).
-- There is no CI runner configured yet. `make check` is the contract a runner
-  would execute.
-- `Identity::generate` zeroizes its seed buffer on a best-effort basis rather
-  than with the `zeroize` crate (ADR-0013); there is no test for that, because
-  there is no portable way to assert it.
+- Zeroization (ADR-0013) is not covered by a test: there is no portable way to
+  assert that a buffer was wiped, since reading it after the wipe is exactly
+  what the type system prevents. It is enforced by the types instead —
+  `Zeroizing` and `ZeroizeOnDrop` — and by review.
+- macOS is not in the CI matrix (ADR-0014).
