@@ -462,7 +462,7 @@ async fn read_request(
 ///
 /// STRENGTHEN IN M6: this only checks that the key the sender *claims* is one
 /// we have paired with. Nothing here proves the sender holds the matching
-/// private key; the Noise KK handshake is what will. See ADR-0019.
+/// private key; iroh's handshake will, in M5. See ADR-0019 and ADR-0025.
 fn known_sender(known_peers: &KnownPeers, claimed_key: &str) -> Option<(String, Fingerprint)> {
     let key = decode_public_key(claimed_key).ok()?;
     let peer = known_peers.lookup_key(&key)?;

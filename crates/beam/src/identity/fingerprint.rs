@@ -16,8 +16,8 @@ const SHORT_ID_MODULUS: u64 = 1_000_000_000;
 
 /// The SHA-256 digest of a raw 32-byte Ed25519 public key.
 ///
-/// This is the canonical, full-strength identifier for a device: the signaling
-/// server routes by it, and users compare it out of band.
+/// This is the canonical, full-strength identifier for a device: users compare
+/// it out of band, and both screens show it when pairing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; FINGERPRINT_SIZE]);
 

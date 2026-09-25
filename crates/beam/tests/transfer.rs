@@ -540,9 +540,9 @@ mod accept_rules {
     ///
     /// STRENGTHEN IN M6: this proves only that an *unrecognised key* is turned
     /// away. It does not prove that a sender presenting a recognised key holds
-    /// the matching private key — in M2 that is claimed, not proven. When the
-    /// Noise KK handshake lands, this test gains a sibling that replays a known
-    /// peer's public key without its private key and expects a refusal.
+    /// the matching private key — in M2 that is claimed, not proven. When
+    /// transfers move onto iroh (M5), this test gains a sibling that presents a
+    /// known peer's public key without its private key and expects a refusal.
     #[tokio::test]
     async fn s7_an_unknown_sender_is_refused_without_a_prompt() {
         let stranger = Identity::generate("stranger").expect("generate");

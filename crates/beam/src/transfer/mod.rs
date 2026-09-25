@@ -1,8 +1,8 @@
 //! The transfer engine: wire messages, framing, chunking, the state machine,
 //! and the sending and receiving halves.
 //!
-//! The engine is generic over its byte stream and knows nothing about TCP,
-//! QUIC or WebRTC data channels; see [`crate::transport`] and ADR-0016.
+//! The engine is generic over its byte stream and knows nothing about TCP or
+//! QUIC; see [`crate::transport`] and ADR-0016.
 
 pub mod bitmap;
 pub mod chunk;

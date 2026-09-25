@@ -37,7 +37,7 @@ pub enum KeyError {
 
 /// This device's keypair.
 ///
-/// The private half never leaves the device and is never sent to the signaling
+/// The private half never leaves the device and is never sent to the rendezvous
 /// server.
 #[derive(Clone)]
 pub struct Identity {
