@@ -1,6 +1,6 @@
 [package]
 name = "beam-server"
-description = "Signaling server that helps two beam peers find each other"
+description = "Rendezvous server that helps two beam devices find each other"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,8 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+beam = { path = "../beam" }
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "macros"] }

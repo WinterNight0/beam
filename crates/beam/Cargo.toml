@@ -23,12 +23,24 @@ clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
 fs4 = "1.1.0"
+# Only the `sink` helpers: tokio-websockets speaks futures' Stream/Sink.
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 getrandom = "0.4.3"
+hmac = "0.13.0"
+# Pinned exactly: iroh is the transport, and a minor bump changes how beam
+# behaves on a network. Bumping it is its own reviewed commit. ADR-0025.
+iroh = "=1.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
+# Pinned exactly: a pre-release, chosen because it shares iroh's curve25519
+# and sha2 versions. ADR-0026.
+spake2 = { version = "=0.5.0-pre.0", features = ["getrandom"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 time = { version = "0.3.45", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "fs", "time", "sync", "macros"] }
+# The same features iroh-relay already enables, plus `server` and webpki roots.
+tokio-websockets = { version = "0.13.3", features = ["client", "server", "ring", "getrandom", "rustls-webpki-roots"] }
+toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }
 zeroize = "1.9.0"
