@@ -7,10 +7,10 @@ server only helps two devices find each other — it never sees your files. Ever
 incoming transfer has to be accepted by hand, and only peers you have paired
 with can ask.
 
-> **Status: milestone M4.** Pairing works: a rendezvous server, SPAKE2 over an
-> iroh connection, and a fingerprint confirmation on both devices. File
-> transfer and resume still run over a TCP address you give by hand, without
-> encryption, until M5 moves them onto iroh — see
+> **Status: milestone M5.** Pairing and file transfer both run over iroh:
+> encrypted end to end, direct when possible and through a relay when not, with
+> each device proving its key on every connection. `beam listen` serves both on
+> one endpoint. M6 adds the threat model and the tests that attack it — see
 > [What this does not protect you from](#what-this-does-not-protect-you-from).
 
 ## Build
@@ -39,27 +39,20 @@ beam peers                     # list paired peers
 beam rename alice ali          # change a local nickname
 beam remove alice              # forget a peer
 
-beam listen                    # wait for transfers
+beam listen                    # wait for transfers and pairing: shows Short ID + code
 beam send alice project.zip    # send a file to a paired peer
 beam transfers                 # list partly received transfers
 beam transfers --clear         # discard them
 
-beam pair --wait --name alice  # wait to be paired: shows Short ID + code
-beam pair <ID> --name bob      # pair with a waiting device, typing its code
-beam newcode                   # regenerate the pairing code (M5)
+beam pair <ID> --name bob      # pair with a listening device, typing its code
+beam pair --wait --name alice  # pair without also receiving files
 
 beam-server                    # the rendezvous server
 ```
 
-Until M5 moves transfers onto iroh, `listen` and `send` need a TCP address.
-That is scaffolding, so the flag is hidden:
-
-```
-beam listen --addr 127.0.0.1:7777 --out ~/Downloads
-beam send alice project.zip --addr 127.0.0.1:7777
-```
-
-`listen` binds `127.0.0.1:7777` by default and saves into the current directory.
+`listen` saves into the current directory unless given `--out <dir>`. Its
+pairing code works once and changes every ten minutes; after three wrong codes
+in a row it stops offering pairing until it is restarted.
 
 Global flags: `--beam-dir <path>` (default `$BEAM_DIR`, else `~/.beam`) and
 `--json` for machine-readable output.
@@ -91,40 +84,86 @@ BEAM_DIR=$PWD/bob   beam init
 head -c 5M /dev/urandom > payload.bin      # something worth sending
 ```
 
+Offline, the default relay cannot be reached and beam spends ten seconds
+finding that out each time it starts. To skip it, put `relay = "none"` in
+`alice/config.toml` and `bob/config.toml`.
+
 **Terminal 0 — the rendezvous server.** It only introduces the two devices.
 
 ```bash
 beam-server              # listens on ws://127.0.0.1:8787/v1, beam's default
 ```
 
-**Pair them.** In terminal 1, bob waits; in terminal 2, alice joins with the
-Short ID bob's screen shows:
+**Terminal 1 — bob listens.** One command waits for both pairing and files:
 
 ```bash
-# terminal 1
-cd /tmp/beam-demo && BEAM_DIR=$PWD/bob beam pair --wait --name alice
-# terminal 2
-cd /tmp/beam-demo && BEAM_DIR=$PWD/alice beam pair <bob's Short ID> --name bob
+cd /tmp/beam-demo && BEAM_DIR=$PWD/bob beam listen --out $PWD/inbox
 ```
 
-Terminal 1 shows the code; type it into terminal 2 when asked. Both terminals
-then show both fingerprints and ask:
+```
+  Short ID      690 340 153
+  Pairing code  685 821
+  Fingerprint   SHA256:10a44acf76456739...
+  Relay         https://aps1-1.relay.n0.iroh.link./
+  Saving to     /tmp/beam-demo/inbox
+
+To pair a new device, run on it:  beam pair 690340153 --name <a name for this one>
+The pairing code works once and changes every 10 minutes.
+Waiting for transfers. Every one has to be accepted by hand. Ctrl+C to stop.
+```
+
+**Terminal 2 — alice pairs with bob**, using the Short ID from terminal 1, and
+types the code when asked:
+
+```bash
+cd /tmp/beam-demo && BEAM_DIR=$PWD/alice beam pair 690340153 --name bob
+```
+
+Both terminals then show the pairing question. It looks deliberately unlike the
+file prompt, because pairing is permanent:
 
 ```
-The other device knows the code.
-  Save as       alice
+================================================================
+  PAIRING REQUEST - this is permanent
+================================================================
+A device that knows your pairing code wants to pair with you.
+  Save as       alices-laptop
   Their key     SHA256:390f55e08994ce1e...
   Your key      SHA256:10a44acf76456739...
 
-Check that the other screen shows the same two fingerprints, the other way round.
-Pair with this device? [y/N]:
+Once paired, alices-laptop can send you files (each one still needs your Accept)
+until you run `beam remove alices-laptop`. Check that the other screen shows
+the same two fingerprints, the other way round.
+Type "yes" to pair, anything else to refuse:
 ```
 
-Answer `y` in both. `beam peers` on either side now lists the other.
+Type `yes` in both — `y` is not enough here. bob saves alice under the name her
+machine suggested; `beam rename` changes it.
 
-Offline, the default relay cannot be reached and `pair --wait` spends ten
-seconds finding that out before carrying on with direct addresses. To skip it,
-put `relay = "none"` in `alice/config.toml` and `bob/config.toml`.
+**Then send.** Still in terminal 2:
+
+```bash
+BEAM_DIR=$PWD/alice beam send bob payload.bin
+```
+
+Terminal 1 asks, and nothing moves until you answer:
+
+```
+Incoming file
+  From          alices-laptop
+  Fingerprint   SHA256:390f55e08994ce1e...
+  File          payload.bin
+  Size          5.0 MiB
+Accept? [y/N]:
+```
+
+Type `y`. Terminal 2 shows the path as it goes — `[Direct P2P]` here, `[Relay]`
+when the two devices cannot reach each other directly — and says if it changes
+mid-transfer. Check that what arrived is what left:
+
+```bash
+sha256sum payload.bin inbox/payload.bin    # the two hashes must match
+```
 
 <details>
 <summary><strong>The same in PowerShell</strong></summary>
@@ -150,102 +189,56 @@ $bytes = New-Object byte[] (5MB)
 beam-server
 ```
 
-**Terminal 1 — bob waits to pair.**
+**Terminal 1 — bob listens.**
 
 ```powershell
 $demo = "$env:USERPROFILE\beam-demo"
 $env:BEAM_DIR = "$demo\bob"
-beam pair --wait --name alice
+beam listen --out "$demo\inbox"
 ```
 
-**Terminal 2 — alice joins**, with the Short ID from terminal 1, and types the
-code when asked:
+**Terminal 2 — alice pairs, then sends.** Use the Short ID from terminal 1 and
+type the code when asked; type `yes` in both terminals at the pairing question.
 
 ```powershell
 $demo = "$env:USERPROFILE\beam-demo"
 $env:BEAM_DIR = "$demo\alice"
 beam pair <bob's Short ID> --name bob
+beam send bob "$demo\payload.bin"
 ```
 
-Answer `y` in both terminals once they show the fingerprints. If you write a
-`config.toml` with PowerShell 5.1's `Set-Content -Encoding utf8`, it gets a
-byte-order mark; beam skips a leading BOM for exactly this reason.
-
-**Then send.** Terminal 1 receives, terminal 2 sends:
-
-```powershell
-beam listen --addr 127.0.0.1:7777 --out "$demo\inbox"     # terminal 1
-beam send bob "$demo\payload.bin" --addr 127.0.0.1:7777   # terminal 2
-```
-
-Answer the prompt in terminal 1 with `y`, then check the two hashes match:
+Answer the file prompt in terminal 1 with `y`, then check the two hashes match:
 
 ```powershell
 Get-FileHash "$demo\payload.bin" -Algorithm SHA256
 Get-FileHash "$demo\inbox\payload.bin" -Algorithm SHA256
 ```
 
-The table of things to try below applies unchanged; only the shell differs.
+A `config.toml` written with PowerShell 5.1's `Set-Content -Encoding utf8` gets
+a byte-order mark; beam skips it. The table below applies unchanged.
 
 </details>
-
-**Things worth trying while pairing.**
-
-| Try this | What should happen |
-|---|---|
-| Type a wrong code | Both sides fail, neither is asked `[y/N]`, nothing is saved, and bob's code is used up: `pair --wait` exits and has to be run again |
-| Answer `n` on either side | Both sides fail and nothing is saved on either |
-| Leave `pair --wait` for ten minutes | The code expires and bob stops being findable |
-| Pair again under a name you already use | Refused before anything touches the network |
-| Stop `beam-server`, then run `beam pair` | It says it cannot reach the rendezvous server, and where that address is configured |
-
-**Now send a file.** Transfers still use a TCP address you give by hand until
-M5; pairing is what put each device's key in the other's `known_peers`.
-
-**Terminal 1 — the receiver.**
-
-```bash
-cd /tmp/beam-demo
-BEAM_DIR=$PWD/bob beam listen --addr 127.0.0.1:7777 --out $PWD/inbox
-```
-
-**Terminal 2 — the sender.**
-
-```bash
-cd /tmp/beam-demo
-BEAM_DIR=$PWD/alice beam send bob payload.bin --addr 127.0.0.1:7777
-```
-
-Terminal 1 now shows the prompt, and nothing moves until you answer it:
-
-```
-Incoming file
-  From          alice
-  Fingerprint   SHA256:dd0ab8817907e2c7...
-  File          payload.bin
-  Size          5.0 MiB
-Accept? [y/N]:
-```
-
-Type `y`. Check that what arrived is what left:
-
-```bash
-sha256sum payload.bin inbox/payload.bin    # the two hashes must match
-```
 
 **Things worth trying, and what should happen.**
 
 | Try this | What should happen |
 |---|---|
-| Answer `n` | Both sides say the transfer was declined, and `inbox/` gains nothing |
+| Answer the pairing question with `y` | Not paired. Only `yes` pairs |
+| Type a wrong pairing code | Both sides fail, nobody is asked, nothing is saved. `listen` pauses pairing for 5 s, then shows a new code |
+| Type three wrong codes in a row | `listen` turns pairing **off** until it is restarted, and says someone may be guessing. Files from paired devices still arrive |
+| Leave `listen` running for ten minutes | It prints a new pairing code; the old one no longer works |
+| Answer a file with `n` | Both sides say it was declined, and `inbox/` gains nothing |
 | Answer nothing for 60 seconds | Both sides say it expired. Silence is a Reject, not a maybe |
-| Send the same file twice, answering `y` both times | The second is saved as `payload (1).bin`, and both terminals say so. The first is never overwritten |
-| Pipe the answer: `echo y \| beam listen ...` | It does **not** work, on purpose. Each prompt discards anything typed before it appeared, so you cannot pre-answer a question you have not seen |
-| Delete `alice` from `bob/known_peers`, then send | Bob refuses without showing a prompt at all, and Alice is told the peer has not paired with her |
-| Interrupt the sender mid-transfer with Ctrl+C, then send the same file again | The second run says `(resuming)` and `Already have`, sends only the rest, and the finished file still matches. `beam transfers` shows the partial in between |
-| Interrupt it, then answer `n` | The partial survives; `beam transfers` still lists it, and sending again picks it up |
-| Interrupt it, then edit `payload.bin` and send again | It starts from zero, because it is now a different file |
-| `beam listen --addr 0.0.0.0:7777` | It works, and prints a warning explaining why you should not |
+| Send twice at once, from two paired devices | The second sender is told `bob is receiving another file; try again later` |
+| Start pairing while a file prompt is open | The pairing question waits until the file question is answered — one question on screen at a time — and still expires 60 s after it arrived |
+| Pipe the answer: `echo y \| beam listen ...` | It does **not** work, on purpose. Each question discards anything typed before it appeared |
+| `beam remove alices-laptop` on bob, then send from alice | Bob refuses without a prompt, and alice is told bob does not recognise her key and how to re-pair |
+| Run `beam init --force` on bob, then send from alice | alice is told bob is not reachable — either not listening or re-initialised — and how to re-pair |
+| Kill the sender mid-transfer with Ctrl+C, then send again | `listen` notices within 15 s. The second run says `(resuming)` and `Already have`, sends only the rest, and the finished file still matches |
+| Stop `beam-server` while `listen` runs | `listen` warns that it cannot register and keeps retrying; start the server again and it re-registers by itself |
+
+To run the server somewhere other people can reach it — behind `wss://` on a
+VPS or through Cloudflare Tunnel — see [docs/deploy.md](docs/deploy.md).
 
 ## Resuming
 
@@ -254,8 +247,8 @@ Ctrl+C — what already arrived is kept. **Send the same file again and it carri
 on from where it stopped.**
 
 ```
-beam send bob big.iso --addr 127.0.0.1:7777     # interrupted at 40%
-beam send bob big.iso --addr 127.0.0.1:7777     # continues from 40%
+beam send bob big.iso     # interrupted at 40%
+beam send bob big.iso     # continues from 40%
 ```
 
 There is no `beam resume` and nothing reconnects by itself. Running `send` again
@@ -306,30 +299,33 @@ A few things worth knowing:
 
 ## What this does not protect you from
 
-Pairing is done properly: it runs over an iroh connection, where each side
-proves it holds its private key, and SPAKE2 proves the other side knows the
-code. But transfers still run over the M2 development transport, so two things
-are missing until M5:
+Since M5 the transfer runs over iroh's QUIC: **encrypted end to end**, and each
+side **proves** the key it claims before a byte moves — the receiver identifies
+the sender by the key the connection proved, not by what the request says. A
+relay, if one is used, carries ciphertext.
 
-- **Transfers are not encrypted.** Anyone who can see the network path can read
-  the file. M5 moves transfers onto iroh's QUIC, which is encrypted end to end.
-- **The sender's identity is claimed, not proven.** The receiver checks the
-  public key in a request against its own `known_peers`, but nothing checks that
-  the sender holds the matching private key. A public key is public: anyone who
-  has seen one can put it in a request. iroh's handshake closes this in M5, and
-  M6 adds the tests that prove it.
+What is still true, and worth knowing:
 
-So: use `127.0.0.1` for now. `beam listen` warns when you bind anywhere else,
-and that warning is worth reading rather than dismissing. See ADR-0018 and
-ADR-0019 in [docs/decisions.md](docs/decisions.md).
+- **The rendezvous server knows when you are online.** While `beam listen`
+  runs, the server holds your public key and IP addresses, and sees who looks
+  you up. It cannot forge anything or make you pair with the wrong device, but
+  it is a server someone runs; see [docs/deploy.md](docs/deploy.md) and
+  [docs/n0-data.md](docs/n0-data.md).
+- **A relay sees that two keys talk, when, and how much** — not what.
+- **Pairing trusts the fingerprint check.** Someone who learns your code and
+  connects first reaches the pairing question as themselves. That is why the
+  question shows both fingerprints and needs `yes` typed in full.
+- **The written threat model is M6.** It states what an attacker can and cannot
+  do and backs each claim with a test.
 
-What *does* hold, and has tests that try to break it: every transfer is
-accepted by hand — including every resume — and no flag or config can skip the
-prompt; unknown senders are refused without a prompt; data arriving before
-ACCEPT ends the transfer; every chunk is verified before it is written and
-re-verified before it is reused; the whole file is verified before it is saved;
-an existing file is never overwritten; and a partial transfer belongs to the one
-peer it came from.
+What has tests that try to break it: every transfer is accepted by hand —
+including every resume — and no flag or config can skip the prompt; pairing
+needs `yes` on both devices; unknown senders are refused without a prompt; a
+sender claiming someone else's key is refused; data arriving before ACCEPT ends
+the transfer; every chunk is verified before it is written and re-verified
+before it is reused; the whole file is verified before it is saved; an existing
+file is never overwritten; a partial transfer belongs to the one peer it came
+from; and a pairing code allows three guesses per `listen` session at most.
 
 ## Files
 

@@ -117,10 +117,13 @@ be self-hosted. Putting one in or near Thailand is on the roadmap after M5.
 - **File contents and file names.** Only to the peer, inside the encrypted
   connection.
 - **`known_peers`.** Local only. The rendezvous server learns, while a device
-  is waiting to pair, its Short ID, public key and IP addresses, and the IP of
-  whoever looks it up — that is what a rendezvous server is for — but never who
-  you have paired with. It keeps that in memory only and logs nothing
-  (ADR-0027, S-22).
+  runs `beam listen` (or `pair --wait`), its Short ID, public key and IP
+  addresses — so it knows **when the device is online** — and the IP of
+  whoever looks it up, by Short ID or by key. That is what a rendezvous server
+  is for, and it is the same fact n0's discovery would have published, but to
+  a server you run rather than a public one. It never learns who you have
+  paired with, keeps everything in memory only, and logs nothing (ADR-0027,
+  S-22). Behind Cloudflare Tunnel, Cloudflare sees the same (`deploy.md`).
 - **Pairing codes and the PAKE exchange.** Pairing proves both sides knew the
   code without sending it; the code never reaches the rendezvous server.
 

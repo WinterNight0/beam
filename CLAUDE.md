@@ -10,13 +10,12 @@ other; file data must not be stored on or normally routed through the server.
 beam init                      # generate device keypair (once per machine)
 beam listen                    # wait for transfers; shows short ID + pairing code
 beam pair <ID> --name alice    # first-time pairing using ID + pairing code
-beam pair --wait --name bob    # M4: the waiting side of pairing (merges into listen in M5)
+beam pair --wait --name bob    # pair without also receiving files
 beam send alice project.zip    # send a file to a paired peer
 beam peers                     # list paired peers + fingerprints
 beam rename alice ali
 beam remove alice
 beam whoami                    # show own ID + fingerprint
-beam newcode                   # regenerate pairing code
 ```
 
 ## Non-negotiable rules
@@ -132,7 +131,9 @@ own workspace crates only if compile times demand it.
   ADR-0026..0029.
 - **M5** Use the iroh transport in real `send`/`listen`, keeping the same transfer
   engine. Show `[Direct P2P]` or `[Relay]` in the progress line. Absorbs the old M7.
-  `listen` takes over waiting for pairing, and `beam newcode` is implemented.
+  `listen` serves pairing and transfers on one endpoint, one question at a time;
+  it renews its own pairing code, so `beam newcode` was dropped. ADR-0028..0032,
+  `docs/deploy.md`.
 - **M6** Replaces Noise KK. Write `docs/threat-model.md`. Add security tests proving
   impersonation fails at the transport level: an unknown key, a known key without its
   secret key, a rendezvous server returning a wrong address, and a peer that re-ran

@@ -280,6 +280,96 @@ unanswered prompt gives up after about a minute; `beam peers` lists the other
 machine on both sides afterwards.
 
 
+## Implemented (M5)
+
+As in M4, nothing here touches the internet: real iroh endpoints bound to
+`127.0.0.1`, a real rendezvous server in-process, `relay = "none"`.
+
+### Unit tests
+
+| Module | What is covered |
+|---|---|
+| `transport` | a route tracker reports each path change once; a fixed route never changes |
+| `pairing::rotation` | a used code is replaced; an unused one expires after 10 min, and cannot be taken just before the tick; one attempt at a time; a failure pauses pairing 5 s, then 10 s; **three failures in a row turn pairing off for good**; a proved-but-refused attempt resets the count; the pause is capped at 5 min |
+| `pairing::protocol` | the joiner's name hint reaches the waiter's decision; an oversized hint is dropped; an `Unavailable` waiter is reported with its reason |
+| `pairing::session` | a usable hint becomes the name; an unusable one is cleaned up or replaced by `peer-<fingerprint>`; a taken name gets a number; only an unproved code counts as a guess |
+| `rendezvous` | a key lookup answer must be for the key asked about, at its endpoint; a key lookup finds only that key even under a Short ID collision |
+| `cli::desk` | `y` accepts a transfer; **`y` does not confirm pairing** (nor `ye`, `yes please`, empty) — `yes` does; the two prompts share no wording; **two questions at once are asked one after the other**, the second showing its remaining time; a question that expires in the queue is refused unseen and reported; a pasted second line cannot answer the next question |
+
+### Engine tests — `tests/transfer.rs`
+
+A path change mid-transfer is reported exactly once and later updates carry the
+new path; a request claiming a key other than the proven one is refused
+unprompted; one matching it goes through; a sender turned away as busy is told
+"receiving another file; try again later".
+
+### `listen` as a service — `tests/listen.rs`
+
+| Requirement | Test |
+|---|---|
+| A transfer over iroh, direct path reported | `a_paired_peer_sends_a_file_over_iroh` |
+| S-1 decline | `a_declined_transfer_saves_nothing` |
+| S-5 expiry | `an_unanswered_transfer_expires` |
+| S-7 on the proved key | `an_unpaired_device_is_refused_without_a_prompt` |
+| S-25 / ADR-0031 | `a_paired_device_claiming_another_ones_key_is_refused` |
+| S-3 / S-4 | `data_before_accept_is_discarded` (a raw client over iroh) |
+| S-2 resume | `an_interrupted_transfer_resumes_with_a_new_accept` |
+| F-16 busy | `a_second_transfer_while_one_is_open_is_told_to_try_later` |
+| Pairing inside `listen`, named from the hint, code renewed | `listen_pairs_and_names_the_device_from_its_hint` |
+| **S-23: three failures switch pairing off, transfers unaffected** | `three_failed_attempts_switch_pairing_off_but_not_transfers` |
+| S-23: attempts during a pause do not count | `an_attempt_during_a_pause_is_refused_without_counting` |
+| **S-24: a pairing and a transfer at once, through the real desk** | `a_pairing_and_a_transfer_at_once_are_asked_one_at_a_time` |
+| ADR-0031: a re-initialised peer is not found under its old key | `dialling_a_key_nobody_holds_any_more_finds_nobody` |
+
+### End-to-end tests over iroh — `tests/end_to_end.rs::over_iroh`
+
+Real `beam listen --loopback` and `beam send --loopback` processes, found
+through a real rendezvous server, every prompt waited for on the child's stdout
+before it is answered:
+
+- a transfer accepted by hand arrives intact, and the sender's output says
+  `[Direct P2P]`;
+- answering `n` saves nothing and the sender is told;
+- an unpaired sender is refused with no prompt on the receiver's screen, and is
+  told how to re-pair;
+- **the sender killed mid-transfer, then sent again**: the receiver notices
+  within the 15 s idle timeout, the second run shows `(resuming)` and
+  `Already have`, sends only the rest, and the file matches;
+- a second sender while a prompt is open is told `bob is receiving another
+  file; try again later`;
+- `listen` pairs, but **answering `y` does not pair**; the proved-but-refused
+  attempt gets a new code at once, and `yes` then pairs.
+
+The M4 pairing tests now answer `yes`, since the pairing prompt asks for it.
+
+### Command tests — `tests/cli.rs`
+
+`newcode` is gone; the `listen` allowlist is `addr`, `loopback`, `out` (the two
+hidden flags choose a transport and an address, and neither answers anything);
+`send` to a peer that is not listening names both causes and how to re-pair;
+`send` with the rendezvous server down says so.
+
+### Manual: a real path change, and a real relay
+
+Automated tests run with the relay off, so the `[Relay]` label and a change of
+path are checked by hand, on two networks (the steps in
+`spikes/transport.md`, with beam itself):
+
+1. Machine A on home Wi-Fi runs `beam listen`; machine B on a phone hotspot
+   runs `beam send`. Both use the default relay.
+2. Expect `[Relay] accepted` at first, and — if hole punching succeeds —
+   `Path changed: [Relay] -> [Direct P2P]` a few seconds in. Over two mobile
+   networks behind CGNAT, expect it to stay `[Relay]`.
+3. With `relay = "none"` on both, over those same two networks, expect the
+   connection to fail rather than relay.
+
+### Manual: the rendezvous server restarting under `listen`
+
+Stop `beam-server` while `beam listen` runs: `listen` warns on stderr that it
+cannot register and keeps retrying every 5 s. Start the server again: `listen`
+prints "Registered with the rendezvous server again." and is findable again.
+
+
 ## Manual test steps
 
 Some things cannot honestly be covered by an automated test on one machine.
@@ -335,12 +425,6 @@ Expected: the piped `y` is discarded and the prompt still waits. Answering a
 question you have not seen is exactly what S-1 forbids.
 
 ## Planned
-
-### M5 — the iroh transport
-
-The M2 and M3 transfer tests re-run unchanged over an iroh stream, which is the
-point of ADR-0016 and what the spike prototype already demonstrated once. The
-progress line reports `[Direct P2P]` or `[Relay]` from `IncomingAddr` (F-11).
 
 ### M6 — threat model and the security tests that back it
 

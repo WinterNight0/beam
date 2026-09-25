@@ -16,15 +16,18 @@ Requirement IDs are stable. Tests reference them.
 | F-3 | `beam peers` lists paired peers with their fingerprints. | M1 |
 | F-4 | `beam rename <old> <new>` changes a peer's local nickname. | M1 |
 | F-5 | `beam remove <name>` forgets a peer, after confirmation. | M1 |
-| F-6 | `beam listen` waits for incoming transfers. From M5 it also shows the Short ID and pairing code; in M4 that is `beam pair --wait` (ADR-0028). | M2/M5 |
+| F-6 | `beam listen` waits for incoming transfers and pairing requests on one iroh endpoint, and shows the Short ID and the current pairing code (ADR-0030). `beam pair --wait` remains for pairing alone. | M2/M5 |
 | F-7 | `beam send <peer> <file>` sends a file to a paired peer. | M2 |
 | F-8 | `beam pair <ID> --name <name>` performs first-time pairing using a Short ID and a pairing code, exchanging and confirming public keys with `spake2`. The other device waits with `beam pair --wait --name <name>`. | M4 |
 | F-13 | A rendezvous server maps a Short ID to an iroh endpoint address. beam never uses n0's DNS discovery. | M4 |
 | F-14 | The relay URL is configurable; n0's relay is the development default and a self-hosted `iroh-relay` replaces it later. | M4 |
-| F-9 | `beam newcode` regenerates this device's pairing code. In M4 a code lives as long as `beam pair --wait`, so running that again is how a new code is made (ADR-0028). | M5 |
+| F-9 | ~~`beam newcode`~~ — **dropped in M5.** `beam listen` renews its pairing code by itself after every attempt and every 10 minutes, and prints the new one (ADR-0028 amendment). | M5 |
 | F-10 | A transfer resumes after an interruption without re-sending verified chunks. Resuming is triggered only by running `beam send` again: there is no automatic reconnection and no `beam resume`. | M3 |
 | F-12 | `beam transfers` lists partially received transfers; `beam transfers --clear` deletes them after confirmation. | M3 |
-| F-11 | The progress line states whether the connection is `[Direct P2P]` or `[Relay]`. | M5 |
+| F-11 | The progress line states whether the connection is `[Direct P2P]` or `[Relay]`, and says so when the path changes mid-transfer (ADR-0032). | M5 |
+| F-15 | `beam send <peer>` finds the peer through the rendezvous server by its full public key from `known_peers`, and sends over iroh. The M2 TCP path survives only as a hidden, test-only `--addr` flag (ADR-0031). | M5 |
+| F-16 | `listen` receives one transfer at a time. A second sender is told in words that the receiver is busy and to try later (ADR-0030). | M5 |
+| F-17 | `docs/deploy.md` explains running `beam-server` behind `wss://` on a VPS with a reverse proxy or through Cloudflare Tunnel, and pointing clients at it. | M5 |
 
 ## 2. Security requirements
 
@@ -40,13 +43,17 @@ convenience loses.
 | S-5 | An unanswered request expires (default 60 s) and counts as a Reject. | M2 |
 | S-6 | The Accept prompt shows sender name, sender fingerprint, file name and size. | M2 |
 | S-7 | The receiver only accepts requests from peers present in its own `known_peers`; unknown senders are rejected without prompting. | M2 |
-| S-7a | The sender's identity is *proven*, not merely claimed. In M2–M4 the receiver checks the public key a sender presents against `known_peers`, but nothing proves the sender holds the matching private key; see ADR-0019. Satisfied in M5 by the transport (ADR-0025) and demonstrated by tests in M6. Tests that turn on the gap are marked `STRENGTHEN IN M6:`. | M5/M6 |
+| S-7a | The sender's identity is *proven*, not merely claimed. In M2–M4 the receiver checks the public key a sender presents against `known_peers`, but nothing proves the sender holds the matching private key; see ADR-0019. **Met by the mechanism in M5:** over iroh the receiver identifies the sender by the key the connection proved and refuses a request claiming any other (ADR-0031). M6 adds the threat model and the impersonation tests and removes the `STRENGTHEN IN M6:` markers. | M5/M6 |
 | S-8 | A changed peer key is a hard abort with an SSH-style warning. A stored key is never updated automatically; the user must re-pair. A peer that re-ran `beam init` therefore fails to connect, with a message that says to re-pair. | M6 |
 | S-9 | Private keys never leave the device and are never sent to the rendezvous server. | M1 |
 | S-10 | Peer authentication is provided by the transport: iroh's QUIC/TLS proves possession of the Ed25519 private key behind an endpoint id before a connection exists, so a rendezvous server returning a wrong address cannot mount a MITM. | M5 |
 | S-16 | A written threat model (`docs/threat-model.md`) states what an attacker can and cannot do, backed by tests that demonstrate each claim. | M6 |
 | S-17 | beam publishes nothing to third-party infrastructure by default beyond relayed (encrypted) traffic; what would otherwise be published, and how to disable it, is documented in `docs/n0-data.md`. | M4 |
 | S-18 | A pairing code is six digits, **single use** and expires after 10 minutes. The first attempt that uses it spends it, whatever the outcome; a wrong guess never leaves the code usable (ADR-0026). | M4 |
+| S-23 | Guessing is bounded when `listen` renews its own code. An attempt that did not prove the code pauses pairing (5 s, doubling, capped at 5 min); **three in a row turn pairing off** for the rest of the `listen` session, with a clear message, while transfers from paired peers keep working. Restarting `listen` turns it back on. An attempt that proved the code resets the count; one that arrives during a pause is refused without counting (ADR-0028 amendment). | M5 |
+| S-24 | Only one question is on screen at a time. Questions queue; each keeps its own deadline counted from when it was asked, and one that expires in the queue is refused unseen and reported. Input typed before a question appears cannot answer it (ADR-0030). | M5 |
+| S-25 | Over iroh, the connection's `remote_id()` must equal the key in `known_peers`: `send` checks the key it dialled, and `listen` looks the sender up by the proved key and refuses a request claiming another. A device that re-ran `beam init` is not followed to its new key; the user is told to re-pair (ADR-0031). | M5 |
+| S-26 | The pairing question looks unlike the Accept prompt — its own banner and wording — and only `yes` typed in full confirms it; `y` does not. Pairing is permanent (ADR-0030). | M5 |
 | S-19 | Pairing key confirmation is an HMAC under the SPAKE2 key over both public keys, the Short ID and the speaker's role. Both keys are the ones the iroh connection proved; a key claimed in a message that differs from the proved one ends the pairing, and the key saved to `known_peers` is the connection's `remote_id()` (ADR-0026). | M4 |
 | S-20 | A rendezvous registration is signed by the device key with a timestamp. The server rejects a bad signature, a timestamp more than 60 s from its clock or not newer than the last for that key, and a key that does not derive the claimed Short ID. Clients re-check every lookup answer (ADR-0027). | M4 |
 | S-21 | Pairing saves nothing until a person on **each** device has seen both fingerprints and answered yes. The same no-bypass rules as Accept apply: no flag or config answers it, no answer within 60 s is a no, and input typed before the question is discarded. | M4 |

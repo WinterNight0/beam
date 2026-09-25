@@ -1122,7 +1122,7 @@ around `serve()`, so beam's own tests run a real server in-process.
 
 ## ADR-0028 — In M4 the waiting side is `beam pair --wait`; M5 merges it into `beam listen`
 
-**Status:** accepted (M4)
+**Status:** accepted (M4), amended (M5) — see the end of this entry
 
 **Context.** CLAUDE.md's user experience has `beam listen` show the Short ID and
 pairing code. In M4, though, `listen` still receives transfers over the
@@ -1165,6 +1165,52 @@ test, which also proves there is no flag that answers the `[y/N]`.
 
 In M4 a receiver runs two commands in turn, `pair --wait` and then `listen`.
 That is a milestone seam, not the intended experience, and it closes in M5.
+
+### Amendment (M5): no `newcode`; the code renews itself, with a bound on guessing
+
+**Status:** accepted (M5), replaces the "`beam newcode`" paragraph above.
+
+M5 dropped `beam newcode` rather than build a way for one process to reach
+another (M5 decision 1). **`beam listen` renews its pairing code by itself** and
+prints each new one:
+
+- after **every attempt** that used it, successful or not;
+- after **ten minutes** unused.
+
+That removes something M4 relied on. With `pair --wait`, one code meant one
+guess and then the process exited: a person had to act before anyone could
+guess again. A `listen` that renews its code automatically would let an
+attacker guess forever while nobody watches. So the renewal is bounded
+(S-23, `pairing::rotation`):
+
+- An attempt in which the other side **did not prove the code** — a wrong code,
+  a dropped connection, anything short of a verified key confirmation — is a
+  **failure**. After one, the next code appears only after a pause: 5 s, then
+  10 s, doubling, capped at five minutes.
+- **After three failures in a row, pairing is off** for the rest of the
+  `listen` session, with a message saying so and why. **Transfers from paired
+  devices keep working.** Restarting `listen` turns pairing back on (M5
+  answer 1).
+- An attempt that proved the code but was then refused at a prompt, or was
+  for a device already paired, is not a guess and **resets** the count.
+- An attempt that arrives during a pause, while pairing is off, or while
+  another attempt is in progress is answered **`Unavailable`** with the
+  reason. It uses no code and does not count.
+
+The arithmetic: with three guesses per session at 10⁻⁶ each, an attacker's
+chance per `listen` session is 3 × 10⁻⁶, and every failed attempt is printed on
+the screen of the person running `listen`. Even a correct guess only reaches the
+pairing prompt (ADR-0030).
+
+`beam pair --wait` is unchanged: one code, one attempt, then it exits.
+
+**Naming the new peer.** `listen` has no `--name`, so it cannot know what to
+call a device that pairs with it. The joiner sends its own host name as a
+*hint* in the pairing `Start` message; `listen` turns it into a valid, unused
+nickname (`DESKTOP-7Q2`, `laptop-2`, or `peer-<fingerprint>` when the hint is
+missing or unusable) and shows it in the prompt as "Save as". It is only a
+label — the key is what is trusted — and `beam rename` changes it. The hint is
+not covered by the confirmation MAC because nothing relies on it.
 
 ---
 
@@ -1216,3 +1262,151 @@ Each was approved before it was added. The duplicate crate versions in
 
 **MSRV 1.89 → 1.91.** iroh 1.2.0 requires Rust 1.91. The exact pin makes this a
 hard floor rather than a choice.
+
+---
+
+## ADR-0030 — `beam listen` serves pairing and transfers, and asks one question at a time
+
+**Status:** accepted (M5)
+
+**Context.** M5 decision 2: `listen` serves pairing and transfers on one
+endpoint, and a pairing request and a transfer request can arrive together.
+
+### Decision
+
+**One endpoint, two ALPNs.** `listen` binds one iroh endpoint answering
+`beam/pair/1` and `beam/xfer/1`, registers it once with the rendezvous server
+— the same registration serves a Short ID lookup (pairing) and a key lookup
+(`send`, ADR-0031) — and refreshes it every 30 s, reconnecting if the server
+goes away. Each incoming connection gets its own task, dispatched on its ALPN.
+The service is `beam::listener`, in the library, so tests run it against real
+endpoints; the CLI only prints its events.
+
+**One question at a time (S-24).** Every question — Accept a file, confirm a
+pairing — goes to one *prompt desk* (`cli::desk`), a thread that owns the
+keyboard and shows questions first come, first served.
+
+- A question's **60 s starts when it is asked**, not when it reaches the
+  screen. One that waits out its time behind another is answered **no without
+  being shown**, and the screen says so ("A file from alice (report.pdf) was
+  refused: it waited too long behind another question").
+- A question that did wait shows how much time it has left:
+  `Accept? [y/N] (41 s left):`.
+- Input typed before a question appears is discarded, including lines pasted
+  along with the answer to the previous question.
+- While a question is on screen, the progress line does not redraw over it.
+
+**The two questions look different (M5 answer 4).** Accepting a file is the
+familiar `Incoming file … Accept? [y/N]:`. Pairing is permanent, so it has a
+banner — `PAIRING REQUEST - this is permanent` — says what pairing allows and
+how to undo it, and ends `Type "yes" to pair, anything else to refuse:`.
+**`y` does not pair**; only `yes` does. The same prompt is used on both sides
+of a pairing, `beam pair <ID>` included.
+
+**One transfer at a time.** A transfer holds `listen`'s single slot from its
+connection until it ends, prompt included. A second transfer from a paired
+device is refused with `Busy`, which the sender's `beam send` reports in words:
+"bob is receiving another file; try again later" (M5 answer 2). Pairing is not
+a transfer and can run alongside one; its question simply queues. A sender that
+bob has **not** paired with is refused as unknown *before* the slot is
+considered, so a stranger cannot learn whether bob is busy.
+
+**Noticing a vanished sender.** A killed sender sends no QUIC close. beam sets
+the connection idle timeout to **15 s** (iroh keep-alives are every 5 s), so
+`listen` gives up the slot within 15 s instead of noq's default 30 s, and the
+partial is kept for a resume.
+
+### Consequences
+
+- Informational lines (a new pairing code, a turned-away sender) can print
+  while a question is on screen. They are not questions, and never answer one.
+- `listen` is now long-lived network software: it is online and findable
+  through the rendezvous server for as long as it runs. That is recorded in
+  `n0-data.md`.
+
+---
+
+## ADR-0031 — `send` finds a peer by its full key, and the connection's proof outranks the request
+
+**Status:** accepted (M5)
+
+**Context.** M5 decision 3.
+
+### Decision
+
+**Lookup by key.** The rendezvous protocol gains `lookup_key {public_key}`,
+answered from the key every signed registration already carries. `beam send
+bob` reads bob's key from `known_peers`, looks it up, and dials the endpoint id
+that *is* that key. The client re-checks that the answer is for that key at
+that key's endpoint, as it does for Short ID lookups. After pairing, the Short
+ID is never used again.
+
+**The connection's key is the sender.** iroh's handshake proves the dialled
+key (ADR-0025), and `send` asserts `remote_id()` equals the key in
+`known_peers` before sending anything. On the receiving side, `listen` gives
+the engine `ReceiveOptions::proven_sender = remote_id()`. The sender is looked
+up by **that** key, and a `TRANSFER_REQUEST` whose `sender_public_key`
+differs from it is refused (`BadRequest`) without a prompt — even when the
+claimed key belongs to another paired peer. This is what S-7a asked for; M6
+writes the threat model around it, adds the impersonation tests, and removes the
+`STRENGTHEN IN M6:` markers.
+
+**After `beam init`.** A device that re-ran `beam init` has a new key and a new
+Short ID. Nothing links them to the old ones — the rendezvous server cannot
+know two keys are "the same device", and must not be able to. So:
+
+- **Sending to** a peer that re-ran init finds no registration for the stored
+  key. From the sender's side that is indistinguishable from the peer not
+  running `listen`, and the message says both, with the fix:
+
+  > bob (SHA256:…) is not reachable. Either it is not running `beam listen`,
+  > or it ran `beam init` again and has a new key. In that case you must
+  > re-pair: `beam remove bob`, then `beam pair <its Short ID> --name bob`.
+
+- **Receiving from** a peer that re-ran init: its new key is not in
+  `known_peers`, so it is refused as unknown, unprompted (S-7), and its `send`
+  says the receiver does not recognise this device's key and how to re-pair.
+
+The stored key is never updated to follow a new one (rule 3 of CLAUDE.md). M6
+adds the test that proves a key change is caught and reported.
+
+---
+
+## ADR-0032 — The progress line follows the path, and says when it changes
+
+**Status:** accepted (M5)
+
+**Context.** F-11 and M5 decision 4: show `[Direct P2P]` or `[Relay]`, and
+update it if the path changes mid-transfer — which is iroh's normal behaviour:
+a connection often starts on the relay and moves to a direct path once hole
+punching succeeds.
+
+### Decision
+
+The transport publishes the connection's **selected** path on a
+`tokio::sync::watch` channel (`transport::dial::watch_route`), fed by iroh's
+`Connection::paths_stream()`, which yields a snapshot whenever the selected
+path changes. A selected relay path is `[Relay]`; a selected IP path is
+`[Direct P2P]`.
+
+The engine reads the channel rather than a fixed value: `SendOptions::route`
+and `ReceiveOptions::route` replace M2's `path_kind`. Each progress update
+carries the current path, and a change is reported once, as its own line:
+
+```
+[Relay] accepted
+[Relay] 1.2 MiB of 40.0 MiB (3%)
+Path changed: [Relay] -> [Direct P2P]
+[Direct P2P] 9.8 MiB of 40.0 MiB (24%)
+```
+
+The TCP test transport and the in-memory tests use a fixed route.
+
+### What is and is not tested
+
+The engine's side — a change mid-transfer is reported exactly once and every
+later update carries the new path — is tested by flipping the channel during a
+real transfer (`a_path_change_mid_transfer_is_reported`). That iroh's
+selected-path snapshots map to the right label is exercised on loopback, where
+the path is direct. A **real** relay-to-direct change needs a relay and two
+networks, so it is a manual step in the test plan.
