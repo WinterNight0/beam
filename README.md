@@ -7,11 +7,11 @@ server only helps two devices find each other — it never sees your files. Ever
 incoming transfer has to be accepted by hand, and only peers you have paired
 with can ask.
 
-> **Status: milestone M5.** Pairing and file transfer both run over iroh:
-> encrypted end to end, direct when possible and through a relay when not, with
-> each device proving its key on every connection. `beam listen` serves both on
-> one endpoint. M6 adds the threat model and the tests that attack it — see
-> [What this does not protect you from](#what-this-does-not-protect-you-from).
+> **Status: milestone M6.** Pairing and file transfer run over iroh: encrypted
+> end to end, direct when possible and through a relay when not, with each
+> device proving its key on every connection. The threat model —
+> [docs/threat-model.md](docs/threat-model.md) — says what an attacker can and
+> cannot do, and names the test behind each claim.
 
 ## Build
 
@@ -315,8 +315,14 @@ What is still true, and worth knowing:
 - **Pairing trusts the fingerprint check.** Someone who learns your code and
   connects first reaches the pairing question as themselves. That is why the
   question shows both fingerprints and needs `yes` typed in full.
-- **The written threat model is M6.** It states what an attacker can and cannot
-  do and backs each claim with a test.
+- **Anything a peer or server sends is shown safely**: escape sequences are
+  removed, invisible direction and joining characters are shown as
+  `<U+XXXX>`, and a long file name is cut in the middle so its real extension
+  stays visible. A name that uses a right-to-left override to disguise itself
+  is refused.
+
+The full list — assets, attackers, threats, the test for each mitigation, and
+the risks accepted on purpose — is [docs/threat-model.md](docs/threat-model.md).
 
 What has tests that try to break it: every transfer is accepted by hand —
 including every resume — and no flag or config can skip the prompt; pairing

@@ -1410,3 +1410,128 @@ real transfer (`a_path_change_mid_transfer_is_reported`). That iroh's
 selected-path snapshots map to the right label is exercised on loopback, where
 the path is direct. A **real** relay-to-direct change needs a relay and two
 networks, so it is a manual step in the test plan.
+
+---
+
+## ADR-0033 — Limits for a paired peer that misbehaves
+
+**Status:** accepted (M6)
+
+**Context.** Pairing establishes who a peer is, not that it behaves. M6 item 4
+asked for the existing limits to be confirmed against a paired peer that
+claims absurd sizes, holds the transfer slot without sending, or sends
+oversized or malformed frames. Checking them found three gaps, closed here.
+
+### Decision
+
+**Chunk size is capped at 16 MiB** (`MAX_CHUNK_SIZE`). The receiver holds one
+chunk in memory while it verifies it, and before M6 a request could set
+`chunk_size` to `u32::MAX` and have the receiver allocate 4 GiB per chunk.
+
+**Chunk count is capped at 2²² (4 194 304)** (`MAX_CHUNK_COUNT`). The receiver
+keeps a bit and a hash per chunk on disk. A 1 GiB file in 1-byte chunks
+described a billion chunks, and a size near `u64::MAX` wrapped the `u32` count
+to a small number the peer could then declare. The count is now computed in
+`u64` and checked against the cap. With 4 MiB chunks the cap allows 16 TiB.
+
+**Free space is checked before a new partial is created.** A request that
+cannot fit is refused before any per-chunk state is written for it. Before M6
+the partial — and its bitmap, 45 MB for a petabyte — was created first and
+discarded after; the test for it took 13 s and now takes milliseconds. A
+resume still gets the full check afterwards, on the missing bytes only.
+
+**A stall timeout of 60 s**, on both sides, once a transfer is accepted: the
+receiver waiting for the next frame, the sender waiting for an acknowledgement.
+Before M6 a paired peer that stopped sending — while keeping its connection
+alive, which iroh's keep-alives do by themselves — held `listen`'s one transfer
+slot for ever. `listen` now also frees the slot as soon as a transfer ends,
+rather than after lingering for the peer to close.
+
+**Verification sends keep-alives (M6 answer 3).** Checking the final hash of a
+large file can take longer than the sender's stall timeout, so the receiver
+sends a `VERIFYING {done, total}` frame (type 10) about once a second while it
+hashes. Each one resets the sender's timeout, and the sender shows it as "The
+peer is verifying the file: …". This was chosen over suspending the timeout
+during verification because a suspended timeout is exactly the window a
+malicious receiver would use to hold a sender. Tested with a verification
+slowed to three times the sender's stall timeout, and with a control run in
+which the same verification without keep-alives does trip it.
+
+### Already handled, now tested
+
+Frames over 64 KiB are refused from their header, before the payload is read or
+allocated; malformed JSON, unknown frame types, unknown fields and chunks
+before a request are refused unprompted; a silent peer before its request
+meets the accept timeout. `tests/hostile_peer.rs` covers each.
+
+---
+
+## ADR-0034 — Text from the other side never reaches the terminal raw
+
+**Status:** accepted (M6)
+
+**Context.** File names, pairing hints, cancel reasons, error messages that
+quote what a peer sent, and the rendezvous server's error text are all chosen
+by someone else. A terminal interprets some characters as commands: ANSI
+sequences recolour, clear, move the cursor, rewrite lines already read or set
+the window title; `\r` prints a fake fingerprint over the real one; a
+right-to-left override makes `invoice‮fdp.exe` read as `invoiceexe.pdf`.
+
+### Decision
+
+One module, `beam::untrusted`, with three entry points — `text` (one line),
+`lines` (keeps our own line breaks), `name` (file names and nicknames):
+
+1. **Escape sequences are removed whole** — CSI, OSC, DCS/SOS/PM/APC, their
+   8-bit C1 forms, two-byte `ESC x` — so no `[31m` debris remains.
+2. **Other control characters are removed** (C0 including `\r`, DEL, C1); a tab
+   becomes a space.
+3. **Invisible direction and joining characters are shown as `<U+XXXX>`**: bidi
+   overrides and isolates, LRM/RLM/ALM, ZWSP/ZWNJ/ZWJ, word joiner, BOM.
+4. **Length is capped**: 300 characters for text; 60 for names, cut **in the
+   middle** keeping at least the last twelve characters and always the whole
+   final extension, so a long name cannot push `.exe` out of view (M6
+   answer 5).
+
+**In file names (M6 answer 1):** bidi overrides and isolates (U+202A–E,
+U+2066–9) are **refused**, like control characters: on disk the name would
+disguise itself in every file manager, not just in beam's prompt. Zero-width
+characters and LRM/RLM are **allowed** — ZWSP is common in Thai text copied
+from the web, ZWJ is part of many emoji — and are made visible in the prompt.
+Thai vowels and tone marks are ordinary letters and pass through unchanged.
+
+**Where it is applied — twice.** At the source, in the `Display` of every error
+that carries a peer's or server's string (`Cancelled`, `BadRequest`,
+`NameError`, malformed-frame errors, the pairing `Unavailable`/`WrongShortId`/
+`Protocol`, the rendezvous `Refused`/`Protocol`), so no construction site can
+be missed. And at the screen: every `ui::field` value, every prompt, every
+`listen` notice, and every error line `beam` prints go through it as well.
+
+Found while writing the tests: the pairing prompt printed the chosen name raw
+in its "Once paired, … `beam remove …`" lines. Fixed; covered by
+`the_pairing_prompt_cannot_be_driven_by_the_name`.
+
+---
+
+## ADR-0035 — A notice during an open question redraws the question
+
+**Status:** accepted (M6), extends ADR-0030
+
+**Context.** M6 item 5. `listen` prints notices — a new pairing code, a sender
+turned away, a failed transfer — and before M6 they could land in the middle of
+an open question, scrolling it away half-drawn.
+
+### Decision
+
+While `listen` runs, **the desk is the only thing that writes to the screen.**
+`PromptDesk::notice` queues a notice alongside questions. With no question
+open it is printed at once. With one open, the desk prints it on its own line
+and **draws the question again** with the time it has left; the answer still
+counts, and input is not discarded mid-question. `listen`'s events and the
+progress reporter's one-off lines ("Verifying…", "Path changed…") both go
+through it; the redrawn progress line is already suppressed while a question is
+open. Warnings that used to go to stderr now come through the desk too, so they
+cannot break a question either.
+
+The desk waits for the keyboard in 50 ms slices so that notices are shown
+promptly; a question still gets its whole deadline.

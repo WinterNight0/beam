@@ -370,6 +370,71 @@ cannot register and keeps retrying every 5 s. Start the server again: `listen`
 prints "Registered with the rendezvous server again." and is findable again.
 
 
+## Implemented (M6)
+
+`docs/threat-model.md` maps every threat to the test that demonstrates its
+mitigation; this section lists the tests M6 added.
+
+### Impersonation, at the transport level — `tests/listen.rs::impersonation`
+
+| M6 case | Test |
+|---|---|
+| An unknown key | `an_unknown_key_is_refused_without_a_prompt` |
+| A known key without its secret key | `a_known_public_key_without_its_secret_key_gets_nowhere` — the sibling the last `STRENGTHEN IN M6` marker was waiting for |
+| A rendezvous server returning a wrong address | `a_rendezvous_that_returns_the_wrong_address_cannot_redirect_a_send` (the attacker endpoint completes no handshake), `a_rendezvous_answer_for_another_key_is_ignored` |
+| A peer that re-ran `beam init` | `tests/end_to_end.rs::over_iroh::a_receiver_that_re_ran_init_gets_a_re_pair_warning_not_a_transfer`, `a_sender_that_re_ran_init_is_refused_with_a_re_pair_warning` — real processes; the message says re-pair and warns about impersonation |
+
+The fake rendezvous server in these tests answers every request with a scripted
+reply; the attacker is a real iroh endpoint on loopback that counts completed
+handshakes.
+
+### Terminal injection — `tests/injection.rs`, `untrusted` and `transfer::paths` unit tests
+
+- File names with CSI, OSC (window title), `\r`, 8-bit CSI: refused before the
+  prompt, and no ESC reaches the screen.
+- A name with U+202E: refused before the prompt (`BidiControl`).
+- **A Thai name with vowels and tone marks**: shown and saved unchanged.
+- **An emoji with ZWJ**: accepted, saved as sent, shown as `👨<U+200D>👩…`.
+- ZWSP in a name: accepted, shown as `<U+200B>`.
+- **A long name that would hide `.exe` if cut at the end**: shown cut in the
+  middle, ending `.pdf.exe` (the test first proves the naive cut hides it).
+- A hostile host-name hint becomes a plain nickname; the pairing prompt shows a
+  hostile name only through the sanitizer.
+- A CANCEL reason and a rendezvous error full of escapes reach the error text
+  without them; REJECT reasons are an enum and cannot carry text.
+- Unit: every ANSI form, `\r` overwrite, other controls, length caps, idempotence.
+
+### A misbehaving paired peer — `tests/hostile_peer.rs`, `tests/listen.rs`
+
+| Case | Before M6 | Test |
+|---|---|---|
+| 64 TiB, validly described | refused for space, **after** writing a per-chunk bitmap (13 s) | `a_sixty_four_tib_request_is_refused_for_space_without_a_prompt` — now before anything is written |
+| A size whose chunk count wraps `u32` | could be declared as the wrapped value | `a_size_whose_chunk_count_would_wrap_is_refused` |
+| 1 GiB in 1-byte chunks | accepted: a billion chunks of state | `a_request_with_too_many_chunks_is_refused` |
+| `chunk_size` over 16 MiB | allocated up to 4 GiB per chunk | `a_chunk_size_over_the_cap_is_refused` |
+| A 1 GiB frame header | refused ✓ | `an_oversized_frame_is_refused_from_its_header` |
+| Malformed / unknown / extra-field frames | refused ✓ | `malformed_frames_are_refused_without_a_prompt` |
+| Silent after ACCEPT | waited for ever | `a_sender_that_goes_quiet_after_accept_is_given_up_on` |
+| Silent mid-chunk | waited for ever | `a_sender_that_goes_quiet_mid_chunk_is_given_up_on` |
+| A receiver that never ACKs | the sender waited for ever | `a_receiver_that_never_acknowledges_is_given_up_on` |
+| **Slow final verification** (M6 answer 3) | — | `a_slow_final_verification_does_not_trip_the_stall_timeout`, and its control `without_keepalives_the_same_verification_would_stall` |
+| Holding `listen`'s slot | held for ever | `a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send` (over iroh) |
+
+### Redraw after a notice — `cli::desk` unit tests
+
+`a_notice_during_a_question_redraws_the_question` (and the answer still
+counts), `a_notice_with_no_question_open_is_printed_at_once`,
+`notices_do_not_let_a_queued_question_jump_in`.
+
+### Mutation checks
+
+Each check removed, the tests run, the check restored: bidi rejection in file
+names → the U+202E test fails; keep-alives during verification → the
+slow-verification test fails; the key check on a rendezvous answer → the
+"answer for another key" impersonation test fails. (M4 and M5 mutation checks
+still stand.)
+
+
 ## Manual test steps
 
 Some things cannot honestly be covered by an automated test on one machine.
@@ -423,19 +488,6 @@ echo y | beam listen --addr 127.0.0.1:7777
 
 Expected: the piped `y` is discarded and the prompt still waits. Answering a
 question you have not seen is exactly what S-1 forbids.
-
-## Planned
-
-### M6 — threat model and the security tests that back it
-
-A written `docs/threat-model.md`, and tests proving impersonation fails at the
-transport level rather than at ours: an unknown key; a known key held by someone
-without the matching secret key; a rendezvous server returning the wrong address
-for a Short ID; and a peer that re-ran `beam init`, which must fail with a
-message telling the user to re-pair (S-8).
-
-Every `STRENGTHEN IN M6:` marker is removed as its case becomes covered, and
-S-7a moves from "outstanding" to "met".
 
 ## Known gaps
 

@@ -138,7 +138,9 @@ own workspace crates only if compile times demand it.
   impersonation fails at the transport level: an unknown key, a known key without its
   secret key, a rendezvous server returning a wrong address, and a peer that re-ran
   `beam init` (must fail with a clear "re-pair" message). Remove every
-  `STRENGTHEN IN M6:` marker and make S-7a pass.
+  `STRENGTHEN IN M6:` marker and make S-7a pass. Done: also terminal-injection
+  defence, limits for a misbehaving paired peer, and redraw-after-notice
+  (ADR-0033..0035).
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.
 
 ## Testing expectations
