@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub(crate) mod hex;
 pub mod identity;
+pub mod pairing;
 pub mod rendezvous;
 pub mod transfer;
 pub mod transport;
