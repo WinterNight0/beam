@@ -1,11 +1,13 @@
 //! Pairing over the network: the rendezvous lookup, the iroh connection, and
 //! the protocol run, for each of the two roles.
 //!
-//! * The **waiter** (`beam pair --wait`) opens an endpoint, registers its
-//!   Short ID with the rendezvous server, shows the code, and takes **one**
-//!   attempt. Whatever happens in that attempt, the code is gone afterwards.
+//! * The **waiter** has a code and takes attempts on its endpoint. `beam pair
+//!   --wait` takes exactly one and exits ([`wait`]). `beam listen` takes them
+//!   for as long as it runs, renewing the code by the rules in
+//!   [`super::rotation`], and calls [`serve`] or [`refuse_connection`] for each.
 //! * The **joiner** (`beam pair <ID>`) looks the Short ID up, connects to each
-//!   entry that checks out, and runs the protocol with the code the user typed.
+//!   entry that checks out, and runs the protocol with the code the user typed
+//!   ([`join`]).
 //!
 //! The peer key that comes back is always the iroh connection's `remote_id()`
 //! — a key the peer proved it holds — and never a key taken from a message.
@@ -18,9 +20,10 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::Join;
 
 use super::code::{CodeSlot, CodeUnavailable, PairingCode};
-use super::protocol::{self, PairingError, Role, Session};
+use super::protocol::{self, Offer, PairingError, Role, Session};
+use super::rotation::Attempt;
 use crate::config::Relay;
-use crate::identity::{Fingerprint, Identity, KnownPeers, ShortId};
+use crate::identity::{Fingerprint, Identity, KnownPeers, ShortId, validate_name};
 use crate::rendezvous::{REFRESH_EVERY, RendezvousClient, RendezvousError};
 use crate::transport::endpoint::{self, Bind, EndpointError, PAIR_ALPN};
 
@@ -66,7 +69,7 @@ pub struct ConfirmRequest {
     pub own_fingerprint: Fingerprint,
 }
 
-/// The `[y/N]` question. Blocking; it runs on a blocking thread.
+/// The pairing question. Blocking; it runs on a blocking thread.
 pub trait Confirm: Send + 'static {
     fn confirm(&mut self, request: &ConfirmRequest) -> std::io::Result<bool>;
 }
@@ -101,7 +104,7 @@ pub enum PairError {
     Rendezvous(#[from] RendezvousError),
     #[error(
         "no device with Short ID {0} is waiting to pair. Ask the other person to run \
-         `beam pair --wait` and read you the Short ID it shows"
+         `beam listen` (or `beam pair --wait`) and read you the Short ID it shows"
     )]
     NotFound(String),
     #[error("{0}; run `beam pair --wait` again for a new code")]
@@ -120,14 +123,24 @@ pub enum PairError {
     Io(#[from] std::io::Error),
 }
 
+/// A pairing that both people confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Paired {
+    /// The key the iroh connection proved: what goes into `known_peers`.
+    pub key: VerifyingKey,
+    /// The nickname it goes in under.
+    pub name: String,
+}
+
 /// What both roles need to know about this side of the pairing.
 #[derive(Clone, Copy, Debug)]
 pub struct Pairing<'a> {
     pub identity: &'a Identity,
     /// Used to refuse a taken name or an already-paired key before asking.
     pub known: &'a KnownPeers,
-    /// The nickname the other device will be saved under.
-    pub name: &'a str,
+    /// The nickname the other device will be saved under. `None` for `beam
+    /// listen`, which takes it from the joiner's hint ([`choose_name`]).
+    pub name: Option<&'a str>,
     pub network: &'a Network,
     pub timeouts: Timeouts,
 }
@@ -135,31 +148,82 @@ pub struct Pairing<'a> {
 /// Checks that `name` is free before anything touches the network, so a
 /// person does not go through the whole exchange only to be told at the end.
 pub fn check_name(known: &KnownPeers, name: &str) -> Result<(), PairError> {
-    crate::identity::validate_name(name).map_err(|e| PairError::Io(std::io::Error::other(e)))?;
+    validate_name(name).map_err(|e| PairError::Io(std::io::Error::other(e)))?;
     if known.lookup(name).is_some() {
         return Err(PairError::NameTaken(name.to_string()));
     }
     Ok(())
 }
 
-/// Waits for one pairing attempt and runs it.
-///
-/// Returns the peer's proved key once both people have confirmed. The code in
-/// `slot` is spent by the first connection, whatever its outcome.
+/// The nickname `beam listen` saves a new peer under: the joiner's own
+/// suggestion, made into a valid, unused name, or `peer-<fingerprint>` when
+/// there is nothing usable. It is only a label; `beam rename` changes it.
+pub fn choose_name(known: &KnownPeers, hint: Option<&str>, key: &VerifyingKey) -> String {
+    let from_hint: String = hint
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(32)
+        .collect::<String>()
+        .trim_matches(|c| matches!(c, '-' | '.'))
+        .to_string();
+    let fallback = format!("peer-{}", &Fingerprint::of(key).hex()[..8]);
+
+    let base = if !from_hint.is_empty() && validate_name(&from_hint).is_ok() {
+        from_hint
+    } else {
+        fallback
+    };
+    if known.lookup(&base).is_none() {
+        return base;
+    }
+    for n in 2.. {
+        let suffix = format!("-{n}");
+        let stem: String = base.chars().take(32 - suffix.len()).collect();
+        let candidate = format!("{stem}{suffix}");
+        if known.lookup(&candidate).is_none() {
+            return candidate;
+        }
+    }
+    unreachable!("some suffix is free")
+}
+
+/// How an attempt counts towards the rotation's failure limit (S-23): only an
+/// attempt in which the code was **not** proved is a guess.
+pub fn attempt_kind(result: &Result<Paired, PairError>) -> Attempt {
+    match result {
+        Ok(_) => Attempt::Paired,
+        Err(PairError::AlreadyPaired(_))
+        | Err(PairError::Pairing(PairingError::Declined | PairingError::DeclinedByPeer)) => {
+            Attempt::ProvedButRefused
+        }
+        Err(_) => Attempt::Failed,
+    }
+}
+
+/// `beam pair --wait`: registers, shows the code, and takes one attempt.
 pub async fn wait<C: Confirm + Clone>(
     pairing: &Pairing<'_>,
     mut slot: CodeSlot,
     confirm: C,
     mut events: impl FnMut(Event<'_>),
-) -> Result<VerifyingKey, PairError> {
+) -> Result<Paired, PairError> {
     let Pairing {
         identity,
         known,
         name,
         network,
-        timeouts,
+        ..
     } = *pairing;
-    check_name(known, name)?;
+    if let Some(name) = name {
+        check_name(known, name)?;
+    }
 
     let endpoint = endpoint::bind(identity, &network.relay, network.bind, &[PAIR_ALPN]).await?;
     let result = async {
@@ -169,7 +233,7 @@ pub async fn wait<C: Confirm + Clone>(
 
         {
             // Peek at the code only to show it; `take` is what spends it.
-            let code = slot_code_for_display(&slot);
+            let code = slot.peek().expect("a fresh slot holds its code");
             let expires_in = slot.expires_at().saturating_duration_since(Instant::now());
             events(Event::Waiting {
                 short_id: identity.short_id(),
@@ -211,22 +275,53 @@ pub async fn wait<C: Confirm + Clone>(
         // Stop being findable: this code gets exactly one attempt.
         rendezvous.close().await;
 
-        let peer_key = endpoint::verifying_key(&connection.remote_id());
         events(Event::Attempt {
-            peer: Fingerprint::of(&peer_key),
+            peer: Fingerprint::of(&endpoint::verifying_key(&connection.remote_id())),
         });
         let code = slot.take(Instant::now())?;
-
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| PairError::Connect(e.to_string()))?;
-        let session = session(Role::Waiter, identity.short_id(), identity, peer_key, timeouts);
-        run_on(connection, send, recv, &session, &code, pairing, confirm).await
+        serve(connection, pairing, &code, confirm).await
     }
     .await;
     endpoint.close().await;
     result
+}
+
+/// Runs one waiter-side attempt on a connection that arrived on the pairing
+/// ALPN, with a code already taken for it.
+pub async fn serve<C: Confirm>(
+    connection: Connection,
+    pairing: &Pairing<'_>,
+    code: &PairingCode,
+    confirm: C,
+) -> Result<Paired, PairError> {
+    let peer_key = endpoint::verifying_key(&connection.remote_id());
+    let (send, recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|e| PairError::Connect(e.to_string()))?;
+    let session = session(
+        Role::Waiter,
+        pairing.identity.short_id(),
+        pairing.identity,
+        peer_key,
+        pairing.timeouts,
+    );
+    run_on(connection, send, recv, &session, code, pairing, confirm).await
+}
+
+/// Turns a pairing attempt away without spending a code: the waiter is
+/// cooling down, switched off, or busy. The joiner is told `reason`.
+pub async fn refuse_connection(connection: Connection, reason: &str) {
+    if let Ok(Ok((mut send, recv))) =
+        tokio::time::timeout(protocol::MESSAGE_TIMEOUT, connection.accept_bi()).await
+    {
+        let mut stream = tokio::io::join(recv, &mut send);
+        let _ = protocol::refuse(&mut stream, reason).await;
+        drop(stream);
+        let _ = send.finish();
+        let _ = tokio::time::timeout(LINGER, send.stopped()).await;
+    }
+    connection.close(0u32.into(), b"unavailable");
 }
 
 /// Looks up `short_id` and pairs with the device behind it.
@@ -239,7 +334,7 @@ pub async fn join<C, R, Fut>(
     read_code: R,
     confirm: C,
     mut events: impl FnMut(Event<'_>),
-) -> Result<VerifyingKey, PairError>
+) -> Result<Paired, PairError>
 where
     C: Confirm + Clone,
     R: FnOnce() -> Fut,
@@ -252,7 +347,9 @@ where
         network,
         timeouts,
     } = *pairing;
-    check_name(known, name)?;
+    if let Some(name) = name {
+        check_name(known, name)?;
+    }
     if short_id == identity.short_id() {
         return Err(PairError::OwnShortId);
     }
@@ -322,7 +419,9 @@ where
                 continue;
             }
         };
-        let session = session(Role::Joiner, short_id, identity, peer_key, timeouts);
+        let mut session = session(Role::Joiner, short_id, identity, peer_key, timeouts);
+        let comment = identity.comment().trim();
+        session.name_hint = (!comment.is_empty()).then(|| comment.to_string());
         let outcome = run_on(
             connection,
             send,
@@ -381,7 +480,7 @@ async fn run_on<C: Confirm>(
     code: &PairingCode,
     pairing: &Pairing<'_>,
     confirm: C,
-) -> Result<VerifyingKey, PairError> {
+) -> Result<Paired, PairError> {
     let Pairing {
         identity,
         known,
@@ -391,15 +490,21 @@ async fn run_on<C: Confirm>(
     let mut stream: Join<RecvStream, SendStream> = tokio::io::join(recv, send);
 
     let already_paired = std::sync::Mutex::new(None::<String>);
-    let decide = |key: VerifyingKey| {
+    let chosen = std::sync::Mutex::new(None::<String>);
+    let decide = |offer: Offer| {
         // Checked before asking: a device that is already in known_peers
         // would be refused by `add` anyway, and the person should not be asked
         // a question whose "yes" cannot be honoured.
-        let existing = known.lookup_key(&key).map(|p| p.name.clone());
+        let existing = known.lookup_key(&offer.key).map(|p| p.name.clone());
+        let save_as = match name {
+            Some(name) => name.to_string(),
+            None => choose_name(known, offer.name_hint.as_deref(), &offer.key),
+        };
+        *chosen.lock().expect("not poisoned") = Some(save_as.clone());
         let request = ConfirmRequest {
             role: session.role,
-            name: name.to_string(),
-            peer_fingerprint: Fingerprint::of(&key),
+            name: save_as,
+            peer_fingerprint: Fingerprint::of(&offer.key),
             own_fingerprint: identity.fingerprint(),
         };
         let mut confirm = confirm;
@@ -425,7 +530,13 @@ async fn run_on<C: Confirm>(
     connection.close(0u32.into(), b"done");
 
     match outcome {
-        Ok(key) => Ok(key),
+        Ok(key) => Ok(Paired {
+            key,
+            name: chosen
+                .into_inner()
+                .expect("not poisoned")
+                .expect("a successful run asked decide"),
+        }),
         Err(PairingError::Declined) => match already_paired.into_inner().expect("not poisoned") {
             Some(existing) => Err(PairError::AlreadyPaired(existing)),
             None => Err(PairError::Pairing(PairingError::Declined)),
@@ -434,8 +545,74 @@ async fn run_on<C: Confirm>(
     }
 }
 
-/// The code, for showing. [`CodeSlot`] only hands its code out through
-/// `take`, so the waiter keeps a copy for display, made here once.
-fn slot_code_for_display(slot: &CodeSlot) -> PairingCode {
-    slot.peek().expect("a fresh slot holds its code")
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{Peer, vectors};
+
+    fn key() -> VerifyingKey {
+        vectors::verifying_key("alpha")
+    }
+
+    #[test]
+    fn a_usable_hint_becomes_the_name() {
+        let known = KnownPeers::with_header();
+        assert_eq!(
+            choose_name(&known, Some("alices-laptop"), &key()),
+            "alices-laptop"
+        );
+        assert_eq!(
+            choose_name(&known, Some("DESKTOP-7Q2"), &key()),
+            "DESKTOP-7Q2"
+        );
+    }
+
+    #[test]
+    fn an_unusable_hint_is_cleaned_up_or_replaced() {
+        let known = KnownPeers::with_header();
+        assert_eq!(
+            choose_name(&known, Some("Alice's Mac"), &key()),
+            "Alice-s-Mac"
+        );
+        let fallback = format!("peer-{}", &Fingerprint::of(&key()).hex()[..8]);
+        for hint in [None, Some(""), Some("   "), Some("!!!"), Some("ÄÖÜ")] {
+            assert_eq!(choose_name(&known, hint, &key()), fallback, "{hint:?}");
+        }
+        assert_eq!(choose_name(&known, Some(&"x".repeat(50)), &key()).len(), 32);
+    }
+
+    #[test]
+    fn a_taken_name_gets_a_number() {
+        let mut known = KnownPeers::with_header();
+        known
+            .add(Peer::new("laptop", vectors::verifying_key("bravo")))
+            .unwrap();
+        assert_eq!(choose_name(&known, Some("laptop"), &key()), "laptop-2");
+        assert_eq!(choose_name(&known, Some("LAPTOP"), &key()), "LAPTOP-2");
+    }
+
+    #[test]
+    fn only_an_unproved_code_counts_as_a_guess() {
+        let paired: Result<Paired, PairError> = Ok(Paired {
+            key: key(),
+            name: "x".into(),
+        });
+        assert_eq!(attempt_kind(&paired), Attempt::Paired);
+        for refused in [
+            PairError::AlreadyPaired("x".into()),
+            PairError::Pairing(PairingError::Declined),
+            PairError::Pairing(PairingError::DeclinedByPeer),
+        ] {
+            assert_eq!(attempt_kind(&Err(refused)), Attempt::ProvedButRefused);
+        }
+        for failed in [
+            PairError::Pairing(PairingError::WrongCode),
+            PairError::Pairing(PairingError::NotConfirmed),
+            PairError::Pairing(PairingError::KeyMismatch),
+            PairError::Pairing(PairingError::Closed),
+            PairError::Pairing(PairingError::Timeout),
+        ] {
+            assert_eq!(attempt_kind(&Err(failed)), Attempt::Failed);
+        }
+    }
 }

@@ -1,20 +1,13 @@
-//! The terminal's side of a transfer and of pairing: the prompts and the
-//! progress line.
+//! The terminal's side of a transfer and of pairing: the keyboard and the
+//! progress line. The questions themselves go through `desk`.
 
 use std::io::{IsTerminal, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::transfer::{Progress, Prompt, PromptRequest, Reporter};
+use crate::transfer::{Progress, Reporter};
 use crate::ui;
-
-/// How much longer than the transfer's own deadline the prompt waits before
-/// giving up on the keyboard.
-///
-/// The engine stops waiting at the deadline, but the thread sitting on stdin
-/// has to end by itself: tokio waits for blocking tasks before it shuts down.
-const PROMPT_GRACE: Duration = Duration::from_secs(5);
 
 /// Lines typed at the keyboard.
 ///
@@ -87,95 +80,16 @@ impl Keyboard {
     }
 }
 
-/// Whether a typed answer is a yes. Anything else, including nothing, is no.
-pub fn is_yes(answer: Option<&str>) -> bool {
-    matches!(
-        answer.map(|a| a.trim().to_ascii_lowercase()).as_deref(),
-        Some("y" | "yes")
-    )
-}
-
-/// Asks the person at the keyboard whether to accept a transfer.
-#[derive(Clone)]
-pub struct TerminalPrompt {
-    keyboard: Keyboard,
-    deadline: Duration,
-}
-
-impl TerminalPrompt {
-    /// Starts the stdin reader. `accept_timeout` is the engine's deadline; the
-    /// prompt waits a little longer than that and then gives up.
-    pub fn new(accept_timeout: Duration) -> Self {
-        Self {
-            keyboard: Keyboard::start(),
-            deadline: accept_timeout + PROMPT_GRACE,
+impl super::desk::Lines for Keyboard {
+    fn discard_pending(&mut self) {
+        if let Ok(lines) = self.lines.lock() {
+            while lines.try_recv().is_ok() {}
         }
     }
-}
 
-impl Prompt for TerminalPrompt {
-    fn confirm(&mut self, request: &PromptRequest) -> std::io::Result<bool> {
-        let answer = self.keyboard.ask(self.deadline, |out| {
-            writeln!(out)?;
-            match &request.resume {
-                Some(_) => writeln!(out, "Incoming file (resuming)")?,
-                None => writeln!(out, "Incoming file")?,
-            }
-            ui::field(out, "From", &request.peer_name)?;
-            ui::field(out, "Fingerprint", &request.fingerprint)?;
-            ui::field(out, "File", &request.file_name)?;
-            ui::field(out, "Size", &ui::format_bytes(request.size))?;
-            if let Some(resume) = &request.resume {
-                let mut already = format!(
-                    "{} ({}%)",
-                    ui::format_bytes(resume.have_bytes),
-                    ui::percent(resume.have_bytes, request.size)
-                );
-                if let Some(age) = resume.age {
-                    already.push_str(&format!(", from {}", ui::format_age(age)));
-                }
-                ui::field(out, "Already have", &already)?;
-            }
-            write!(out, "Accept? [y/N]: ")
-        })?;
-        Ok(is_yes(answer.as_deref()))
-    }
-}
-
-/// Asks whether to save a device that has just proved it knows the pairing
-/// code. The same rules as Accept: no answer in time is a no, and there is no
-/// way to answer in advance.
-#[derive(Clone)]
-pub struct TerminalPairConfirm {
-    keyboard: Keyboard,
-    deadline: Duration,
-}
-
-impl TerminalPairConfirm {
-    pub fn new(keyboard: Keyboard, decision_timeout: Duration) -> Self {
-        Self {
-            keyboard,
-            deadline: decision_timeout + PROMPT_GRACE,
-        }
-    }
-}
-
-impl crate::pairing::Confirm for TerminalPairConfirm {
-    fn confirm(&mut self, request: &crate::pairing::ConfirmRequest) -> std::io::Result<bool> {
-        let answer = self.keyboard.ask(self.deadline, |out| {
-            writeln!(out)?;
-            writeln!(out, "The other device knows the code.")?;
-            ui::field(out, "Save as", &request.name)?;
-            ui::field(out, "Their key", &request.peer_fingerprint.to_string())?;
-            ui::field(out, "Your key", &request.own_fingerprint.to_string())?;
-            writeln!(out)?;
-            writeln!(
-                out,
-                "Check that the other screen shows the same two fingerprints, the other way round."
-            )?;
-            write!(out, "Pair with this device? [y/N]: ")
-        })?;
-        Ok(is_yes(answer.as_deref()))
+    fn next_line(&mut self, timeout: Duration) -> Option<String> {
+        let lines = self.lines.lock().ok()?;
+        lines.recv_timeout(timeout).ok()
     }
 }
 
@@ -233,6 +147,11 @@ impl TerminalReporter {
     }
 
     fn draw(&mut self, text: &str, force: bool) {
+        // A question is on screen; redrawing would write over it. The next
+        // update after it is answered catches the line up.
+        if super::desk::PROMPT_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if !self.due(force) {
             return;
         }
@@ -298,6 +217,10 @@ impl Reporter for TerminalReporter {
             Progress::Rechecking => {
                 self.finish();
                 self.line("Checking what is already here...");
+            }
+            Progress::PathChanged { from, to } => {
+                self.finish();
+                self.line(&format!("Path changed: {} -> {}", from.label(), to.label()));
             }
         }
     }

@@ -267,23 +267,18 @@ fn the_remove_prompt_shows_the_fingerprint() {
     );
 }
 
+/// M5 dropped `newcode`: `listen` renews its own code (ADR-0028). The
+/// command is gone rather than kept as a stub that does nothing.
 #[test]
-fn commands_that_wait_for_later_milestones_exit_two() {
+fn newcode_no_longer_exists() {
     let (_tmp, dir) = initialised();
-    let cases: [&[&str]; 1] = [&["newcode"]];
-    for args in cases {
-        let outcome = run(&dir, "", args);
-        assert_eq!(
-            outcome.code, EXIT_NOT_IMPLEMENTED,
-            "{args:?} exited {} ({})",
-            outcome.code, outcome.stderr
-        );
-        assert!(
-            outcome.stderr.contains("not implemented yet"),
-            "{args:?}: {}",
-            outcome.stderr
-        );
-    }
+    let outcome = run(&dir, "", &["newcode"]);
+    assert_eq!(outcome.code, EXIT_ERROR, "{}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains("unrecognized subcommand"),
+        "{}",
+        outcome.stderr
+    );
 }
 
 #[test]
@@ -304,17 +299,85 @@ fn send_is_no_longer_a_stub() {
     );
 }
 
+/// A rendezvous server on a free loopback port, on its own runtime, for as
+/// long as the value lives.
+struct Rendezvous {
+    url: String,
+    _runtime: tokio::runtime::Runtime,
+}
+
+fn rendezvous() -> Rendezvous {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let url = format!("ws://{}/v1", listener.local_addr().unwrap());
+    runtime.spawn(beam::rendezvous::serve(
+        listener,
+        beam::rendezvous::ServerConfig::default(),
+    ));
+    Rendezvous {
+        url,
+        _runtime: runtime,
+    }
+}
+
+/// ADR-0031: a paired device that is not listening — or that ran `beam init`
+/// again, which looks identical from here — gets a message that says both,
+/// and says how to re-pair.
 #[test]
-fn send_without_an_address_explains_that_discovery_is_not_here_yet() {
-    let (_tmp, dir) = initialised();
+fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
+    let (tmp, dir) = initialised();
     seed_peers(&dir);
-    let outcome = run(&dir, "", &["send", "alice", "anything.txt"]);
-    assert_eq!(outcome.code, EXIT_ERROR);
-    assert!(
-        outcome.stderr.contains("--addr") && outcome.stderr.contains("M4"),
-        "unhelpful error: {}",
-        outcome.stderr
+    let server = rendezvous();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("rendezvous = \"{}\"\nrelay = \"none\"\n", server.url),
+    )
+    .unwrap();
+    let file = tmp.path().join("note.txt");
+    std::fs::write(&file, b"hello").unwrap();
+
+    let outcome = run(
+        &dir,
+        "",
+        &["send", "alice", file.to_str().unwrap(), "--loopback"],
     );
+    assert_eq!(outcome.code, EXIT_ERROR);
+    for needle in [
+        "alice",
+        "not reachable",
+        "beam listen",
+        "beam init",
+        "re-pair",
+        "beam remove alice",
+    ] {
+        assert!(
+            outcome.stderr.contains(needle),
+            "no {needle:?} in: {}",
+            outcome.stderr
+        );
+    }
+}
+
+#[test]
+fn send_with_the_rendezvous_server_down_says_so() {
+    let (tmp, dir) = initialised();
+    seed_peers(&dir);
+    std::fs::write(
+        dir.join("config.toml"),
+        "rendezvous = \"ws://127.0.0.1:1/v1\"\nrelay = \"none\"\n",
+    )
+    .unwrap();
+    let file = tmp.path().join("note.txt");
+    std::fs::write(&file, b"hello").unwrap();
+    let outcome = run(
+        &dir,
+        "",
+        &["send", "alice", file.to_str().unwrap(), "--loopback"],
+    );
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(outcome.stderr.contains("beam-server"), "{}", outcome.stderr);
 }
 
 #[test]
@@ -373,9 +436,11 @@ fn listen_has_no_flag_that_could_stand_in_for_the_prompt() {
 
     // `beam-dir`, `json` and `help` are added by clap from the root command,
     // so what is listed here is exactly what `listen` declares for itself.
+    // `addr` and `loopback` are hidden development flags that choose the
+    // transport and the address; neither can answer anything.
     assert_eq!(
         flags,
-        ["addr", "out"],
+        ["addr", "loopback", "out"],
         "the flags on `beam listen` changed; check that the new one cannot \
          accept a transfer without a person answering the prompt (S-1)"
     );
@@ -524,7 +589,15 @@ fn help_lists_every_planned_command() {
     let outcome = run(&dir, "", &["--help"]);
     assert_eq!(outcome.code, EXIT_OK, "{}", outcome.stderr);
     for name in [
-        "init", "whoami", "peers", "pair", "rename", "remove", "listen", "send", "newcode",
+        "init",
+        "whoami",
+        "peers",
+        "pair",
+        "rename",
+        "remove",
+        "listen",
+        "send",
+        "transfers",
     ] {
         assert!(
             outcome.stdout.contains(name),

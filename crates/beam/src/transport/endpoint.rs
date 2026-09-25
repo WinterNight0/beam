@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
-use iroh::endpoint::presets;
+use iroh::endpoint::{IdleTimeout, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
 
 use crate::config::Relay;
@@ -26,6 +26,17 @@ use crate::identity::Identity;
 /// that speaks a different pairing protocol fails the QUIC handshake instead
 /// of misreading messages.
 pub const PAIR_ALPN: &[u8] = b"beam/pair/1";
+
+/// The ALPN protocol id of file transfers: the M2 engine, unchanged, on a
+/// QUIC stream. Versioned like the pairing one.
+pub const XFER_ALPN: &[u8] = b"beam/xfer/1";
+
+/// How long a connection may go without hearing from the peer before it is
+/// considered gone. iroh sends keep-alives every 5 s, so a live peer is never
+/// idle this long; a crashed one is noticed within 15 s instead of noq's 30 s
+/// default. That matters to `listen`, which holds its one transfer slot until
+/// the sender is known to be gone (ADR-0030).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long to wait for the relay before announcing direct addresses only.
 const RELAY_WAIT: Duration = Duration::from_secs(10);
@@ -62,9 +73,15 @@ pub async fn bind(
         Relay::Url(url) => RelayMode::custom([url.clone()]),
     };
 
+    let transport = QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(IDLE_TIMEOUT).expect("15 s is a valid idle timeout"),
+        ))
+        .build();
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .relay_mode(relay_mode)
+        .transport_config(transport)
         .alpns(alpns.iter().map(|a| a.to_vec()).collect());
     if bind == Bind::Loopback {
         builder = builder

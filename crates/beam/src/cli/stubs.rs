@@ -1,14 +1,10 @@
-//! Commands that are declared now but land in a later milestone.
+//! Small commands with nothing else to live with.
 //!
-//! They appear in `beam --help` from M0 on, so the intended surface is visible,
-//! and each fails loudly with exit code 2 rather than pretending to work.
+//! Until M5 this also held the stubs for commands planned for later
+//! milestones. Every planned command now exists; `newcode` was dropped in M5
+//! (ADR-0028), because `listen` renews its code by itself.
 
 use super::{CommandError, Io};
-
-/// Builds the error a stubbed command returns.
-pub(super) fn not_implemented(command: &'static str, milestone: &'static str) -> CommandError {
-    CommandError::NotImplemented { command, milestone }
-}
 
 /// `beam version`.
 pub(super) fn version(io: &mut Io<'_>) -> Result<(), CommandError> {

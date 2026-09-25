@@ -146,7 +146,7 @@ impl RejectReason {
             Self::UnknownPeer => "the peer has not paired with you",
             Self::Expired => "the peer did not answer in time",
             Self::BadRequest => "the peer rejected the request as malformed",
-            Self::Busy => "the peer is already receiving this file in another session",
+            Self::Busy => "the peer is receiving another file; try again later",
             Self::NoSpace => "the peer does not have enough free disk space",
         }
     }

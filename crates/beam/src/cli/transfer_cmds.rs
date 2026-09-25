@@ -1,7 +1,9 @@
-//! `beam listen` and `beam send`.
+//! `beam listen --addr` and `beam send --addr`: the M2 TCP stand-in, and
+//! `beam transfers`.
 //!
-//! Both use a plain TCP address given on the command line. That is a stand-in
-//! for the iroh transport, which arrives in M5; see ADR-0018 and ADR-0025.
+//! The TCP path is hidden and kept for tests only: it is unencrypted and the
+//! sender's identity is only claimed. The real `listen` and `send` are in
+//! `net_cmds.rs`, over iroh. See ADR-0018 and ADR-0025.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -11,7 +13,8 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::terminal::{TerminalPrompt, TerminalReporter};
+use super::desk::{DeskPrompt, PromptDesk};
+use super::terminal::{Keyboard, TerminalReporter};
 use super::{App, CommandError, Io};
 use crate::identity::{Identity, KnownPeers, encode_public_key};
 use crate::transfer::{
@@ -23,11 +26,11 @@ use crate::ui;
 
 /// The `--json` shape of a finished send.
 #[derive(Serialize)]
-struct SendJson {
-    transfer_id: String,
-    peer: String,
-    bytes_sent: u64,
-    saved_as: Option<String>,
+pub(super) struct SendJson {
+    pub(super) transfer_id: String,
+    pub(super) peer: String,
+    pub(super) bytes_sent: u64,
+    pub(super) saved_as: Option<String>,
 }
 
 /// The `--json` shape of one partial transfer.
@@ -44,12 +47,12 @@ struct PartialJson {
 
 /// The `--json` shape of a finished receive.
 #[derive(Serialize)]
-struct ReceiveJson {
-    transfer_id: String,
-    peer: String,
-    fingerprint: String,
-    saved_as: String,
-    bytes: u64,
+pub(super) struct ReceiveJson {
+    pub(super) transfer_id: String,
+    pub(super) peer: String,
+    pub(super) fingerprint: String,
+    pub(super) saved_as: String,
+    pub(super) bytes: u64,
 }
 
 impl App {
@@ -71,7 +74,7 @@ impl App {
         Ok((identity, known_peers))
     }
 
-    pub(super) fn listen(
+    pub(super) fn listen_tcp(
         &self,
         addr: SocketAddr,
         out_dir: Option<PathBuf>,
@@ -92,23 +95,23 @@ impl App {
             )?;
             writeln!(
                 io.err,
-                "beam: warning: in M2 the connection is NOT encrypted and the sender's identity"
+                "beam: warning: --addr is the M2 test transport: the connection is NOT encrypted"
             )?;
             writeln!(
                 io.err,
-                "beam: warning: is only claimed, not proven. Anyone who can reach this port and"
+                "beam: warning: and the sender's identity is only claimed, not proven. Anyone who"
             )?;
             writeln!(
                 io.err,
-                "beam: warning: knows a paired peer's public key can impersonate it, and anyone"
+                "beam: warning: can reach this port and knows a paired peer's public key can"
             )?;
             writeln!(
                 io.err,
-                "beam: warning: on the path can read the file. Encryption arrives in M5 and"
+                "beam: warning: impersonate it, and anyone on the path can read the file. Run"
             )?;
             writeln!(
                 io.err,
-                "beam: warning: proven identity in M6. Use 127.0.0.1 until then."
+                "beam: warning: `beam listen` without --addr for the real, encrypted transport."
             )?;
             writeln!(io.err)?;
         }
@@ -149,6 +152,7 @@ impl App {
             // Within one run, a transfer id is never honoured twice (S-11).
             // M3 persists this across restarts.
             let mut seen: HashSet<TransferId> = HashSet::new();
+            let desk = PromptDesk::terminal(Keyboard::start());
 
             loop {
                 let (stream, peer_addr) = listener.accept().await.map_err(CommandError::Io)?;
@@ -158,7 +162,7 @@ impl App {
                     stream,
                     &known_peers,
                     &options,
-                    TerminalPrompt::new(options.accept_timeout),
+                    DeskPrompt::new(desk.clone(), options.accept_timeout),
                     &mut reporter,
                     &mut seen,
                 )
@@ -211,7 +215,7 @@ impl App {
         result
     }
 
-    pub(super) fn send(
+    pub(super) fn send_tcp(
         &self,
         peer_name: &str,
         file: &Path,
@@ -444,12 +448,12 @@ impl App {
 
 /// Progress goes to the terminal unless the caller asked for JSON, in which
 /// case a progress bar would corrupt the output.
-enum EitherReporter {
+pub(super) enum EitherReporter {
     Terminal(TerminalReporter),
     Silent(SilentReporter),
 }
 
-fn reporter_for(json: bool) -> EitherReporter {
+pub(super) fn reporter_for(json: bool) -> EitherReporter {
     if json {
         EitherReporter::Silent(SilentReporter)
     } else {
@@ -458,7 +462,7 @@ fn reporter_for(json: bool) -> EitherReporter {
 }
 
 impl EitherReporter {
-    fn finish(&mut self) {
+    pub(super) fn finish(&mut self) {
         if let EitherReporter::Terminal(reporter) = self {
             reporter.finish();
         }

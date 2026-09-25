@@ -26,7 +26,7 @@ use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
 
 use crate::identity::{Fingerprint, KnownPeers, decode_public_key};
-use crate::transport::PathKind;
+use crate::transport::{PathKind, Route, RouteTracker, fixed_route};
 
 use super::chunk::{ChunkPlan, hash_stream, sha256_hex};
 use super::engine::{
@@ -87,8 +87,15 @@ pub struct ReceiveOptions {
     pub accept_timeout: Duration,
     /// How many times a chunk may be asked for again.
     pub max_chunk_attempts: u32,
-    /// How the peers are connected, for the progress line.
-    pub path_kind: PathKind,
+    /// How the peers are connected, for the progress line. It can change
+    /// during the transfer; see [`Route`].
+    pub route: Route,
+    /// The sender's key **as proved by the transport**, when the transport
+    /// proves one. Over iroh this is the connection's `remote_id()`; the M2
+    /// TCP stand-in proves nothing and leaves it `None`. When it is set, the
+    /// sender is looked up by it, and a request claiming any other key is
+    /// refused. See ADR-0031.
+    pub proven_sender: Option<ed25519_dalek::VerifyingKey>,
     /// How long an untouched partial survives.
     pub max_partial_age: StdDuration,
 }
@@ -101,7 +108,8 @@ impl ReceiveOptions {
             tmp_dir: tmp_dir.into(),
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             max_chunk_attempts: DEFAULT_CHUNK_ATTEMPTS,
-            path_kind: PathKind::Direct,
+            route: fixed_route(PathKind::Direct),
+            proven_sender: None,
             max_partial_age: super::partial::DEFAULT_MAX_AGE,
         }
     }
@@ -200,6 +208,19 @@ where
         refuse(&mut writer, request.transfer_id, RejectReason::BadRequest).await;
         machine.apply(Event::Fail)?;
         return Err(TransferError::ReplayedTransferId);
+    }
+
+    // A transport that proved who is on the other end outranks whatever the
+    // request says. A request that disagrees with the proof is not a mistake
+    // an honest sender can make.
+    if let Some(proven) = &options.proven_sender
+        && decode_public_key(&request.sender_public_key).ok().as_ref() != Some(proven)
+    {
+        refuse(&mut writer, request.transfer_id, RejectReason::BadRequest).await;
+        machine.apply(Event::Fail)?;
+        return Err(TransferError::BadRequest(
+            "the request claims a different key from the one the connection proved".into(),
+        ));
     }
 
     // S-7: a sender this machine has not paired with never reaches the prompt.
@@ -440,6 +461,34 @@ where
     }
 }
 
+/// Turns a sender away with `reason` without looking at what it wants to
+/// send: reads its request, so the refusal can name the transfer, and answers
+/// REJECT. Used by `beam listen` for a second transfer while one is already
+/// in progress (ADR-0030). Nothing is created on disk and nobody is asked.
+pub async fn turn_away<S>(
+    stream: S,
+    reason: RejectReason,
+    timeout: Duration,
+) -> Result<(), TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let request = match tokio::time::timeout(timeout, read_message(&mut reader)).await {
+        Ok(Ok(Message::TransferRequest(request))) => request,
+        Ok(Ok(other)) => {
+            return Err(TransferError::OutOfOrder {
+                expected: "TRANSFER_REQUEST",
+                got: other.kind_name(),
+            });
+        }
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(TransferError::Rejected(RejectReason::Expired)),
+    };
+    refuse(&mut writer, request.transfer_id, reason).await;
+    Ok(())
+}
+
 /// Reads the opening request, refusing to wait forever for a silent peer.
 async fn read_request(
     incoming: &mut Incoming,
@@ -458,11 +507,13 @@ async fn read_request(
     }
 }
 
-/// Looks the claimed sender up in `known_peers`.
+/// Looks the sender up in `known_peers`.
 ///
-/// STRENGTHEN IN M6: this only checks that the key the sender *claims* is one
-/// we have paired with. Nothing here proves the sender holds the matching
-/// private key; iroh's handshake will, in M5. See ADR-0019 and ADR-0025.
+/// STRENGTHEN IN M6: over the TCP stand-in this only checks that the key the
+/// sender *claims* is one we have paired with. Over iroh the caller has already
+/// required the claim to equal the key the connection proved
+/// (`ReceiveOptions::proven_sender`), which closes the gap; M6 adds the tests
+/// that demonstrate it and removes this marker. See ADR-0019 and ADR-0031.
 fn known_sender(known_peers: &KnownPeers, claimed_key: &str) -> Option<(String, Fingerprint)> {
     let key = decode_public_key(claimed_key).ok()?;
     let peer = known_peers.lookup_key(&key)?;
@@ -506,6 +557,7 @@ where
 
     let already_had = partial.have_bytes();
     let mut done = already_had;
+    let mut route = RouteTracker::new(&options.route);
     let mut received_now = 0u64;
 
     // Only the chunks that are actually missing. The sender is told the same
@@ -523,10 +575,14 @@ where
 
         done += bytes.len() as u64;
         received_now += bytes.len() as u64;
+        let (path, before) = route.poll();
+        if let Some(from) = before {
+            reporter.report(Progress::PathChanged { from, to: path });
+        }
         reporter.report(Progress::Transferring {
             done,
             total: plan.size(),
-            path: options.path_kind,
+            path,
         });
 
         write_message(writer, &Message::ChunkAck(ChunkAck { index })).await?;

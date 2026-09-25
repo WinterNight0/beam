@@ -104,7 +104,7 @@ async fn start_waiting(
         let pairing = Pairing {
             identity: &identity,
             known: &known,
-            name: "joiner",
+            name: Some("joiner"),
             network: &network,
             timeouts,
         };
@@ -114,6 +114,7 @@ async fn start_waiting(
             }
         })
         .await
+        .map(|paired| paired.key)
     });
     let code = tokio::time::timeout(Duration::from_secs(20), rx.recv())
         .await
@@ -134,7 +135,7 @@ async fn join_with(
     let pairing = Pairing {
         identity,
         known,
-        name: "waiter",
+        name: Some("waiter"),
         network: &network,
         timeouts: quick(),
     };
@@ -146,6 +147,7 @@ async fn join_with(
         |_| {},
     )
     .await
+    .map(|paired| paired.key)
 }
 
 fn identity(comment: &str) -> Identity {

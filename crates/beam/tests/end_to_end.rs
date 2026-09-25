@@ -155,6 +155,21 @@ impl Watched {
             .to_string()
     }
 
+    /// Reads until `needle` has appeared `count` times in all.
+    fn wait_for_count(&mut self, needle: &str, count: usize) {
+        let deadline = Instant::now() + PATIENCE;
+        while self.seen.matches(needle).count() < count {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.bytes.recv_timeout(left) {
+                Ok(byte) => self.seen.push(byte as char),
+                Err(_) => panic!(
+                    "waited for {needle:?} to appear {count} times; the process printed:\n{}",
+                    self.seen
+                ),
+            }
+        }
+    }
+
     fn answer(&mut self, text: &str) {
         writeln!(self.stdin, "{text}").expect("write to the child's stdin");
         self.stdin.flush().expect("flush");
@@ -498,7 +513,7 @@ mod killed {
     }
 
     /// Waits until a partial reports at least two stored chunks.
-    fn wait_for_partial_progress(work: &Path) {
+    pub(super) fn wait_for_partial_progress(work: &Path) {
         let deadline = Instant::now() + PATIENCE;
         while Instant::now() < deadline {
             if partial_chunks(work) >= 2 {
@@ -546,14 +561,18 @@ mod killed {
 mod pairing {
     use super::*;
 
+    /// The end of the pairing question. It asks for `yes` in full, and looks
+    /// nothing like the Accept prompt's `[y/N]`.
+    pub(super) const PAIR_PROMPT: &str = "Type \"yes\" to pair, anything else to refuse";
+
     /// A rendezvous server on a free loopback port, run on its own runtime
     /// for as long as the value lives.
-    struct Server {
-        url: String,
+    pub(super) struct Server {
+        pub(super) url: String,
         _runtime: tokio::runtime::Runtime,
     }
 
-    fn server() -> Server {
+    pub(super) fn server() -> Server {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -571,7 +590,7 @@ mod pairing {
 
     /// Points a beam home at the test server, with no relay: this test must
     /// not touch the internet.
-    fn configure(beam_dir: &Path, url: &str) {
+    pub(super) fn configure(beam_dir: &Path, url: &str) {
         std::fs::write(
             beam_dir.join("config.toml"),
             format!("rendezvous = \"{url}\"\nrelay = \"none\"\n"),
@@ -622,8 +641,8 @@ mod pairing {
         joiner.answer(&code);
 
         // Both people are asked, and both are shown both fingerprints.
-        waiter.wait_for("[y/N]: ");
-        joiner.wait_for("[y/N]: ");
+        waiter.wait_for(PAIR_PROMPT);
+        joiner.wait_for(PAIR_PROMPT);
         let alice_fp = whoami_field(&alice, "Fingerprint");
         let bob_fp = whoami_field(&bob, "Fingerprint");
         for (who, watched) in [("waiter", &waiter), ("joiner", &joiner)] {
@@ -633,8 +652,8 @@ mod pairing {
                 watched.seen
             );
         }
-        waiter.answer("y");
-        joiner.answer("y");
+        waiter.answer("yes");
+        joiner.answer("yes");
         waiter.wait_for("Paired with alice.");
         joiner.wait_for("Paired with bob.");
         assert!(waiter.exit_status().success(), "{}", waiter.seen);
@@ -707,8 +726,8 @@ mod pairing {
         waiter.wait_for("not paired");
         assert!(!joiner.exit_status().success());
         assert!(!waiter.exit_status().success());
-        assert!(!joiner.seen.contains("[y/N]"), "{}", joiner.seen);
-        assert!(!waiter.seen.contains("[y/N]"), "{}", waiter.seen);
+        assert!(!joiner.seen.contains(PAIR_PROMPT), "{}", joiner.seen);
+        assert!(!waiter.seen.contains(PAIR_PROMPT), "{}", waiter.seen);
         assert!(waiter.seen.contains("beam pair --wait"), "{}", waiter.seen);
 
         for home in [&alice, &bob] {
@@ -736,10 +755,10 @@ mod pairing {
         joiner.wait_for("Pairing code shown on the other device: ");
         joiner.answer(&code);
 
-        waiter.wait_for("[y/N]: ");
-        joiner.wait_for("[y/N]: ");
+        waiter.wait_for(PAIR_PROMPT);
+        joiner.wait_for(PAIR_PROMPT);
         waiter.answer("n");
-        joiner.answer("y");
+        joiner.answer("yes");
         waiter.wait_for("not paired");
         joiner.wait_for("not paired");
         assert!(!waiter.exit_status().success());
@@ -753,5 +772,249 @@ mod pairing {
                 .count();
             assert_eq!(entries, 0, "{} gained a peer:\n{peers}", home.display());
         }
+    }
+}
+
+/// M5: the real transport. `listen` and `send` without `--addr`, over iroh on
+/// loopback, found through a real rendezvous server — every Accept rule and
+/// resume, as real processes, with every prompt waited for before it is
+/// answered.
+mod over_iroh {
+    use super::pairing::{PAIR_PROMPT, configure, server};
+    use super::*;
+
+    /// Two homes paired by hand, pointed at `server`, plus a payload.
+    fn setup(payload_len: usize, url: &str) -> Demo {
+        let demo = demo(payload_len);
+        configure(&demo.alice, url);
+        configure(&demo.bob, url);
+        demo
+    }
+
+    fn listen(demo: &Demo) -> Watched {
+        let mut listener = Watched::spawn(
+            &demo.bob,
+            &[
+                "listen",
+                "--loopback",
+                "--out",
+                demo.inbox.to_str().expect("utf-8 path"),
+            ],
+        );
+        listener.wait_for("Waiting for transfers");
+        listener
+    }
+
+    fn send(demo: &Demo, extra: &[&str]) -> Watched {
+        let mut args = vec![
+            "send",
+            "bob",
+            demo.payload.to_str().expect("utf-8 path"),
+            "--loopback",
+        ];
+        args.extend_from_slice(extra);
+        Watched::spawn(&demo.alice, &args)
+    }
+
+    #[test]
+    fn a_transfer_over_iroh_is_accepted_by_hand_and_arrives_intact() {
+        let server = server();
+        let demo = setup(600_000, &server.url);
+        let mut listener = listen(&demo);
+        let mut sender = send(&demo, &[]);
+
+        listener.wait_for("Incoming file");
+        listener.wait_for("[y/N]: ");
+        assert!(listener.seen.contains("alice"), "{}", listener.seen);
+        listener.answer("y");
+        listener.wait_for("saved as payload.bin");
+
+        assert!(sender.exit_status().success(), "{}", sender.seen);
+        // On loopback with the relay off, the path is direct — and the
+        // progress output says so (F-11).
+        assert!(sender.seen.contains("[Direct P2P]"), "{}", sender.seen);
+        assert_eq!(
+            std::fs::read(demo.inbox.join("payload.bin")).unwrap(),
+            std::fs::read(&demo.payload).unwrap()
+        );
+    }
+
+    #[test]
+    fn answering_no_over_iroh_saves_nothing_and_says_so() {
+        let server = server();
+        let demo = setup(10_000, &server.url);
+        let mut listener = listen(&demo);
+        let mut sender = send(&demo, &[]);
+
+        listener.wait_for("[y/N]: ");
+        listener.answer("n");
+        sender.wait_for("bob declined the transfer");
+        assert!(!sender.exit_status().success());
+        assert!(!demo.inbox.join("payload.bin").exists());
+    }
+
+    /// S-7 on the proved key, as processes: a device bob does not know is
+    /// refused with no prompt on bob's screen, and is told why.
+    #[test]
+    fn an_unpaired_sender_is_refused_without_a_prompt() {
+        let server = server();
+        let demo = setup(10_000, &server.url);
+        // bob forgets alice; alice still knows bob.
+        beam(&demo.bob, &["remove", "alice", "--yes"]);
+        let mut listener = listen(&demo);
+        let mut sender = send(&demo, &[]);
+
+        sender.wait_for("does not recognise this device");
+        assert!(!sender.exit_status().success());
+        assert!(sender.seen.contains("re-pair"), "{}", sender.seen);
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(byte) = listener.bytes.try_recv() {
+            listener.seen.push(byte as char);
+        }
+        assert!(!listener.seen.contains("[y/N]"), "{}", listener.seen);
+    }
+
+    /// Resume over iroh: kill the sender mid-transfer, send again; the second
+    /// run asks again (S-2), says it is a resume, and sends only the rest.
+    #[test]
+    fn killing_the_sender_over_iroh_then_resuming() {
+        let server = server();
+        let demo = setup(2 * 1024 * 1024, &server.url);
+        let work = demo.bob.join("tmp");
+        let mut listener = listen(&demo);
+
+        let mut first = send(&demo, &["--chunk-size", "65536"]);
+        listener.wait_for("[y/N]: ");
+        listener.answer("y");
+        super::killed::wait_for_partial_progress(&work);
+        let _ = first.child.kill();
+        let _ = first.child.wait();
+
+        // The receiver notices the sender is gone (QUIC idle timeout, 15 s)
+        // and keeps the partial.
+        listener.wait_for("transfer from alice failed");
+        assert!(!demo.inbox.join("payload.bin").exists());
+
+        let mut second = send(&demo, &["--chunk-size", "65536"]);
+        listener.wait_for("Incoming file (resuming)");
+        listener.wait_for("Already have");
+        listener.answer("y");
+        listener.wait_for("(resumed;");
+        assert!(second.exit_status().success(), "{}", second.seen);
+        assert!(second.seen.contains("was already there"), "{}", second.seen);
+        assert_eq!(
+            std::fs::read(demo.inbox.join("payload.bin")).unwrap(),
+            std::fs::read(&demo.payload).unwrap()
+        );
+    }
+
+    /// ADR-0030 and condition 2 of the M5 answers: a second sender while one
+    /// transfer is open is told, in words, to try later.
+    #[test]
+    fn a_second_sender_is_told_the_receiver_is_busy() {
+        let server = server();
+        let demo = setup(10_000, &server.url);
+        // carol, also paired with bob.
+        let carol = demo._tmp.path().join("carol");
+        beam(&carol, &["init"]);
+        configure(&carol, &server.url);
+        let carol_key = public_key_of(&carol);
+        let bob_key = public_key_of(&demo.bob);
+        let mut bobs = std::fs::read_to_string(demo.bob.join("known_peers")).unwrap();
+        bobs.push_str(&format!(
+            "carol  ed25519 {carol_key}  added=2026-01-01T00:00:00Z\n"
+        ));
+        std::fs::write(demo.bob.join("known_peers"), bobs).unwrap();
+        std::fs::write(
+            carol.join("known_peers"),
+            format!("# beam known_peers v1\nbob  ed25519 {bob_key}  added=2026-01-01T00:00:00Z\n"),
+        )
+        .unwrap();
+
+        let mut listener = listen(&demo);
+        let mut first = send(&demo, &[]);
+        listener.wait_for("[y/N]: ");
+
+        let mut second = Watched::spawn(
+            &carol,
+            &["send", "bob", demo.payload.to_str().unwrap(), "--loopback"],
+        );
+        second.wait_for("bob is receiving another file; try again later");
+        assert!(!second.exit_status().success());
+        listener.wait_for("Turned away a file from carol");
+
+        listener.answer("y");
+        assert!(first.exit_status().success(), "{}", first.seen);
+    }
+
+    /// `listen` offers pairing as well as transfers, and names the new peer
+    /// from the joiner's host name. Condition 4: the pairing prompt is its
+    /// own thing, and `y` does not confirm it.
+    #[test]
+    fn listen_pairs_but_only_with_yes_in_full() {
+        let server = server();
+        let tmp = tempfile::tempdir().unwrap();
+        let (alice, bob) = (tmp.path().join("alice"), tmp.path().join("bob"));
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        beam(&alice, &["init"]);
+        beam(&bob, &["init"]);
+        configure(&alice, &server.url);
+        configure(&bob, &server.url);
+
+        let mut listener = Watched::spawn(
+            &bob,
+            &["listen", "--loopback", "--out", inbox.to_str().unwrap()],
+        );
+        listener.wait_for("Waiting for transfers");
+        let short_id = listener.field("Short ID");
+
+        // First attempt: bob answers `y`, which is not a yes to pairing.
+        let code = listener.field("Pairing code");
+        let mut joiner =
+            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        joiner.wait_for("Pairing code shown on the other device: ");
+        joiner.answer(&code);
+        listener.wait_for("PAIRING REQUEST - this is permanent");
+        listener.wait_for(PAIR_PROMPT);
+        assert!(!listener.seen.contains("[y/N]"), "{}", listener.seen);
+        joiner.wait_for(PAIR_PROMPT);
+        joiner.answer("yes");
+        listener.answer("y");
+        joiner.wait_for("not paired");
+        listener.wait_for("Not paired with");
+        assert!(!joiner.exit_status().success());
+        let peers = std::fs::read_to_string(bob.join("known_peers")).unwrap_or_default();
+        assert!(!peers.contains(&public_key_of(&alice)), "{peers}");
+
+        // A proved code that was then refused is not a guess: a new code is
+        // issued at once. With `yes`, pairing goes through.
+        // Wait for the whole line: output arrives byte by byte.
+        listener.wait_for("(the last one was used)");
+        let line = listener
+            .seen
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("New pairing code:"))
+            .unwrap()
+            .to_string();
+        let code: String = line
+            .trim_start_matches("New pairing code:")
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let mut joiner =
+            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        joiner.wait_for("Pairing code shown on the other device: ");
+        joiner.answer(&code);
+        listener.wait_for_count(PAIR_PROMPT, 2);
+        joiner.wait_for(PAIR_PROMPT);
+        listener.answer("yes");
+        joiner.answer("yes");
+        joiner.wait_for("Paired with bob.");
+        listener.wait_for("Paired with");
+        assert!(joiner.exit_status().success(), "{}", joiner.seen);
+        let peers = std::fs::read_to_string(bob.join("known_peers")).unwrap();
+        assert!(peers.contains(&public_key_of(&alice)), "{peers}");
     }
 }

@@ -98,7 +98,25 @@ pub struct Session {
     pub remote_key: VerifyingKey,
     pub message_timeout: Duration,
     pub decision_timeout: Duration,
+    /// Joiner only: a suggested nickname for this device, sent to the waiter.
+    /// `beam listen` has no `--name` to save a new peer under, so it offers
+    /// this one (sanitised, and only as a label; ADR-0030). Not part of the
+    /// MAC: it names nothing the protocol relies on.
+    pub name_hint: Option<String>,
 }
+
+/// What `decide` is asked about: a peer that has proved the code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offer {
+    /// The key the transport proved.
+    pub key: VerifyingKey,
+    /// The joiner's suggested name for itself, if it sent one. Only the waiter
+    /// ever sees one.
+    pub name_hint: Option<String>,
+}
+
+/// Longest name hint accepted. Anything longer is ignored, not truncated.
+const MAX_NAME_HINT: usize = 64;
 
 impl Session {
     /// A session with the default timeouts.
@@ -115,6 +133,7 @@ impl Session {
             remote_key,
             message_timeout: MESSAGE_TIMEOUT,
             decision_timeout: DECISION_TIMEOUT,
+            name_hint: None,
         }
     }
 
@@ -160,6 +179,8 @@ pub enum PairingError {
     Timeout,
     #[error("the other device closed the connection before pairing finished")]
     Closed,
+    #[error("the other device is not accepting pairing right now: {0}")]
+    Unavailable(String),
     #[error("the other device sent something unexpected: {0}")]
     Protocol(String),
     #[error("pairing failed: {0}")]
@@ -175,6 +196,13 @@ enum Message {
         short_id: String,
         public_key: String,
         spake: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name_hint: Option<String>,
+    },
+    /// The waiter's answer to a Start when it is not taking attempts: cooling
+    /// down, switched off, or busy with another attempt. No code is involved.
+    Unavailable {
+        reason: String,
     },
     Reply {
         public_key: String,
@@ -192,8 +220,8 @@ enum Message {
 /// Runs one side of the protocol.
 ///
 /// `decide` is asked — once, and only after the peer has proved it knows the
-/// code — whether to pair with the given key. It is where the `[y/N]` prompt
-/// goes. It has [`Session::decision_timeout`] to answer; running out of time
+/// code — whether to pair with the offered key. It is where the pairing
+/// prompt goes. It has [`Session::decision_timeout`] to answer; running out of time
 /// is a no.
 ///
 /// On success, returns the key to save, which is always
@@ -206,21 +234,27 @@ pub async fn run<S, F, Fut>(
 ) -> Result<VerifyingKey, PairingError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(VerifyingKey) -> Fut,
+    F: FnOnce(Offer) -> Fut,
     Fut: Future<Output = std::io::Result<bool>>,
 {
-    match session.role {
-        Role::Joiner => confirm_as_joiner(stream, session, code).await?,
+    let name_hint = match session.role {
+        Role::Joiner => {
+            confirm_as_joiner(stream, session, code).await?;
+            None
+        }
         Role::Waiter => confirm_as_waiter(stream, session, code).await?,
-    }
+    };
 
     // The peer knows the code and holds the key the transport proved. Now a
     // person decides.
-    let accept =
-        match tokio::time::timeout(session.decision_timeout, decide(session.remote_key)).await {
-            Ok(answer) => answer?,
-            Err(_) => false,
-        };
+    let offer = Offer {
+        key: session.remote_key,
+        name_hint,
+    };
+    let accept = match tokio::time::timeout(session.decision_timeout, decide(offer)).await {
+        Ok(answer) => answer?,
+        Err(_) => false,
+    };
 
     send(stream, &Message::Decision { accept }).await?;
     // The peer may still be looking at its own prompt, so allow for that.
@@ -257,6 +291,7 @@ where
             short_id: session.short_id.to_string(),
             public_key: encode_public_key(&session.local_key),
             spake: BASE64.encode(&spake_a),
+            name_hint: session.name_hint.clone(),
         },
     )
     .await?;
@@ -267,6 +302,7 @@ where
             spake,
             confirm,
         } => (public_key, spake, confirm),
+        Message::Unavailable { reason } => return Err(PairingError::Unavailable(reason)),
         other => return Err(unexpected("Reply", &other)),
     };
     check_claim(&claimed, &session.remote_key)?;
@@ -287,23 +323,27 @@ where
     Ok(())
 }
 
+/// Returns the joiner's name hint, if it sent a usable one.
 async fn confirm_as_waiter<S>(
     stream: &mut S,
     session: &Session,
     code: &PairingCode,
-) -> Result<(), PairingError>
+) -> Result<Option<String>, PairingError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (version, short_id, claimed, spake_a) = match recv(stream, session.message_timeout).await? {
-        Message::Start {
-            version,
-            short_id,
-            public_key,
-            spake,
-        } => (version, short_id, public_key, spake),
-        other => return Err(unexpected("Start", &other)),
-    };
+    let (version, short_id, claimed, spake_a, name_hint) =
+        match recv(stream, session.message_timeout).await? {
+            Message::Start {
+                version,
+                short_id,
+                public_key,
+                spake,
+                name_hint,
+            } => (version, short_id, public_key, spake, name_hint),
+            other => return Err(unexpected("Start", &other)),
+        };
+    let name_hint = name_hint.filter(|h| h.len() <= MAX_NAME_HINT);
     if version != VERSION {
         return Err(PairingError::UnsupportedVersion(version));
     }
@@ -342,7 +382,8 @@ where
         Err(PairingError::Closed) => return Err(PairingError::NotConfirmed),
         Err(e) => return Err(e),
     };
-    verify_confirmation(&key, Role::Joiner, session, &confirm_j)
+    verify_confirmation(&key, Role::Joiner, session, &confirm_j)?;
+    Ok(name_hint)
 }
 
 /// The SPAKE2 password: the code, bound to the Short ID it was issued for.
@@ -412,9 +453,26 @@ fn decode_b64(text: &str) -> Result<Vec<u8>, PairingError> {
         .map_err(|e| PairingError::Protocol(format!("base64: {e}")))
 }
 
+/// Answers a joiner's Start with `Unavailable`, without touching any code:
+/// the waiter is cooling down, switched off, or busy (ADR-0028). The joiner
+/// reports `reason` to its user.
+pub async fn refuse<S>(stream: &mut S, reason: &str) -> Result<(), PairingError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send(
+        stream,
+        &Message::Unavailable {
+            reason: reason.to_string(),
+        },
+    )
+    .await
+}
+
 fn unexpected(wanted: &str, got: &Message) -> PairingError {
     let name = match got {
         Message::Start { .. } => "Start",
+        Message::Unavailable { .. } => "Unavailable",
         Message::Reply { .. } => "Reply",
         Message::Confirm { .. } => "Confirm",
         Message::Decision { .. } => "Decision",
@@ -499,11 +557,11 @@ mod tests {
         session
     }
 
-    async fn yes(_: VerifyingKey) -> std::io::Result<bool> {
+    async fn yes(_: Offer) -> std::io::Result<bool> {
         Ok(true)
     }
 
-    async fn no(_: VerifyingKey) -> std::io::Result<bool> {
+    async fn no(_: Offer) -> std::io::Result<bool> {
         Ok(false)
     }
 
@@ -593,6 +651,7 @@ mod tests {
                 version,
                 short_id,
                 spake,
+                name_hint,
                 ..
             }) = recv(&mut to_alpha, Duration::from_secs(5)).await
             {
@@ -601,6 +660,7 @@ mod tests {
                     short_id,
                     public_key: encode_public_key(&mallory()),
                     spake,
+                    name_hint,
                 };
                 let _ = send(&mut to_bravo, &rewritten).await;
             }
@@ -669,6 +729,7 @@ mod tests {
             short_id: short_id.to_string(),
             public_key: encode_public_key(&mallory()),
             spake: BASE64.encode([0x41u8; 33]),
+            name_hint: None,
         };
         send(&mut a, &spoofed).await.unwrap();
         let w = run(&mut b, &waiter, &code("123456"), yes).await;
@@ -829,6 +890,7 @@ mod tests {
             short_id: waiter.short_id.to_string(),
             public_key: encode_public_key(&key("alpha")),
             spake: BASE64.encode([0x41u8; 33]),
+            name_hint: None,
         };
         send(&mut a, &start).await.unwrap();
         let w = run(&mut b, &quick(waiter), &code("123456"), yes).await;
@@ -858,6 +920,71 @@ mod tests {
         a.write_all(body).await.unwrap();
         let w = run(&mut b, &quick(waiter), &code("123456"), yes).await;
         assert!(matches!(w, Err(PairingError::Protocol(_))), "{w:?}");
+    }
+
+    /// `beam listen` names a new peer from the joiner's hint; the hint only
+    /// reaches the waiter's decision, after the code is proved.
+    #[tokio::test]
+    async fn the_joiners_name_hint_reaches_the_waiters_decision() {
+        let (mut joiner, waiter) = honest_sessions();
+        joiner.name_hint = Some("alices-laptop".into());
+        let (mut a, mut b) = duplex(64 * 1024);
+        let (joiner, waiter) = (quick(joiner), quick(waiter));
+        let c = code("123456");
+        let seen = std::sync::Mutex::new(None);
+        let record = |offer: Offer| {
+            *seen.lock().unwrap() = Some(offer);
+            async { Ok(true) }
+        };
+        let (j, w) = tokio::join!(
+            run(&mut a, &joiner, &c, yes),
+            run(&mut b, &waiter, &c, record)
+        );
+        j.unwrap();
+        w.unwrap();
+        let offer = seen.into_inner().unwrap().expect("the waiter decided");
+        assert_eq!(offer.name_hint.as_deref(), Some("alices-laptop"));
+        assert_eq!(offer.key, key("alpha"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_name_hint_is_dropped() {
+        let (mut joiner, waiter) = honest_sessions();
+        joiner.name_hint = Some("x".repeat(MAX_NAME_HINT + 1));
+        let (mut a, mut b) = duplex(64 * 1024);
+        let (joiner, waiter) = (quick(joiner), quick(waiter));
+        let c = code("123456");
+        let seen = std::sync::Mutex::new(None);
+        let record = |offer: Offer| {
+            *seen.lock().unwrap() = Some(offer.name_hint);
+            async { Ok(true) }
+        };
+        let (j, w) = tokio::join!(
+            run(&mut a, &joiner, &c, yes),
+            run(&mut b, &waiter, &c, record)
+        );
+        j.unwrap();
+        w.unwrap();
+        assert_eq!(seen.into_inner().unwrap(), Some(None));
+    }
+
+    /// A waiter that is cooling down or switched off answers `Unavailable`,
+    /// and the joiner reports why.
+    #[tokio::test]
+    async fn an_unavailable_waiter_is_reported_as_such() {
+        let (joiner, _) = honest_sessions();
+        let (mut a, mut b) = duplex(64 * 1024);
+        let joiner = quick(joiner);
+        let c = code("123456");
+        let waiter = async {
+            recv(&mut b, Duration::from_secs(5)).await.unwrap();
+            refuse(&mut b, "pairing is paused").await.unwrap();
+        };
+        let (j, ()) = tokio::join!(run(&mut a, &joiner, &c, yes), waiter);
+        match j {
+            Err(PairingError::Unavailable(reason)) => assert_eq!(reason, "pairing is paused"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

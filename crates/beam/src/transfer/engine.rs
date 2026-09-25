@@ -131,6 +131,9 @@ pub enum Progress {
     /// Re-hashing what is already on disk from an earlier session, before
     /// offering any of it to the sender as "already have".
     Rechecking,
+    /// The connection moved to a different path mid-transfer, e.g. from the
+    /// relay to a direct path once hole punching succeeded (F-11).
+    PathChanged { from: PathKind, to: PathKind },
 }
 
 /// Somewhere to send [`Progress`].

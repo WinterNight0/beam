@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite};
 
-use crate::transport::PathKind;
+use crate::transport::{PathKind, Route, RouteTracker, fixed_route};
 
 use super::bitmap::ChunkBitmap;
 use super::chunk::{ChunkPlan, hash_stream, sha256_hex};
@@ -36,8 +36,9 @@ pub struct SendOptions {
     pub chunk_size: u32,
     /// How many times to re-send a chunk that failed its hash.
     pub max_chunk_attempts: u32,
-    /// How the peers are connected, for the progress line.
-    pub path_kind: PathKind,
+    /// How the peers are connected, for the progress line. It can change
+    /// during the transfer; see [`Route`].
+    pub route: Route,
 }
 
 impl SendOptions {
@@ -49,7 +50,7 @@ impl SendOptions {
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             chunk_size: CHUNK_SIZE,
             max_chunk_attempts: DEFAULT_CHUNK_ATTEMPTS,
-            path_kind: PathKind::Direct,
+            route: fixed_route(PathKind::Direct),
         }
     }
 }
@@ -109,8 +110,9 @@ where
     reporter.report(Progress::AwaitingAccept);
 
     let have = await_decision(stream, &mut machine, options.accept_timeout, plan).await?;
+    let mut route = RouteTracker::new(&options.route);
     reporter.report(Progress::Accepted {
-        path: options.path_kind,
+        path: route.poll().0,
     });
 
     let skipped: u64 = (0..plan.chunk_count())
@@ -136,10 +138,14 @@ where
         )
         .await?;
         sent += bytes.len() as u64;
+        let (path, before) = route.poll();
+        if let Some(from) = before {
+            reporter.report(Progress::PathChanged { from, to: path });
+        }
         reporter.report(Progress::Transferring {
             done: skipped + sent,
             total: size,
-            path: options.path_kind,
+            path,
         });
     }
 

@@ -3,7 +3,9 @@
 //! Commands live here rather than in the binary so they can be exercised by
 //! tests with in-memory streams and a temporary home directory; see ADR-0002.
 
+pub mod desk;
 mod identity_cmds;
+mod net_cmds;
 mod pair_cmds;
 mod stubs;
 mod terminal;
@@ -23,13 +25,6 @@ use crate::identity::{PeerError, Store, StoreError};
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_NOT_IMPLEMENTED: i32 = 2;
-
-/// Where `beam listen` binds when `--addr` is not given.
-///
-/// Loopback, so that M2's unencrypted, unauthenticated transport is not exposed
-/// to the network by accident. See ADR-0018 and ADR-0019.
-const DEFAULT_LISTEN_ADDR: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 7777);
 
 const LONG_ABOUT: &str = "\
 beam sends files directly between two computers.
@@ -166,14 +161,22 @@ enum Command {
         loopback: bool,
     },
 
-    /// Wait for incoming transfers
+    /// Wait for incoming transfers and pairing requests
+    ///
+    /// Shows this device's Short ID and a pairing code. The code works for one
+    /// attempt and changes every ten minutes; after three failed attempts,
+    /// pairing is off until `listen` is restarted. Every incoming file has to
+    /// be accepted by hand.
     Listen {
-        /// Where to listen. Development only; peer discovery arrives in M4.
+        /// The M2 TCP transport: unencrypted, sender unproven. Tests only.
         #[arg(long, hide = true, value_name = "HOST:PORT")]
         addr: Option<SocketAddr>,
         /// Directory to save received files in (default: the current directory)
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
+        /// Advertise only 127.0.0.1. Development and tests only.
+        #[arg(long, hide = true)]
+        loopback: bool,
     },
 
     /// Send a file to a paired peer
@@ -182,13 +185,16 @@ enum Command {
         peer: String,
         /// The file to send
         file: PathBuf,
-        /// Where to connect. Development only; peer discovery arrives in M4.
+        /// The M2 TCP transport: unencrypted, sender unproven. Tests only.
         #[arg(long, hide = true, value_name = "HOST:PORT")]
         addr: Option<SocketAddr>,
         /// Chunk size in bytes. Development only; it exists so tests can make
         /// a small file span many chunks without writing gigabytes.
         #[arg(long, hide = true, value_name = "BYTES")]
         chunk_size: Option<u32>,
+        /// Use only 127.0.0.1. Development and tests only.
+        #[arg(long, hide = true)]
+        loopback: bool,
     },
 
     /// List or clear partially received transfers
@@ -207,9 +213,6 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-
-    /// Regenerate this device's pairing code
-    Newcode,
 
     /// Show the beam version
     Version,
@@ -304,25 +307,25 @@ impl App {
                 wait,
                 loopback,
             } => self.pair(short_id.as_deref(), &name, wait, loopback, io),
-            Command::Listen { addr, out } => {
-                self.listen(addr.unwrap_or(DEFAULT_LISTEN_ADDR), out, io)
-            }
+            Command::Listen {
+                addr,
+                out,
+                loopback,
+            } => match addr {
+                Some(addr) => self.listen_tcp(addr, out, io),
+                None => self.listen(out, loopback, io),
+            },
             Command::Send {
                 peer,
                 file,
                 addr,
                 chunk_size,
-            } => {
-                let addr = addr.ok_or_else(|| {
-                    CommandError::Message(
-                        "M2 needs `--addr <host:port>` to reach the peer;                          finding a peer by name arrives in M4"
-                            .to_string(),
-                    )
-                })?;
-                self.send(&peer, &file, addr, chunk_size, io)
-            }
+                loopback,
+            } => match addr {
+                Some(addr) => self.send_tcp(&peer, &file, addr, chunk_size, io),
+                None => self.send(&peer, &file, chunk_size, loopback, io),
+            },
             Command::Transfers { clear, id, yes } => self.transfers(clear, id.as_deref(), yes, io),
-            Command::Newcode => Err(stubs::not_implemented("newcode", "M5")),
             Command::Version => stubs::version(io),
         }
     }

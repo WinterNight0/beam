@@ -13,7 +13,8 @@
 
 use std::time::Duration;
 
-use super::terminal::{Keyboard, TerminalPairConfirm};
+use super::desk::{DeskPrompt, PromptDesk};
+use super::terminal::Keyboard;
 use super::{App, CommandError, Io};
 use crate::config::Config;
 use crate::identity::{Identity, Peer, ShortId};
@@ -61,12 +62,12 @@ impl App {
         };
 
         let keyboard = Keyboard::start();
-        let confirm = TerminalPairConfirm::new(keyboard.clone(), timeouts.decision);
+        let confirm = DeskPrompt::new(PromptDesk::terminal(keyboard.clone()), timeouts.decision);
         let runtime = self.runtime()?;
         let pairing = Pairing {
             identity: &identity,
             known: &known,
-            name,
+            name: Some(name),
             network: &network,
             timeouts,
         };
@@ -98,7 +99,7 @@ impl App {
             }
         });
 
-        let key = result.map_err(|e| not_paired(e, wait_for_peer))?;
+        let key = result.map_err(|e| not_paired(e, wait_for_peer))?.key;
 
         // Read the file again: it may have changed while the prompt was up.
         let mut known = self.store.load_known_peers()?;
