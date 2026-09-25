@@ -18,6 +18,6 @@ pub use known_peers::{
     Attr, HEADER, KnownPeers, ParseError, ParseErrorKind, Peer, PeerError, validate_name,
 };
 pub use store::{
-    DIR_ENV, DIR_NAME, KNOWN_PEERS_NAME, PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, Store, StoreError,
-    TMP_NAME,
+    CONFIG_NAME, DIR_ENV, DIR_NAME, KNOWN_PEERS_NAME, PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, Store,
+    StoreError, TMP_NAME,
 };

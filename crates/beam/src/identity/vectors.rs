@@ -41,3 +41,8 @@ pub fn signing_key(name: &str) -> SigningKey {
 pub fn verifying_key(name: &str) -> VerifyingKey {
     signing_key(name).verifying_key()
 }
+
+/// A whole identity for the named vector, for tests that need one.
+pub fn identity(name: &str) -> super::Identity {
+    super::Identity::from_signing_key(signing_key(name), name)
+}

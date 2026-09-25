@@ -1,8 +1,12 @@
 //! Byte-stream transports.
 //!
 //! The transfer engine is generic over `AsyncRead + AsyncWrite`, so this module
-//! only has to hand it a stream. M2 provides TCP; M5 replaces it with a WebRTC
-//! data channel without the engine noticing. See ADR-0016.
+//! only has to hand it a stream. M2 provides TCP; M5 replaces it with an iroh
+//! QUIC stream without the engine noticing. See ADR-0016 and ADR-0025.
+//!
+//! [`endpoint`] builds the iroh endpoint. In M4 only pairing uses it.
+
+pub mod endpoint;
 
 use std::net::SocketAddr;
 
@@ -12,7 +16,7 @@ pub enum PathKind {
     /// A direct connection between the peers.
     #[default]
     Direct,
-    /// Traffic is being relayed through a third party (M7).
+    /// Traffic is being relayed through a third party (M5).
     Relay,
 }
 

@@ -20,6 +20,7 @@ pub const PRIVATE_KEY_NAME: &str = "id_ed25519";
 pub const PUBLIC_KEY_NAME: &str = "id_ed25519.pub";
 pub const KNOWN_PEERS_NAME: &str = "known_peers";
 pub const TMP_NAME: &str = "tmp";
+pub const CONFIG_NAME: &str = "config.toml";
 
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -116,6 +117,11 @@ impl Store {
     /// The path of the device public key.
     pub fn public_key_path(&self) -> PathBuf {
         self.dir.join(PUBLIC_KEY_NAME)
+    }
+
+    /// Path of `config.toml`, which may not exist.
+    pub fn config_path(&self) -> PathBuf {
+        self.dir.join(CONFIG_NAME)
     }
 
     /// The path of the `known_peers` database.

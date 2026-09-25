@@ -7,6 +7,7 @@
 //! that they can be exercised by tests; see `docs/decisions.md` ADR-0002.
 
 pub mod cli;
+pub mod config;
 pub(crate) mod hex;
 pub mod identity;
 pub mod transfer;
