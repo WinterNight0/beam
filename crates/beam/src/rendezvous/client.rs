@@ -9,8 +9,10 @@ use tokio::net::TcpStream;
 use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, WebSocketStream};
 
 use super::proto::{
-    ClientMessage, MAX_MESSAGE, ServerMessage, sign_registration, unix_now, verify_record,
+    ClientMessage, MAX_MESSAGE, ServerMessage, sign_registration, unix_now, verify_key_record,
+    verify_record,
 };
+use crate::identity::encode_public_key;
 use crate::identity::{Identity, ShortId};
 
 /// How long to wait for the server to connect or answer.
@@ -26,7 +28,7 @@ pub const REFRESH_EVERY: Duration = Duration::from_secs(30);
 pub enum RendezvousError {
     #[error(
         "cannot reach the rendezvous server at {url}: {message}\n       \
-         Is beam-server running? The address is `rendezvous` in config.toml."
+         Is beam-server running? The address is `rendezvous` in config.toml"
     )]
     Unreachable { url: String, message: String },
     #[error("the rendezvous server refused the request ({code}): {message}")]
@@ -107,6 +109,24 @@ impl RendezvousClient {
                 .filter_map(|record| verify_record(short_id, record))
                 .map(|(public_key, addr)| Found { public_key, addr })
                 .collect()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Where the device with exactly this key is, if it is registered. The
+    /// answer is checked here: an entry for any other key, or at any other
+    /// endpoint, is ignored.
+    pub async fn lookup_key(
+        &mut self,
+        key: &VerifyingKey,
+    ) -> Result<Option<EndpointAddr>, RendezvousError> {
+        let request = ClientMessage::LookupKey {
+            public_key: encode_public_key(key),
+        };
+        match self.request(&request).await? {
+            ServerMessage::Found { peers, .. } => Ok(peers
+                .iter()
+                .find_map(|record| verify_key_record(key, record))),
             other => Err(unexpected(&other)),
         }
     }

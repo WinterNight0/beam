@@ -137,6 +137,18 @@ impl Registry {
         records
     }
 
+    /// The live entry for exactly this key, if the device is registered.
+    ///
+    /// A linear scan: the table holds the devices currently online, which for
+    /// this server is small. An index is the obvious change if it ever is not.
+    pub fn lookup_key(&mut self, key: &VerifyingKey, now: Instant) -> Vec<PeerRecord> {
+        let short_id = crate::identity::Fingerprint::of(key).short_id();
+        self.lookup(short_id, now)
+            .into_iter()
+            .filter(|r| r.public_key == encode_public_key(key))
+            .collect()
+    }
+
     /// Forgets everything a connection registered.
     pub fn release(&mut self, owner: Owner) {
         self.by_id.retain(|_, entries| {
@@ -249,6 +261,17 @@ fn respond(
             },
             Err(e) => error("malformed", &e.to_string()),
         },
+        ClientMessage::LookupKey { public_key } => {
+            match crate::identity::decode_public_key(&public_key) {
+                Ok(key) => ServerMessage::Found {
+                    short_id: crate::identity::Fingerprint::of(&key)
+                        .short_id()
+                        .to_string(),
+                    peers: registry.lookup_key(&key, Instant::now()),
+                },
+                Err(e) => error("malformed", &e.to_string()),
+            }
+        }
     }
 }
 
@@ -419,6 +442,34 @@ mod tests {
 
         assert!(registry.lookup(alpha.short_id(), t0).is_empty());
         assert_eq!(registry.lookup(bravo.short_id(), t0).len(), 1);
+    }
+
+    #[test]
+    fn a_key_lookup_finds_only_that_key_even_under_a_collision() {
+        let config = ServerConfig::default();
+        let alpha = vectors::identity("alpha");
+        let mallory = vectors::identity("mallory");
+        let mut registry = Registry::new();
+        let t0 = Instant::now();
+
+        registry
+            .register(registration(&alpha, 1, 1), 1, t0, &config)
+            .unwrap();
+        registry
+            .register(colliding(&mallory, alpha.short_id(), 1), 2, t0, &config)
+            .unwrap();
+
+        let found = registry.lookup_key(&alpha.verifying_key(), t0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].public_key,
+            encode_public_key(&alpha.verifying_key())
+        );
+        assert!(
+            registry
+                .lookup_key(&vectors::identity("nobody").verifying_key(), t0)
+                .is_empty()
+        );
     }
 
     #[test]

@@ -8,7 +8,10 @@
 //!   private key whose fingerprint produces it.
 //! * `lookup` — "where is Short ID *s*?" The answer is every live entry for
 //!   *s*, and the client checks each one again itself: the server is a
-//!   convenience, not an authority.
+//!   convenience, not an authority. Used once, for pairing.
+//! * `lookup_key` — "where is the device with this public key?" Used by
+//!   `send` after pairing, when the full key is known and the Short ID no
+//!   longer matters (ADR-0031).
 //!
 //! A Short ID is only 30 bits, so a determined attacker *can* grind a key that
 //! lands on someone else's Short ID and register it. That is expected and is
@@ -57,6 +60,9 @@ pub enum ClientMessage {
     },
     Lookup {
         short_id: String,
+    },
+    LookupKey {
+        public_key: String,
     },
 }
 
@@ -242,6 +248,16 @@ pub fn verify_registration(
         timestamp: parsed.timestamp,
         addr: parsed.addr,
     })
+}
+
+/// The client's check of a `lookup_key` answer: the entry must be for exactly
+/// the key that was asked for, at that key's endpoint.
+pub fn verify_key_record(requested: &VerifyingKey, record: &PeerRecord) -> Option<EndpointAddr> {
+    let key = decode_public_key(&record.public_key).ok()?;
+    if key != *requested || record.addr.id != endpoint_id(&key) {
+        return None;
+    }
+    Some(record.addr.clone())
 }
 
 /// The client's own check of a lookup answer: an entry is used only if its
@@ -462,6 +478,34 @@ mod tests {
             addr: addr_of(&bravo),
         };
         assert!(verify_record(requested, &wrong_addr).is_none());
+    }
+
+    #[test]
+    fn a_key_lookup_answer_must_be_for_the_key_asked_about() {
+        let alpha = alpha();
+        let bravo = vectors::identity("bravo");
+        let good = PeerRecord {
+            public_key: encode_public_key(&alpha.verifying_key()),
+            addr: addr_of(&alpha),
+        };
+        assert_eq!(
+            verify_key_record(&alpha.verifying_key(), &good),
+            Some(addr_of(&alpha))
+        );
+        // Someone else's entry, or the right key at someone else's endpoint.
+        let other = PeerRecord {
+            public_key: encode_public_key(&bravo.verifying_key()),
+            addr: addr_of(&bravo),
+        };
+        assert_eq!(verify_key_record(&alpha.verifying_key(), &other), None);
+        let misdirected = PeerRecord {
+            public_key: good.public_key.clone(),
+            addr: addr_of(&bravo),
+        };
+        assert_eq!(
+            verify_key_record(&alpha.verifying_key(), &misdirected),
+            None
+        );
     }
 
     #[test]
