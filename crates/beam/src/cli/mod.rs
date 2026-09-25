@@ -4,6 +4,7 @@
 //! tests with in-memory streams and a temporary home directory; see ADR-0002.
 
 mod identity_cmds;
+mod pair_cmds;
 mod stubs;
 mod terminal;
 mod transfer_cmds;
@@ -99,7 +100,7 @@ enum Command {
     /// Generate this device's identity keypair
     ///
     /// The private key never leaves this machine and is never sent to the
-    /// signaling server. Run this once per machine.
+    /// rendezvous server. Run this once per machine.
     Init {
         /// Replace an existing identity (invalidates every existing pairing)
         #[arg(long)]
@@ -135,16 +136,37 @@ enum Command {
         yes: bool,
     },
 
-    /// Pair with a peer for the first time using its Short ID and pairing code
+    /// Pair with another device for the first time
+    ///
+    /// One device waits and shows its Short ID and a pairing code:
+    ///
+    ///   beam pair --wait --name <a name for the other device>
+    ///
+    /// The other looks it up and types the code:
+    ///
+    ///   beam pair <SHORT ID> --name <a name for the waiting device>
+    ///
+    /// Both people then compare fingerprints and confirm. The code works for
+    /// one attempt and expires after ten minutes. In M5 waiting moves into
+    /// `beam listen`.
     Pair {
-        /// The peer's 9-digit Short ID
-        short_id: String,
-        /// Local nickname to store the peer under
+        /// The other device's 9-digit Short ID
+        #[arg(required_unless_present = "wait", conflicts_with = "wait")]
+        short_id: Option<String>,
+        /// Local nickname to store the other device under
         #[arg(long)]
-        name: Option<String>,
+        name: String,
+        /// Wait for the other device, showing this device's Short ID and a
+        /// pairing code
+        #[arg(long)]
+        wait: bool,
+        /// Advertise only 127.0.0.1. Development only; it makes pairing two
+        /// beam homes on one machine independent of the network.
+        #[arg(long, hide = true)]
+        loopback: bool,
     },
 
-    /// Wait for incoming transfers and show the pairing code
+    /// Wait for incoming transfers
     Listen {
         /// Where to listen. Development only; peer discovery arrives in M4.
         #[arg(long, hide = true, value_name = "HOST:PORT")]
@@ -276,7 +298,12 @@ impl App {
             Command::Peers => self.peers(io),
             Command::Rename { old_name, new_name } => self.rename(&old_name, &new_name, io),
             Command::Remove { name, yes } => self.remove(&name, yes, io),
-            Command::Pair { .. } => Err(stubs::not_implemented("pair", "M4")),
+            Command::Pair {
+                short_id,
+                name,
+                wait,
+                loopback,
+            } => self.pair(short_id.as_deref(), &name, wait, loopback, io),
             Command::Listen { addr, out } => {
                 self.listen(addr.unwrap_or(DEFAULT_LISTEN_ADDR), out, io)
             }
@@ -295,7 +322,7 @@ impl App {
                 self.send(&peer, &file, addr, chunk_size, io)
             }
             Command::Transfers { clear, id, yes } => self.transfers(clear, id.as_deref(), yes, io),
-            Command::Newcode => Err(stubs::not_implemented("newcode", "M4")),
+            Command::Newcode => Err(stubs::not_implemented("newcode", "M5")),
             Command::Version => stubs::version(io),
         }
     }

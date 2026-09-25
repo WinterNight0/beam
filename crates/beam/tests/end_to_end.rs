@@ -118,6 +118,43 @@ impl Watched {
         }
     }
 
+    /// Waits for the process to exit by itself.
+    fn exit_status(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll the child") {
+                // Collect whatever it printed last, for the assertions.
+                std::thread::sleep(Duration::from_millis(50));
+                while let Ok(byte) = self.bytes.try_recv() {
+                    self.seen.push(byte as char);
+                }
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the process did not exit within {PATIENCE:?}. It printed:\n{}",
+                self.seen
+            );
+            while let Ok(byte) = self.bytes.try_recv() {
+                self.seen.push(byte as char);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The value printed after `label` in a `  Label   value` detail line.
+    fn field(&self, label: &str) -> String {
+        let line = self
+            .seen
+            .lines()
+            .find(|line| line.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("no {label:?} line in:\n{}", self.seen));
+        line.trim_start()
+            .trim_start_matches(label)
+            .trim()
+            .to_string()
+    }
+
     fn answer(&mut self, text: &str) {
         writeln!(self.stdin, "{text}").expect("write to the child's stdin");
         self.stdin.flush().expect("flush");
@@ -170,7 +207,9 @@ fn demo(payload_len: usize) -> Demo {
     beam(&alice, &["init"]);
     beam(&bob, &["init"]);
 
-    // Pair them by hand; `beam pair` arrives in M4.
+    // Pair them by writing known_peers directly, which keeps the transfer
+    // tests independent of the network. `beam_pair_between_two_processes`
+    // below pairs through the real command.
     let entry = |name: &str, key: &str| {
         format!("# beam known_peers v1\n{name}  ed25519 {key}  added=2026-01-01T00:00:00Z\n")
     };
@@ -494,5 +533,225 @@ mod killed {
             }
         }
         total
+    }
+}
+
+/// `beam pair` between two real processes, through a real rendezvous server,
+/// followed by a transfer between the two devices it paired.
+///
+/// Every prompt is waited for before it is answered, as above. That is what
+/// catches a prompt that never reaches the screen, and it also proves the
+/// ordering the design promises: nobody is asked `[y/N]` until the code has
+/// been checked.
+mod pairing {
+    use super::*;
+
+    /// A rendezvous server on a free loopback port, run on its own runtime
+    /// for as long as the value lives.
+    struct Server {
+        url: String,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    fn server() -> Server {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind the rendezvous server");
+        let addr = listener.local_addr().expect("local addr");
+        runtime.spawn(beam::rendezvous::serve(
+            listener,
+            beam::rendezvous::ServerConfig::default(),
+        ));
+        Server {
+            url: format!("ws://{addr}/v1"),
+            _runtime: runtime,
+        }
+    }
+
+    /// Points a beam home at the test server, with no relay: this test must
+    /// not touch the internet.
+    fn configure(beam_dir: &Path, url: &str) {
+        std::fs::write(
+            beam_dir.join("config.toml"),
+            format!("rendezvous = \"{url}\"\nrelay = \"none\"\n"),
+        )
+        .expect("write config.toml");
+    }
+
+    fn two_homes(server: &Server) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let alice = tmp.path().join("alice");
+        let bob = tmp.path().join("bob");
+        beam(&alice, &["init"]);
+        beam(&bob, &["init"]);
+        configure(&alice, &server.url);
+        configure(&bob, &server.url);
+        (tmp, alice, bob)
+    }
+
+    /// A field from `beam whoami`.
+    fn whoami_field(beam_dir: &Path, label: &str) -> String {
+        let out = beam(beam_dir, &["whoami"]);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("no {label} in {out}"));
+        line.trim_start()
+            .trim_start_matches(label)
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn beam_pair_between_two_processes_then_a_transfer() {
+        let server = server();
+        let (tmp, alice, bob) = two_homes(&server);
+
+        // bob waits; alice joins.
+        let mut waiter = Watched::spawn(&bob, &["pair", "--wait", "--name", "alice", "--loopback"]);
+        waiter.wait_for("The code works for one attempt only.");
+        let short_id = waiter.field("Short ID");
+        let code = waiter.field("Pairing code");
+        assert_eq!(short_id.replace(' ', "").len(), 9, "{short_id:?}");
+        assert_eq!(code.replace(' ', "").len(), 6, "{code:?}");
+
+        let mut joiner =
+            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        joiner.wait_for("Pairing code shown on the other device: ");
+        joiner.answer(&code);
+
+        // Both people are asked, and both are shown both fingerprints.
+        waiter.wait_for("[y/N]: ");
+        joiner.wait_for("[y/N]: ");
+        let alice_fp = whoami_field(&alice, "Fingerprint");
+        let bob_fp = whoami_field(&bob, "Fingerprint");
+        for (who, watched) in [("waiter", &waiter), ("joiner", &joiner)] {
+            assert!(
+                watched.seen.contains(&alice_fp) && watched.seen.contains(&bob_fp),
+                "the {who}'s prompt does not show both fingerprints:\n{}",
+                watched.seen
+            );
+        }
+        waiter.answer("y");
+        joiner.answer("y");
+        waiter.wait_for("Paired with alice.");
+        joiner.wait_for("Paired with bob.");
+        assert!(waiter.exit_status().success(), "{}", waiter.seen);
+        assert!(joiner.exit_status().success(), "{}", joiner.seen);
+
+        // Each side stored the other's real key.
+        let bobs_peers = std::fs::read_to_string(bob.join("known_peers")).unwrap();
+        let alices_peers = std::fs::read_to_string(alice.join("known_peers")).unwrap();
+        assert!(bobs_peers.contains(&public_key_of(&alice)), "{bobs_peers}");
+        assert!(
+            alices_peers.contains(&public_key_of(&bob)),
+            "{alices_peers}"
+        );
+
+        // And the pairing is good for what it is for: a transfer.
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("create inbox");
+        let payload = tmp.path().join("hello.txt");
+        std::fs::write(&payload, b"paired, then sent").unwrap();
+        let mut listener = Watched::spawn(
+            &bob,
+            &[
+                "listen",
+                "--addr",
+                "127.0.0.1:0",
+                "--out",
+                inbox.to_str().unwrap(),
+            ],
+        );
+        let addr = listener.listening_on();
+        let sender = Command::new(BEAM)
+            .args(["send", "bob", payload.to_str().unwrap(), "--addr", &addr])
+            .env("BEAM_DIR", &alice)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn send");
+        listener.wait_for("[y/N]: ");
+        assert!(listener.seen.contains("alice"), "{}", listener.seen);
+        listener.answer("y");
+        listener.wait_for("saved as hello.txt");
+        assert!(sender.wait_with_output().unwrap().status.success());
+        assert_eq!(
+            std::fs::read(inbox.join("hello.txt")).unwrap(),
+            b"paired, then sent"
+        );
+    }
+
+    #[test]
+    fn a_wrong_code_between_two_processes_saves_nothing_on_either_side() {
+        let server = server();
+        let (_tmp, alice, bob) = two_homes(&server);
+
+        let mut waiter = Watched::spawn(&bob, &["pair", "--wait", "--name", "alice", "--loopback"]);
+        waiter.wait_for("The code works for one attempt only.");
+        let short_id = waiter.field("Short ID");
+        let code: u32 = waiter
+            .field("Pairing code")
+            .replace(' ', "")
+            .parse()
+            .unwrap();
+        let wrong = format!("{:06}", (code + 1) % 1_000_000);
+
+        let mut joiner =
+            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        joiner.wait_for("Pairing code shown on the other device: ");
+        joiner.answer(&wrong);
+
+        joiner.wait_for("not paired");
+        waiter.wait_for("not paired");
+        assert!(!joiner.exit_status().success());
+        assert!(!waiter.exit_status().success());
+        assert!(!joiner.seen.contains("[y/N]"), "{}", joiner.seen);
+        assert!(!waiter.seen.contains("[y/N]"), "{}", waiter.seen);
+        assert!(waiter.seen.contains("beam pair --wait"), "{}", waiter.seen);
+
+        for home in [&alice, &bob] {
+            let peers = std::fs::read_to_string(home.join("known_peers")).unwrap_or_default();
+            let entries = peers
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                .count();
+            assert_eq!(entries, 0, "{} gained a peer:\n{peers}", home.display());
+        }
+    }
+
+    #[test]
+    fn answering_no_to_pairing_saves_nothing_on_either_side() {
+        let server = server();
+        let (_tmp, alice, bob) = two_homes(&server);
+
+        let mut waiter = Watched::spawn(&bob, &["pair", "--wait", "--name", "alice", "--loopback"]);
+        waiter.wait_for("The code works for one attempt only.");
+        let short_id = waiter.field("Short ID");
+        let code = waiter.field("Pairing code");
+
+        let mut joiner =
+            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        joiner.wait_for("Pairing code shown on the other device: ");
+        joiner.answer(&code);
+
+        waiter.wait_for("[y/N]: ");
+        joiner.wait_for("[y/N]: ");
+        waiter.answer("n");
+        joiner.answer("y");
+        waiter.wait_for("not paired");
+        joiner.wait_for("not paired");
+        assert!(!waiter.exit_status().success());
+        assert!(!joiner.exit_status().success());
+
+        for home in [&alice, &bob] {
+            let peers = std::fs::read_to_string(home.join("known_peers")).unwrap_or_default();
+            let entries = peers
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                .count();
+            assert_eq!(entries, 0, "{} gained a peer:\n{peers}", home.display());
+        }
     }
 }

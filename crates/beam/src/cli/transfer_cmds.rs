@@ -1,8 +1,7 @@
 //! `beam listen` and `beam send`.
 //!
 //! Both use a plain TCP address given on the command line. That is a stand-in
-//! for peer discovery, which arrives in M4, and for WebRTC, which arrives in
-//! M5; see ADR-0018.
+//! for the iroh transport, which arrives in M5; see ADR-0018 and ADR-0025.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -54,12 +53,12 @@ struct ReceiveJson {
 }
 
 impl App {
-    /// Builds the runtime the two networked commands run on.
+    /// Builds the runtime the networked commands run on.
     ///
-    /// The rest of the CLI stays synchronous; only these two need a runtime,
-    /// and building it here keeps `cli::execute` and the M1 commands free of
-    /// async plumbing.
-    fn runtime(&self) -> Result<tokio::runtime::Runtime, CommandError> {
+    /// The rest of the CLI stays synchronous; only `listen`, `send` and `pair`
+    /// need a runtime, and building it here keeps `cli::execute` and the M1
+    /// commands free of async plumbing.
+    pub(super) fn runtime(&self) -> Result<tokio::runtime::Runtime, CommandError> {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

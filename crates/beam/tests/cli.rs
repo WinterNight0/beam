@@ -270,7 +270,7 @@ fn the_remove_prompt_shows_the_fingerprint() {
 #[test]
 fn commands_that_wait_for_later_milestones_exit_two() {
     let (_tmp, dir) = initialised();
-    let cases: [&[&str]; 2] = [&["pair", "123456789", "--name", "alice"], &["newcode"]];
+    let cases: [&[&str]; 1] = [&["newcode"]];
     for args in cases {
         let outcome = run(&dir, "", args);
         assert_eq!(
@@ -379,6 +379,98 @@ fn listen_has_no_flag_that_could_stand_in_for_the_prompt() {
         "the flags on `beam listen` changed; check that the new one cannot \
          accept a transfer without a person answering the prompt (S-1)"
     );
+}
+
+/// The pairing confirmation has the same no-bypass rule as Accept (condition
+/// 4 of the M4 approval): no flag can answer `[y/N]` in advance. Allowlisted
+/// for the same reason as `listen` above.
+#[test]
+fn pair_has_no_flag_that_could_stand_in_for_the_confirmation() {
+    let command = beam::cli::command();
+    let pair = command
+        .find_subcommand("pair")
+        .expect("pair is a subcommand");
+
+    let mut flags: Vec<&str> = pair
+        .get_arguments()
+        .filter_map(|arg| arg.get_long())
+        .collect();
+    flags.sort_unstable();
+
+    assert_eq!(
+        flags,
+        ["loopback", "name", "wait"],
+        "the flags on `beam pair` changed; check that the new one cannot save a \
+         peer without a person confirming its fingerprint"
+    );
+}
+
+#[test]
+fn pair_needs_a_name() {
+    let (_tmp, dir) = initialised();
+    let outcome = run(&dir, "", &["pair", "123456789"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(outcome.stderr.contains("--name"), "{}", outcome.stderr);
+}
+
+#[test]
+fn pair_needs_a_short_id_or_wait_but_not_both() {
+    let (_tmp, dir) = initialised();
+    let neither = run(&dir, "", &["pair", "--name", "alice"]);
+    assert_eq!(neither.code, EXIT_ERROR, "{}", neither.stderr);
+
+    let both = run(
+        &dir,
+        "",
+        &["pair", "123456789", "--wait", "--name", "alice"],
+    );
+    assert_eq!(both.code, EXIT_ERROR, "{}", both.stderr);
+    assert!(
+        both.stderr.contains("cannot be used with"),
+        "{}",
+        both.stderr
+    );
+}
+
+#[test]
+fn pair_with_a_malformed_short_id_fails_before_the_network() {
+    let (_tmp, dir) = initialised();
+    // The default rendezvous server is not running; reaching the Short ID
+    // check proves nothing was attempted over the network first.
+    let outcome = run(&dir, "", &["pair", "12345", "--name", "alice"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(outcome.stderr.contains("9 digits"), "{}", outcome.stderr);
+}
+
+#[test]
+fn pair_with_a_name_that_is_taken_fails_before_the_network() {
+    let (_tmp, dir) = initialised();
+    seed_peers(&dir);
+    let outcome = run(&dir, "", &["pair", "123456789", "--name", "alice"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(
+        outcome.stderr.contains("already exists"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(!outcome.stderr.contains("rendezvous"), "{}", outcome.stderr);
+}
+
+#[test]
+fn pair_without_an_identity_points_at_init() {
+    let (_tmp, dir) = beam_dir();
+    let outcome = run(&dir, "", &["pair", "--wait", "--name", "alice"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(outcome.stderr.contains("beam init"), "{}", outcome.stderr);
+}
+
+#[test]
+fn pair_with_a_broken_config_says_which_file() {
+    let (_tmp, dir) = initialised();
+    std::fs::write(dir.join("config.toml"), "realy = \"none\"\n").unwrap();
+    let outcome = run(&dir, "", &["pair", "--wait", "--name", "alice"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(outcome.stderr.contains("config.toml"), "{}", outcome.stderr);
 }
 
 /// S-1 again, from the other direction: nothing anywhere in the CLI is named
