@@ -28,14 +28,14 @@ use time::OffsetDateTime;
 use crate::identity::{Fingerprint, KnownPeers, decode_public_key};
 use crate::transport::{PathKind, Route, RouteTracker, fixed_route};
 
-use super::chunk::{ChunkPlan, hash_stream, sha256_hex};
+use super::chunk::{ChunkPlan, sha256_hex};
 use super::engine::{
     DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, Progress, Reporter, TransferError,
 };
 use super::frame::{FrameError, read_message, write_message};
 use super::message::{
     Accept, Cancel, ChunkAck, ChunkNak, Complete, Message, NakReason, Reject, RejectReason,
-    TransferId, TransferRequest,
+    TransferId, TransferRequest, VerifyProgress,
 };
 use super::partial::{Partial, PartialError, PartialKey, PartialStore};
 use super::paths::{reserve_destination, sanitize_file_name};
@@ -87,6 +87,15 @@ pub struct ReceiveOptions {
     pub accept_timeout: Duration,
     /// How many times a chunk may be asked for again.
     pub max_chunk_attempts: u32,
+    /// How long to wait for the sender's next frame once accepted. Without
+    /// it, a paired peer that goes quiet holds the transfer slot for ever.
+    pub stall_timeout: Duration,
+    /// How often to tell the sender verification is still going.
+    pub keepalive_every: Duration,
+    /// A pause after each block of the final verification. Zero, except in
+    /// tests that need a verification slow enough to outlast a stall timeout.
+    #[doc(hidden)]
+    pub verify_pause: Duration,
     /// How the peers are connected, for the progress line. It can change
     /// during the transfer; see [`Route`].
     pub route: Route,
@@ -108,6 +117,9 @@ impl ReceiveOptions {
             tmp_dir: tmp_dir.into(),
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             max_chunk_attempts: DEFAULT_CHUNK_ATTEMPTS,
+            stall_timeout: super::engine::DEFAULT_STALL_TIMEOUT,
+            keepalive_every: super::engine::DEFAULT_KEEPALIVE_EVERY,
+            verify_pause: Duration::ZERO,
             route: fixed_route(PathKind::Direct),
             proven_sender: None,
             max_partial_age: super::partial::DEFAULT_MAX_AGE,
@@ -154,6 +166,23 @@ impl Incoming {
             Some(Err(e)) => Err(e.into()),
             None => Err(FrameError::Closed.into()),
         }
+    }
+}
+
+impl Incoming {
+    /// The next message, once the transfer is under way: a peer that sends
+    /// nothing for `stall` is given up on (ADR-0033).
+    async fn within(
+        &mut self,
+        stall: Duration,
+        waiting_for: &'static str,
+    ) -> Result<Message, TransferError> {
+        tokio::time::timeout(stall, self.next())
+            .await
+            .map_err(|_| TransferError::Stalled {
+                after: stall,
+                waiting_for,
+            })?
     }
 }
 
@@ -239,7 +268,31 @@ where
         size: request.size,
         chunk_size: request.chunk_size,
     };
-    let mut partial = match options.partials().open(&key, &file_name, plan).await {
+    // A request for more than will fit is refused before anything is written
+    // for it. Checked here, before the partial exists, only for a new
+    // transfer: a resume needs just the missing bytes, which the full check
+    // below knows. Without this a paired peer could make every request cost
+    // the receiver a state file sized to the chunk count.
+    let partials = options.partials();
+    let resuming = partials
+        .has(&key)
+        .map_err(|e| TransferError::Partial(Box::new(e)))?;
+    if !resuming {
+        std::fs::create_dir_all(partials.root())
+            .map_err(|e| TransferError::io("create", partials.root().display(), e))?;
+        if let Err(e) = check_space(
+            partials.root(),
+            &options.out_dir,
+            request.size,
+            request.size,
+        ) {
+            refuse(&mut writer, request.transfer_id, RejectReason::NoSpace).await;
+            machine.apply(Event::Declined)?;
+            return Err(TransferError::Space(Box::new(e)));
+        }
+    }
+
+    let mut partial = match partials.open(&key, &file_name, plan).await {
         Ok(partial) => partial,
         Err(PartialError::Busy) => {
             refuse(&mut writer, request.transfer_id, RejectReason::Busy).await;
@@ -509,11 +562,15 @@ async fn read_request(
 
 /// Looks the sender up in `known_peers`.
 ///
-/// STRENGTHEN IN M6: over the TCP stand-in this only checks that the key the
-/// sender *claims* is one we have paired with. Over iroh the caller has already
-/// required the claim to equal the key the connection proved
-/// (`ReceiveOptions::proven_sender`), which closes the gap; M6 adds the tests
-/// that demonstrate it and removes this marker. See ADR-0019 and ADR-0031.
+/// Over iroh — the only transport beam uses for real — the key looked up here
+/// has already been required to equal the key the connection proved
+/// (`ReceiveOptions::proven_sender`), so this is a lookup of a *proven*
+/// identity (S-7a, met in M6; `tests/listen.rs::impersonation`).
+///
+/// Over the hidden, test-only TCP transport (`--addr`) nothing proves the
+/// claim. That is recorded as an accepted risk in `docs/threat-model.md`: the
+/// flag is hidden, prints a warning on any non-loopback address, and exists
+/// so the engine can be tested without iroh. See ADR-0019 and ADR-0031.
 fn known_sender(known_peers: &KnownPeers, claimed_key: &str) -> Option<(String, Fingerprint)> {
     let key = decode_public_key(claimed_key).ok()?;
     let peer = known_peers.lookup_key(&key)?;
@@ -565,8 +622,15 @@ where
     // sends something else anyway is caught by the out-of-order check.
     let wanted: Vec<u32> = partial.bitmap().missing().collect();
     for index in wanted {
-        let (bytes, digest) =
-            receive_chunk(incoming, writer, plan, index, options.max_chunk_attempts).await?;
+        let (bytes, digest) = receive_chunk(
+            incoming,
+            writer,
+            plan,
+            index,
+            options.max_chunk_attempts,
+            options.stall_timeout,
+        )
+        .await?;
 
         partial
             .store_chunk(index, &bytes, &digest)
@@ -591,7 +655,10 @@ where
     let part_path = partial.part_path();
 
     // The sender says it has finished before the whole-file hash is checked.
-    match incoming.next().await? {
+    match incoming
+        .within(options.stall_timeout, "waiting for the sender to finish")
+        .await?
+    {
         Message::Complete(_) => {}
         Message::Cancel(cancel) => {
             machine.apply(Event::Cancel)?;
@@ -612,7 +679,7 @@ where
     // pieces arrived intact — this says the file is the one that was promised.
     // The caller discards the partial when this fails, because a partial that
     // cannot produce the right file will not produce it next time either.
-    verify(&part_path, &request.file_sha256).await?;
+    verify(&part_path, &request.file_sha256, writer, options).await?;
 
     // Reserve the name by creating the file, then move the verified part over
     // it. Nothing is written under the destination name until the contents are
@@ -653,6 +720,7 @@ async fn receive_chunk<W>(
     plan: ChunkPlan,
     index: u32,
     max_attempts: u32,
+    stall: Duration,
 ) -> Result<(Vec<u8>, String), TransferError>
 where
     W: AsyncWrite + Unpin,
@@ -660,7 +728,7 @@ where
     let expected_len = plan.len_of(index);
 
     for attempt in 1..=max_attempts {
-        let start = match incoming.next().await? {
+        let start = match incoming.within(stall, "waiting for the next chunk").await? {
             Message::ChunkStart(start) => start,
             Message::Cancel(cancel) => return Err(TransferError::Cancelled(cancel.reason)),
             other => {
@@ -688,7 +756,7 @@ where
 
         let mut buffer = Vec::with_capacity(expected_len as usize);
         loop {
-            match incoming.next().await? {
+            match incoming.within(stall, "receiving a chunk").await? {
                 Message::ChunkData { index: got, bytes } if got == index => {
                     buffer.extend_from_slice(&bytes);
                 }
@@ -737,7 +805,21 @@ where
 }
 
 /// Hashes the assembled file and compares it with what the sender promised.
-async fn verify(part_path: &Path, expected: &str) -> Result<(), TransferError> {
+/// Checks the assembled file against the hash the sender promised, telling
+/// the sender every `keepalive_every` that it is still at it: on a large file
+/// this takes longer than the sender's stall timeout (ADR-0033).
+async fn verify<W>(
+    part_path: &Path,
+    expected: &str,
+    writer: &mut W,
+    options: &ReceiveOptions,
+) -> Result<(), TransferError>
+where
+    W: AsyncWrite + Unpin,
+{
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
     let mut file = tokio::fs::File::open(part_path)
         .await
         .map_err(|e| TransferError::io("open", part_path.display(), e))?;
@@ -747,9 +829,29 @@ async fn verify(part_path: &Path, expected: &str) -> Result<(), TransferError> {
         .map_err(|e| TransferError::io("read", part_path.display(), e))?
         .len();
 
-    let (digest, _) = hash_stream(&mut file, total, |_, _| {})
-        .await
-        .map_err(|e| TransferError::io("read", part_path.display(), e))?;
+    let mut hasher = Sha256::new();
+    let mut block = vec![0u8; 1024 * 1024];
+    let mut done = 0u64;
+    let mut last_told = tokio::time::Instant::now();
+    loop {
+        let n = file
+            .read(&mut block)
+            .await
+            .map_err(|e| TransferError::io("read", part_path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&block[..n]);
+        done += n as u64;
+        if !options.verify_pause.is_zero() {
+            tokio::time::sleep(options.verify_pause).await;
+        }
+        if last_told.elapsed() >= options.keepalive_every {
+            write_message(writer, &Message::Verifying(VerifyProgress { done, total })).await?;
+            last_told = tokio::time::Instant::now();
+        }
+    }
+    let digest = crate::hex::encode(&hasher.finalize());
 
     if digest == expected {
         Ok(())

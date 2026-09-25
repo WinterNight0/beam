@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::message::{
     Accept, Cancel, ChunkAck, ChunkNak, ChunkStart, Complete, Message, Reject, TransferRequest,
+    VerifyProgress,
 };
 
 /// The largest payload any frame may declare.
@@ -37,6 +38,7 @@ mod kind {
     pub const CHUNK_NAK: u8 = 7;
     pub const COMPLETE: u8 = 8;
     pub const CANCEL: u8 = 9;
+    pub const VERIFYING: u8 = 10;
 }
 
 /// Why a frame could not be read or written.
@@ -54,7 +56,7 @@ pub enum FrameError {
     TooLarge { declared: usize },
     #[error("a CHUNK_DATA frame is too short to contain a chunk index")]
     MalformedChunkData,
-    #[error("malformed {kind} payload: {source}")]
+    #[error("malformed {kind} payload: {}", crate::untrusted::text(&source.to_string()))]
     Json {
         kind: &'static str,
         #[source]
@@ -75,6 +77,7 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::ChunkNak(m) => (kind::CHUNK_NAK, to_json(m, "CHUNK_NAK")?),
         Message::Complete(m) => (kind::COMPLETE, to_json(m, "COMPLETE")?),
         Message::Cancel(m) => (kind::CANCEL, to_json(m, "CANCEL")?),
+        Message::Verifying(m) => (kind::VERIFYING, to_json(m, "VERIFYING")?),
         Message::ChunkData { index, bytes } => {
             let mut payload = Vec::with_capacity(4 + bytes.len());
             payload.extend_from_slice(&index.to_be_bytes());
@@ -109,6 +112,7 @@ pub fn decode(kind: u8, payload: &[u8]) -> Result<Message, FrameError> {
         kind::CHUNK_NAK => Message::ChunkNak(from_json::<ChunkNak>(payload, "CHUNK_NAK")?),
         kind::COMPLETE => Message::Complete(from_json::<Complete>(payload, "COMPLETE")?),
         kind::CANCEL => Message::Cancel(from_json::<Cancel>(payload, "CANCEL")?),
+        kind::VERIFYING => Message::Verifying(from_json::<VerifyProgress>(payload, "VERIFYING")?),
         kind::CHUNK_DATA => {
             if payload.len() < 4 {
                 return Err(FrameError::MalformedChunkData);

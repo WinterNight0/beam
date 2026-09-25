@@ -947,6 +947,67 @@ mod over_iroh {
         assert!(first.exit_status().success(), "{}", first.seen);
     }
 
+    /// M6: bob re-ran `beam init`. alice's send cannot find bob's old key,
+    /// and says so with an SSH-style warning and the way to re-pair. Nothing
+    /// follows the new key by itself (rule 3, S-8).
+    #[test]
+    fn a_receiver_that_re_ran_init_gets_a_re_pair_warning_not_a_transfer() {
+        let server = server();
+        let demo = setup(10_000, &server.url);
+        beam(&demo.bob, &["init", "--force"]);
+        let mut listener = listen(&demo);
+        let mut sender = send(&demo, &[]);
+
+        sender.wait_for("beam pair <bob's new Short ID> --name bob");
+        assert!(!sender.exit_status().success());
+        for needle in [
+            "not reachable",
+            "beam init",
+            "WARNING",
+            "impersonating bob",
+            "beam remove bob",
+        ] {
+            assert!(
+                sender.seen.contains(needle),
+                "no {needle:?} in:\n{}",
+                sender.seen
+            );
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(byte) = listener.bytes.try_recv() {
+            listener.seen.push(byte as char);
+        }
+        assert!(!listener.seen.contains("[y/N]"), "{}", listener.seen);
+    }
+
+    /// M6: alice re-ran `beam init`. bob does not know her new key: refused
+    /// with no prompt on bob's screen, and alice is told why, with the
+    /// warning that a changed key is what an impersonator would present.
+    #[test]
+    fn a_sender_that_re_ran_init_is_refused_with_a_re_pair_warning() {
+        let server = server();
+        let demo = setup(10_000, &server.url);
+        beam(&demo.alice, &["init", "--force"]);
+        let mut listener = listen(&demo);
+        let mut sender = send(&demo, &[]);
+
+        sender.wait_for("here:     beam pair <bob's Short ID> --name bob");
+        assert!(!sender.exit_status().success());
+        for needle in [
+            "does not recognise this device's key",
+            "WARNING",
+            "impersonator",
+        ] {
+            assert!(
+                sender.seen.contains(needle),
+                "no {needle:?} in:\n{}",
+                sender.seen
+            );
+        }
+        listener.wait_for("transfer from");
+        assert!(!listener.seen.contains("[y/N]"), "{}", listener.seen);
+    }
+
     /// `listen` offers pairing as well as transfers, and names the new peer
     /// from the joiner's host name. Condition 4: the pairing prompt is its
     /// own thing, and `y` does not confirm it.

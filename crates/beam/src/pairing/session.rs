@@ -115,7 +115,12 @@ pub enum PairError {
     Pairing(#[from] PairingError),
     #[error("that device is already paired as {0:?}; nothing was changed")]
     AlreadyPaired(String),
-    #[error("a peer named {0:?} already exists; choose another name, or `beam remove {0}` first")]
+    #[error(
+        "a peer named {0:?} already exists; choose another name.\n       \
+         WARNING: if you are pairing again because {0} has a new key, remove the old one\n       \
+         first (`beam remove {0}`) — but only after checking the new fingerprint with {0}\n       \
+         in person. Someone who wanted to impersonate {0} would ask you to re-pair too."
+    )]
     NameTaken(String),
     #[error("this is your own Short ID")]
     OwnShortId,

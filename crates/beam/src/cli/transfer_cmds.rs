@@ -278,9 +278,11 @@ impl App {
                     },
                 )?;
             } else {
+                // The name is the receiver's to choose, so it is shown safely.
                 let saved = summary
                     .final_name
-                    .clone()
+                    .as_deref()
+                    .map(crate::untrusted::name)
                     .unwrap_or_else(|| "the peer did not say".to_string());
                 let skipped = if summary.bytes_skipped > 0 {
                     format!(

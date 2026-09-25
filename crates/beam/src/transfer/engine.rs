@@ -13,6 +13,14 @@ use super::state::IllegalTransition;
 /// How long an unanswered request lives before it counts as a Reject (S-5).
 pub const DEFAULT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long either side waits for the peer's next frame once a transfer has
+/// been accepted. A peer that goes quiet — while its connection stays alive —
+/// would otherwise hold the receiver's one transfer slot for ever (ADR-0033).
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the receiver tells the sender it is still verifying.
+pub const DEFAULT_KEEPALIVE_EVERY: Duration = Duration::from_secs(1);
+
 /// How many times one chunk may be re-sent after a hash mismatch.
 pub const DEFAULT_CHUNK_ATTEMPTS: u32 = 3;
 
@@ -24,7 +32,8 @@ pub enum TransferError {
     Rejected(RejectReason),
 
     /// Somebody stopped the transfer deliberately.
-    #[error("the transfer was cancelled: {0}")]
+    /// The reason is the peer's text: shown only through `untrusted`.
+    #[error("the transfer was cancelled: {}", crate::untrusted::text(.0))]
     Cancelled(String),
 
     /// File bytes arrived before this side had sent ACCEPT (S-4).
@@ -46,8 +55,15 @@ pub enum TransferError {
     ReplayedTransferId,
 
     /// The request described a file in a way that does not add up.
-    #[error("the peer sent a malformed request: {0}")]
+    #[error("the peer sent a malformed request: {}", crate::untrusted::text(.0))]
     BadRequest(String),
+
+    /// The peer sent nothing for the stall timeout mid-transfer.
+    #[error("the peer sent nothing for {} s while {waiting_for}; gave up", after.as_secs())]
+    Stalled {
+        after: Duration,
+        waiting_for: &'static str,
+    },
 
     /// A chunk kept failing its hash.
     #[error("chunk {index} failed its hash {attempts} times; giving up")]
@@ -131,6 +147,8 @@ pub enum Progress {
     /// Re-hashing what is already on disk from an earlier session, before
     /// offering any of it to the sender as "already have".
     Rechecking,
+    /// The peer is checking the whole-file hash; sender side only.
+    PeerVerifying { done: u64, total: u64 },
     /// The connection moved to a different path mid-transfer, e.g. from the
     /// relay to a direct path once hole punching succeeded (F-11).
     PathChanged { from: PathKind, to: PathKind },

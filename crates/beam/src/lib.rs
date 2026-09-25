@@ -16,3 +16,4 @@ pub mod rendezvous;
 pub mod transfer;
 pub mod transport;
 pub mod ui;
+pub mod untrusted;

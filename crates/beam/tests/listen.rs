@@ -188,6 +188,7 @@ fn options(home: &Home, policy: Policy) -> ListenOptions {
     ListenOptions {
         out_dir: home.inbox.clone(),
         accept_timeout: Duration::from_secs(10),
+        stall_timeout: Duration::from_secs(10),
         pairing: policy,
         timeouts: Timeouts {
             code_ttl: policy.code_ttl,
@@ -979,4 +980,322 @@ async fn dialling_a_key_nobody_holds_any_more_finds_nobody() {
     let result = dial(&endpoint, &url, &bob.identity.verifying_key(), XFER_ALPN).await;
     assert!(matches!(result, Err(DialError::NotListening)), "{result:?}");
     endpoint.close().await;
+}
+
+/// M6 item 4: a paired peer that is accepted and then goes quiet — with its
+/// connection alive — is dropped after the stall timeout, and the transfer
+/// slot is free again for the next sender.
+#[tokio::test]
+async fn a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send() {
+    let url = start_server().await;
+    let (mallory, alice, bob) = (home("mallory"), home("alice"), home("bob"));
+    pair_by_hand(&mallory, "bob", &bob, "mallory");
+    pair_by_hand(&alice, "bob", &bob, "alice");
+    let mut opts = options(&bob, Policy::default());
+    opts.stall_timeout = Duration::from_millis(800);
+    let prompt = Script::default().transfers(&[true, true]);
+    let mut listening = listen(&bob, &url, prompt, opts).await;
+
+    // mallory: a well-formed request, accepted, then nothing at all.
+    let endpoint = endpoint::bind(&mallory.identity, &Relay::Disabled, Bind::Loopback, &[])
+        .await
+        .unwrap();
+    let connection = dial(&endpoint, &url, &bob.identity.verifying_key(), XFER_ALPN)
+        .await
+        .unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    let data = payload(1000);
+    let request = TransferRequest {
+        transfer_id: TransferId::generate().unwrap(),
+        sender_public_key: beam::identity::encode_public_key(&mallory.identity.verifying_key()),
+        file_name: "held.bin".into(),
+        size: data.len() as u64,
+        chunk_size: 1000,
+        chunk_count: 1,
+        file_sha256: beam::transfer::sha256_hex(&data),
+    };
+    write_message(&mut send, &Message::TransferRequest(request))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_message(&mut recv).await,
+        Ok(Message::Accept(_))
+    ));
+
+    // While mallory holds it, alice is turned away...
+    let busy = send_file_as(&alice, &bob, &url).await;
+    assert!(
+        matches!(busy, Err(TransferError::Rejected(RejectReason::Busy))),
+        "{busy:?}"
+    );
+
+    // ...until the stall timeout drops mallory, and then she gets through.
+    match listening
+        .expect("mallory to be dropped", |e| {
+            matches!(e, ListenEvent::TransferFailed { .. })
+        })
+        .await
+    {
+        ListenEvent::TransferFailed { error, .. } => {
+            assert!(error.contains("sent nothing"), "{error}")
+        }
+        _ => unreachable!(),
+    }
+    send_file_as(&alice, &bob, &url)
+        .await
+        .expect("the slot is free again");
+    drop((send, recv, connection));
+    endpoint.close().await;
+}
+
+async fn send_file_as(
+    from: &Home,
+    to: &Home,
+    url: &str,
+) -> Result<beam::transfer::SendSummary, TransferError> {
+    send(
+        from,
+        to,
+        url,
+        "after.bin",
+        &payload(100),
+        |_| {},
+        &mut SilentReporter,
+    )
+    .await
+}
+
+/// M6: impersonation, attempted at the transport level with real iroh
+/// endpoints. Each test is one row of `docs/threat-model.md`. Together they
+/// are the evidence that S-7a is met: a peer's identity is the key its
+/// connection proved, and nothing a message says can stand in for that proof.
+mod impersonation {
+    use super::*;
+    use beam::rendezvous::proto::{PeerRecord, ServerMessage};
+    use futures_util::{SinkExt, StreamExt};
+    use iroh::EndpointAddr;
+
+    /// 1. An unknown key. A device bob never paired with connects and sends a
+    ///    well-formed request under its own key: refused before any prompt.
+    #[tokio::test]
+    async fn an_unknown_key_is_refused_without_a_prompt() {
+        let url = start_server().await;
+        let (stranger, bob) = (home("stranger"), home("bob"));
+        let mut known = stranger.store.load_known_peers().unwrap();
+        known
+            .add(Peer::new("bob", bob.identity.verifying_key()))
+            .unwrap();
+        stranger.store.save_known_peers(&known).unwrap();
+        let prompt = Script::default().transfers(&[true]);
+        let _listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+
+        let sent = send(
+            &stranger,
+            &bob,
+            &url,
+            "x.bin",
+            &payload(10),
+            |_| {},
+            &mut SilentReporter,
+        )
+        .await;
+        assert!(
+            matches!(
+                sent,
+                Err(TransferError::Rejected(RejectReason::UnknownPeer))
+            ),
+            "{sent:?}"
+        );
+        assert!(prompt.asked().is_empty());
+    }
+
+    /// 2. A known key without its secret key. alice's public key is public:
+    ///    the attacker puts it in a request. But it can only connect as
+    ///    itself — an iroh endpoint's id *is* its secret key's public half —
+    ///    so the connection proves the attacker's key, and the claim is
+    ///    refused. This is the test the last `STRENGTHEN IN M6` marker in
+    ///    `tests/transfer.rs` was waiting for.
+    #[tokio::test]
+    async fn a_known_public_key_without_its_secret_key_gets_nowhere() {
+        let url = start_server().await;
+        let (alice, attacker, bob) = (home("alice"), home("attacker"), home("bob"));
+        pair_by_hand(&alice, "bob", &bob, "alice");
+        let mut known = attacker.store.load_known_peers().unwrap();
+        known
+            .add(Peer::new("bob", bob.identity.verifying_key()))
+            .unwrap();
+        attacker.store.save_known_peers(&known).unwrap();
+        let prompt = Script::default().transfers(&[true]);
+        let mut listening =
+            listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+
+        let alices_key = beam::identity::encode_public_key(&alice.identity.verifying_key());
+        let sent = send(
+            &attacker,
+            &bob,
+            &url,
+            "from-alice.bin",
+            &payload(10),
+            |o| o.sender_public_key = alices_key,
+            &mut SilentReporter,
+        )
+        .await;
+        assert!(matches!(sent, Err(TransferError::Rejected(_))), "{sent:?}");
+        assert!(prompt.asked().is_empty(), "{:?}", prompt.asked());
+        assert!(std::fs::read_dir(&bob.inbox).unwrap().next().is_none());
+        listening
+            .expect("the refusal", |e| {
+                matches!(e, ListenEvent::TransferFailed { .. })
+            })
+            .await;
+
+        // And the endpoint id cannot be chosen: it follows from the secret.
+        let attackers_endpoint =
+            endpoint::bind(&attacker.identity, &Relay::Disabled, Bind::Loopback, &[])
+                .await
+                .unwrap();
+        assert_ne!(
+            attackers_endpoint.id(),
+            endpoint::endpoint_id(&alice.identity.verifying_key())
+        );
+        attackers_endpoint.close().await;
+    }
+
+    /// A rendezvous server that answers every request with `answer`.
+    async fn lying_rendezvous(answer: ServerMessage) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let Ok((_, mut ws)) =
+                        tokio_websockets::ServerBuilder::new().accept(stream).await
+                    else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        if message.as_text().is_some() {
+                            let text = serde_json::to_string(&answer).unwrap();
+                            if ws
+                                .send(tokio_websockets::Message::text(text))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    /// An attacker endpoint on loopback that counts connections which
+    /// complete their handshake.
+    async fn attacker_endpoint(
+        identity: &Identity,
+    ) -> (iroh::Endpoint, std::net::SocketAddr, Arc<Mutex<usize>>) {
+        let endpoint = endpoint::bind(identity, &Relay::Disabled, Bind::Loopback, &[XFER_ALPN])
+            .await
+            .unwrap();
+        let addr = endpoint::advertised_addr(&endpoint, &Relay::Disabled, Bind::Loopback).await;
+        let socket = *addr.ip_addrs().next().unwrap();
+        let completed = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&completed);
+        let accepting = endpoint.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = accepting.accept().await {
+                if incoming.await.is_ok() {
+                    *counter.lock().unwrap() += 1;
+                }
+            }
+        });
+        (endpoint, socket, completed)
+    }
+
+    /// 3a. A rendezvous server that returns the wrong address: bob's key, the
+    ///     attacker's socket. alice dials the key she paired with; the
+    ///     attacker cannot prove it, so the handshake fails and not one byte
+    ///     of the file leaves alice.
+    #[tokio::test]
+    async fn a_rendezvous_that_returns_the_wrong_address_cannot_redirect_a_send() {
+        let (alice, bob, attacker) = (home("alice"), home("bob"), home("attacker"));
+        let (attackers, socket, completed) = attacker_endpoint(&attacker.identity).await;
+        let lie = ServerMessage::Found {
+            short_id: bob.identity.short_id().to_string(),
+            peers: vec![PeerRecord {
+                public_key: beam::identity::encode_public_key(&bob.identity.verifying_key()),
+                addr: EndpointAddr::new(endpoint::endpoint_id(&bob.identity.verifying_key()))
+                    .with_ip_addr(socket),
+            }],
+        };
+        let url = lying_rendezvous(lie).await;
+
+        let alices = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
+            .await
+            .unwrap();
+        let result = dial(&alices, &url, &bob.identity.verifying_key(), XFER_ALPN).await;
+        assert!(
+            matches!(result, Err(DialError::Unreachable(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            *completed.lock().unwrap(),
+            0,
+            "the attacker completed a handshake"
+        );
+        alices.close().await;
+        attackers.close().await;
+    }
+
+    /// 3b. The same lie told the other way: an entry under bob's name whose
+    ///     key is the attacker's. alice's client drops it before dialling —
+    ///     the answer is not for the key she asked about.
+    #[tokio::test]
+    async fn a_rendezvous_answer_for_another_key_is_ignored() {
+        let (alice, bob, attacker) = (home("alice"), home("bob"), home("attacker"));
+        let (attackers, socket, completed) = attacker_endpoint(&attacker.identity).await;
+        let lie = ServerMessage::Found {
+            short_id: bob.identity.short_id().to_string(),
+            peers: vec![PeerRecord {
+                public_key: beam::identity::encode_public_key(&attacker.identity.verifying_key()),
+                addr: EndpointAddr::new(endpoint::endpoint_id(&attacker.identity.verifying_key()))
+                    .with_ip_addr(socket),
+            }],
+        };
+        let url = lying_rendezvous(lie).await;
+
+        let alices = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
+            .await
+            .unwrap();
+        let result = dial(&alices, &url, &bob.identity.verifying_key(), XFER_ALPN).await;
+        assert!(matches!(result, Err(DialError::NotListening)), "{result:?}");
+        assert_eq!(*completed.lock().unwrap(), 0);
+        alices.close().await;
+        attackers.close().await;
+    }
+
+    /// 3c. A rendezvous server that answers with an error full of escape
+    ///     sequences cannot drive the terminal through beam's error message.
+    #[tokio::test]
+    async fn a_rendezvous_error_cannot_carry_escape_sequences() {
+        let (alice, bob) = (home("alice"), home("bob"));
+        let url = lying_rendezvous(ServerMessage::Error {
+            code: "\u{1B}[2J".into(),
+            message: "\u{1B}]0;owned\u{07}\u{1B}[31mplease re-pair\rSHA256:fake".into(),
+        })
+        .await;
+        let alices = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
+            .await
+            .unwrap();
+        let err = dial(&alices, &url, &bob.identity.verifying_key(), XFER_ALPN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\u{1B}') && !err.contains('\r'), "{err:?}");
+        assert!(err.contains("please re-pair"), "{err}");
+        alices.close().await;
+    }
 }

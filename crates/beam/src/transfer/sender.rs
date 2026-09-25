@@ -14,7 +14,8 @@ use crate::transport::{PathKind, Route, RouteTracker, fixed_route};
 use super::bitmap::ChunkBitmap;
 use super::chunk::{ChunkPlan, hash_stream, sha256_hex};
 use super::engine::{
-    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, Progress, Reporter, TransferError,
+    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, DEFAULT_STALL_TIMEOUT, Progress, Reporter,
+    TransferError,
 };
 use super::frame::{MAX_CHUNK_DATA, read_message, write_message};
 use super::message::{
@@ -36,6 +37,10 @@ pub struct SendOptions {
     pub chunk_size: u32,
     /// How many times to re-send a chunk that failed its hash.
     pub max_chunk_attempts: u32,
+    /// How long to wait for the receiver's next frame once accepted. The
+    /// receiver sends keep-alives while it verifies, so a large file does not
+    /// trip this (ADR-0033).
+    pub stall_timeout: Duration,
     /// How the peers are connected, for the progress line. It can change
     /// during the transfer; see [`Route`].
     pub route: Route,
@@ -50,6 +55,7 @@ impl SendOptions {
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             chunk_size: CHUNK_SIZE,
             max_chunk_attempts: DEFAULT_CHUNK_ATTEMPTS,
+            stall_timeout: DEFAULT_STALL_TIMEOUT,
             route: fixed_route(PathKind::Direct),
         }
     }
@@ -135,6 +141,7 @@ where
             index,
             &bytes,
             options.max_chunk_attempts,
+            options.stall_timeout,
         )
         .await?;
         sent += bytes.len() as u64;
@@ -161,8 +168,27 @@ where
     reporter.report(Progress::Verifying);
 
     // The receiver verifies the whole-file hash and answers with the name it
-    // saved the file under.
-    let final_name = match read_message(stream).await? {
+    // saved the file under. On a large file that takes a while, so it sends
+    // VERIFYING frames meanwhile; each one resets the stall timeout.
+    let final_name = loop {
+        let message = tokio::time::timeout(options.stall_timeout, read_message(stream))
+            .await
+            .map_err(|_| TransferError::Stalled {
+                after: options.stall_timeout,
+                waiting_for: "waiting for the file to be verified",
+            })??;
+        match message {
+            Message::Verifying(progress) => {
+                reporter.report(Progress::PeerVerifying {
+                    done: progress.done,
+                    total: progress.total,
+                });
+                continue;
+            }
+            other => break other,
+        }
+    };
+    let final_name = match final_name {
         Message::Complete(complete) => complete.final_name,
         Message::Cancel(cancel) => {
             machine.apply(Event::Cancel)?;
@@ -261,6 +287,7 @@ async fn send_chunk<S>(
     index: u32,
     bytes: &[u8],
     max_attempts: u32,
+    stall_timeout: Duration,
 ) -> Result<(), TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -311,7 +338,13 @@ where
             .await?;
         }
 
-        match read_message(stream).await? {
+        let answer = tokio::time::timeout(stall_timeout, read_message(stream))
+            .await
+            .map_err(|_| TransferError::Stalled {
+                after: stall_timeout,
+                waiting_for: "waiting for a chunk to be acknowledged",
+            })??;
+        match answer {
             Message::ChunkAck(ack) if ack.index == index => return Ok(()),
             Message::ChunkNak(nak) if nak.index == index => {
                 if attempt == max_attempts {

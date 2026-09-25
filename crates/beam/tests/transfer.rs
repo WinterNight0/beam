@@ -538,11 +538,12 @@ mod accept_rules {
 
     /// S-7: a sender that is not in `known_peers` is refused without a prompt.
     ///
-    /// STRENGTHEN IN M6: this proves only that an *unrecognised key* is turned
-    /// away. It does not prove that a sender presenting a recognised key holds
-    /// the matching private key — in M2 that is claimed, not proven. When
-    /// transfers move onto iroh (M5), this test gains a sibling that presents a
-    /// known peer's public key without its private key and expects a refusal.
+    /// This proves that an *unrecognised key* is turned away, over an
+    /// in-memory pipe where the key is only claimed. Its sibling — a known
+    /// peer's public key presented without the matching private key, which
+    /// must also be refused — needs a transport that proves keys, so it runs
+    /// over iroh: `tests/listen.rs::impersonation::
+    /// a_known_public_key_without_its_secret_key_gets_nowhere`.
     #[tokio::test]
     async fn s7_an_unknown_sender_is_refused_without_a_prompt() {
         let stranger = Identity::generate("stranger").expect("generate");

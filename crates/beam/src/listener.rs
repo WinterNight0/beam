@@ -52,6 +52,9 @@ pub struct ListenOptions {
     pub out_dir: PathBuf,
     /// How long a transfer's Accept prompt waits (S-5).
     pub accept_timeout: Duration,
+    /// How long an accepted transfer may go without a frame before it is
+    /// dropped and the transfer slot freed (ADR-0033).
+    pub stall_timeout: Duration,
     /// How the pairing code renews itself.
     pub pairing: Policy,
     /// Pairing message and decision timeouts.
@@ -428,7 +431,7 @@ where
         return;
     }
 
-    let Ok(_permit) = Arc::clone(&shared.transfer_slot).try_acquire_owned() else {
+    let Ok(permit) = Arc::clone(&shared.transfer_slot).try_acquire_owned() else {
         shared.tell(ListenEvent::TransferTurnedAway { peer });
         if let Ok((send, recv)) = connection.accept_bi().await {
             let _ = turn_away(tokio::io::join(recv, send), RejectReason::Busy, timeout).await;
@@ -450,6 +453,7 @@ where
 
     let mut options = ReceiveOptions::new(&shared.options.out_dir, shared.store.tmp_path());
     options.accept_timeout = timeout;
+    options.stall_timeout = shared.options.stall_timeout;
     options.route = watch_route(&connection);
     options.proven_sender = Some(peer_key);
 
@@ -467,6 +471,9 @@ where
         .await
     };
     drop(reporter);
+    // The transfer is over, whatever the peer does next: free the slot now,
+    // not after lingering for its close below.
+    drop(permit);
 
     match result {
         Ok(summary) => shared.tell(ListenEvent::Received(summary)),

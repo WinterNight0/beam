@@ -346,6 +346,14 @@ impl PartialStore {
         &self.root
     }
 
+    /// Whether a partial matching `key` already exists. Nothing is created.
+    pub fn has(&self, key: &PartialKey) -> Result<bool, PartialError> {
+        if !self.root.exists() {
+            return Ok(false);
+        }
+        Ok(self.find(key)?.is_some())
+    }
+
     /// Finds the partial matching `key`, or starts one, and locks it.
     pub async fn open(
         &self,

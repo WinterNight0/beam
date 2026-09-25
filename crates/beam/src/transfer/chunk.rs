@@ -34,9 +34,21 @@ impl ChunkPlan {
     /// `chunk_size` imply; a mismatch means the request is malformed, or the
     /// peer is trying to make the receiver allocate for chunks that will never
     /// arrive.
+    ///
+    /// The chunk size is capped at [`MAX_CHUNK_SIZE`](super::message::MAX_CHUNK_SIZE):
+    /// the receiver holds one chunk in memory while it checks the hash, so an
+    /// uncapped size would let a paired peer make it allocate 4 GiB. And the
+    /// number of chunks must fit the `u32` index, or it would silently wrap.
     pub fn try_new(size: u64, chunk_size: u32, chunk_count: u32) -> Result<Self, PlanError> {
         if chunk_size == 0 {
             return Err(PlanError::ZeroChunkSize);
+        }
+        if chunk_size > super::message::MAX_CHUNK_SIZE {
+            return Err(PlanError::ChunkTooLarge(chunk_size));
+        }
+        // Computed in u64, so a count that would wrap a u32 is caught too.
+        if size.div_ceil(u64::from(chunk_size)) > u64::from(super::message::MAX_CHUNK_COUNT) {
+            return Err(PlanError::TooManyChunks);
         }
         let plan = Self::new(size, chunk_size);
         if plan.chunk_count() != chunk_count {
@@ -82,6 +94,13 @@ pub enum PlanError {
     ZeroChunkSize,
     #[error("peer declared {declared} chunks, but the size implies {implied}")]
     CountMismatch { declared: u32, implied: u32 },
+    #[error("chunk size {0} is over the limit of {limit}", limit = super::message::MAX_CHUNK_SIZE)]
+    ChunkTooLarge(u32),
+    #[error(
+        "the size implies more than {limit} chunks",
+        limit = super::message::MAX_CHUNK_COUNT
+    )]
+    TooManyChunks,
 }
 
 /// SHA-256 of a buffer, as lowercase hex.
@@ -177,6 +196,59 @@ mod tests {
         assert_eq!(plan.chunk_count(), 3);
         assert_eq!(plan.len_of(0), 4 * 1024 * 1024);
         assert_eq!(plan.len_of(2), 9_000_000 - 2 * 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_chunk_size_over_the_cap_is_refused() {
+        use super::super::message::MAX_CHUNK_SIZE;
+        assert!(ChunkPlan::try_new(MAX_CHUNK_SIZE as u64, MAX_CHUNK_SIZE, 1).is_ok());
+        assert!(matches!(
+            ChunkPlan::try_new(u64::from(MAX_CHUNK_SIZE) + 1, MAX_CHUNK_SIZE + 1, 1),
+            Err(PlanError::ChunkTooLarge(_))
+        ));
+        assert!(matches!(
+            ChunkPlan::try_new(u64::from(u32::MAX), u32::MAX, 1),
+            Err(PlanError::ChunkTooLarge(_))
+        ));
+    }
+
+    /// Without the check, `u64::MAX` bytes in 1-byte chunks would wrap the
+    /// `u32` chunk count to a small number a peer could simply declare.
+    #[test]
+    fn a_chunk_count_that_would_wrap_is_refused() {
+        let wrapped = (u64::MAX.div_ceil(1)) as u32;
+        assert!(matches!(
+            ChunkPlan::try_new(u64::MAX, 1, wrapped),
+            Err(PlanError::TooManyChunks)
+        ));
+        let just_over = u64::from(u32::MAX) + 1;
+        assert!(matches!(
+            ChunkPlan::try_new(just_over, 1, 0),
+            Err(PlanError::TooManyChunks)
+        ));
+    }
+
+    /// A tiny chunk size would otherwise let a modest file describe a
+    /// billion chunks, and the receiver keeps state per chunk.
+    #[test]
+    fn the_chunk_count_is_capped() {
+        use super::super::message::MAX_CHUNK_COUNT;
+        let at = u64::from(MAX_CHUNK_COUNT);
+        assert!(ChunkPlan::try_new(at, 1, MAX_CHUNK_COUNT).is_ok());
+        assert!(matches!(
+            ChunkPlan::try_new(at + 1, 1, MAX_CHUNK_COUNT + 1),
+            Err(PlanError::TooManyChunks)
+        ));
+        // 1 GiB in one-byte chunks.
+        assert!(matches!(
+            ChunkPlan::try_new(1 << 30, 1, 1 << 30),
+            Err(PlanError::TooManyChunks)
+        ));
+        // The default chunk size reaches 16 TiB.
+        let tib16 = u64::from(MAX_CHUNK_COUNT) * u64::from(super::super::message::CHUNK_SIZE);
+        assert!(
+            ChunkPlan::try_new(tib16, super::super::message::CHUNK_SIZE, MAX_CHUNK_COUNT).is_ok()
+        );
     }
 
     #[test]

@@ -28,14 +28,23 @@ const FORBIDDEN: [char; 6] = ['<', '>', '"', '|', '?', '*'];
 pub enum NameError {
     #[error("the peer sent an empty file name")]
     Empty,
-    #[error("the peer sent {0:?}, which does not name a file")]
+    #[error("the peer sent \"{}\", which does not name a file", crate::untrusted::name(.0))]
     NotAName(String),
     #[error("the peer sent a file name containing a control character")]
     ControlCharacter,
     #[error("the peer sent a file name containing {0:?}")]
     ForbiddenCharacter(char),
-    #[error("the peer sent {0:?}, which is a reserved device name on Windows")]
+    #[error(
+        "the peer sent \"{}\", which is a reserved device name on Windows",
+        crate::untrusted::name(.0)
+    )]
     Reserved(String),
+    #[error(
+        "the peer sent a file name containing a text-direction control (U+{:04X}), \
+         which can disguise its real extension",
+        *.0 as u32
+    )]
+    BidiControl(char),
     #[error("the peer sent a file name ending in a dot or a space")]
     TrailingDotOrSpace,
     #[error("the peer sent a file name of {0} bytes, the limit is {MAX_NAME_BYTES}")]
@@ -53,6 +62,13 @@ pub fn sanitize_file_name(raw: &str) -> Result<String, NameError> {
     }
     if raw.chars().any(|c| c.is_control()) {
         return Err(NameError::ControlCharacter);
+    }
+    // A right-to-left override makes `invoice\u{202E}fdp.exe` display as
+    // `invoiceexe.pdf` — in the prompt and later in a file manager. Refused,
+    // not rewritten (ADR-0034). Zero-width characters are allowed: they are
+    // ordinary in Thai text and inside emoji, and the prompt shows them.
+    if let Some(c) = raw.chars().find(|c| crate::untrusted::is_bidi_control(*c)) {
+        return Err(NameError::BidiControl(c));
     }
 
     // Both separators, whatever platform we are on: a name from a Windows peer
@@ -136,6 +152,53 @@ pub fn reserve_destination(dir: &Path, name: &str) -> std::io::Result<(File, Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M6 answer 1: a Thai name, vowels and tone marks and all, is kept
+    /// exactly as sent.
+    #[test]
+    fn a_thai_name_is_kept_unchanged() {
+        let thai = "รายงานประจำปี_ฉบับที่๒_ผู้อำนวยการ.pdf";
+        assert_eq!(sanitize_file_name(thai).unwrap(), thai);
+    }
+
+    /// M6 answer 1: ZWJ inside an emoji, and ZWSP from Thai text copied off
+    /// the web, are allowed in names.
+    #[test]
+    fn zero_width_characters_are_allowed_in_names() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} holiday.jpg";
+        assert_eq!(sanitize_file_name(family).unwrap(), family);
+        let zwsp = "ข่าว\u{200B}ดี.txt";
+        assert_eq!(sanitize_file_name(zwsp).unwrap(), zwsp);
+        assert!(sanitize_file_name("a\u{200E}b.txt").is_ok());
+    }
+
+    /// M6 answer 1: a name with a bidi override or isolate is refused.
+    #[test]
+    fn bidi_overrides_and_isolates_are_refused() {
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}',
+        ] {
+            let name = format!("invoice{c}fdp.exe");
+            assert_eq!(
+                sanitize_file_name(&name),
+                Err(NameError::BidiControl(c)),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        let shown = NameError::BidiControl('\u{202E}').to_string();
+        assert!(
+            shown.contains("U+202E") && !shown.contains('\u{202E}'),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn errors_quoting_a_name_do_not_carry_escapes() {
+        let err = NameError::NotAName("..\u{1B}[2J".into()).to_string();
+        assert!(!err.contains('\u{1B}'), "{err}");
+    }
 
     #[test]
     fn ordinary_names_pass_through() {

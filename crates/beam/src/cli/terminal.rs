@@ -102,6 +102,9 @@ pub struct TerminalReporter {
     interactive: bool,
     last_drawn: Option<Instant>,
     line_open: bool,
+    /// Under `listen`, whole lines go through the desk, so they cannot land
+    /// in the middle of an open question (M6 item 5).
+    desk: Option<super::desk::PromptDesk>,
 }
 
 /// How often the line is redrawn at most.
@@ -117,6 +120,15 @@ impl TerminalReporter {
             interactive: std::io::stdout().is_terminal(),
             last_drawn: None,
             line_open: false,
+            desk: None,
+        }
+    }
+
+    /// A reporter whose whole lines go through `desk`.
+    pub fn with_desk(desk: super::desk::PromptDesk) -> Self {
+        Self {
+            desk: Some(desk),
+            ..Self::new()
         }
     }
 
@@ -169,6 +181,10 @@ impl TerminalReporter {
 
     fn line(&mut self, text: &str) {
         self.finish();
+        if let Some(desk) = &self.desk {
+            desk.notice(text);
+            return;
+        }
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{text}");
         let _ = out.flush();
@@ -217,6 +233,15 @@ impl Reporter for TerminalReporter {
             Progress::Rechecking => {
                 self.finish();
                 self.line("Checking what is already here...");
+            }
+            Progress::PeerVerifying { done, total } => {
+                let text = format!(
+                    "The peer is verifying the file: {} of {} ({}%)",
+                    ui::format_bytes(done),
+                    ui::format_bytes(total),
+                    ui::percent(done, total)
+                );
+                self.draw(&text, done >= total);
             }
             Progress::PathChanged { from, to } => {
                 self.finish();

@@ -31,13 +31,21 @@ pub enum RendezvousError {
          Is beam-server running? The address is `rendezvous` in config.toml"
     )]
     Unreachable { url: String, message: String },
-    #[error("the rendezvous server refused the request ({code}): {message}")]
+    /// Both strings are the server's: shown only through `untrusted`.
+    #[error(
+        "the rendezvous server refused the request ({}): {}",
+        crate::untrusted::text(code),
+        crate::untrusted::text(message)
+    )]
     Refused { code: String, message: String },
     #[error("the rendezvous server did not answer in time")]
     Timeout,
     #[error("the rendezvous server closed the connection")]
     Closed,
-    #[error("the rendezvous server sent something unexpected: {0}")]
+    #[error(
+        "the rendezvous server sent something unexpected: {}",
+        crate::untrusted::text(.0)
+    )]
     Protocol(String),
 }
 

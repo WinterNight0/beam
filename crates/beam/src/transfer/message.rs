@@ -207,6 +207,27 @@ pub struct Complete {
     pub final_name: Option<String>,
 }
 
+/// The largest chunk a request may propose. The receiver holds one chunk in
+/// memory while it verifies it, so this bounds what a peer can make it
+/// allocate. Four times the default.
+pub const MAX_CHUNK_SIZE: u32 = 16 * 1024 * 1024;
+
+/// The most chunks a request may describe. The receiver keeps a bit and a
+/// hash per chunk on disk, so this bounds that state — about 700 KB of bitmap
+/// at the limit — however small a chunk size a peer proposes. With the
+/// default 4 MiB chunks it allows files up to 16 TiB.
+pub const MAX_CHUNK_COUNT: u32 = 1 << 22;
+
+/// The receiver is checking the whole file's hash. Sent about once a second
+/// while it does, so that a large file's verification is not mistaken for a
+/// stalled peer (ADR-0033).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyProgress {
+    pub done: u64,
+    pub total: u64,
+}
+
 /// Either side abandons the transfer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +252,7 @@ pub enum Message {
     ChunkNak(ChunkNak),
     Complete(Complete),
     Cancel(Cancel),
+    Verifying(VerifyProgress),
 }
 
 impl Message {
@@ -246,6 +268,7 @@ impl Message {
             Self::ChunkNak(_) => "CHUNK_NAK",
             Self::Complete(_) => "COMPLETE",
             Self::Cancel(_) => "CANCEL",
+            Self::Verifying(_) => "VERIFYING",
         }
     }
 

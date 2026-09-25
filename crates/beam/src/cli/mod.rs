@@ -284,7 +284,13 @@ where
     match result {
         Ok(()) => EXIT_OK,
         Err(err) => {
-            let _ = writeln!(io.err, "beam: {err}");
+            // Errors can quote what a peer or a server sent; the last line of
+            // defence before the terminal (ADR-0034).
+            let _ = writeln!(
+                io.err,
+                "beam: {}",
+                crate::untrusted::lines(&err.to_string())
+            );
             match err {
                 CommandError::NotImplemented { .. } => EXIT_NOT_IMPLEMENTED,
                 _ => EXIT_ERROR,

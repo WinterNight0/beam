@@ -167,7 +167,10 @@ pub enum PairingError {
          connection; someone may be interfering"
     )]
     KeyMismatch,
-    #[error("the other device was looking for Short ID {requested}, not this one")]
+    #[error(
+        "the other device was looking for Short ID {}, not this one",
+        crate::untrusted::text(requested)
+    )]
     WrongShortId { requested: String },
     #[error("the other device speaks pairing protocol version {0}; this beam speaks {VERSION}")]
     UnsupportedVersion(u8),
@@ -179,9 +182,12 @@ pub enum PairingError {
     Timeout,
     #[error("the other device closed the connection before pairing finished")]
     Closed,
-    #[error("the other device is not accepting pairing right now: {0}")]
+    #[error(
+        "the other device is not accepting pairing right now: {}",
+        crate::untrusted::text(.0)
+    )]
     Unavailable(String),
-    #[error("the other device sent something unexpected: {0}")]
+    #[error("the other device sent something unexpected: {}", crate::untrusted::text(.0))]
     Protocol(String),
     #[error("pairing failed: {0}")]
     Io(#[from] std::io::Error),

@@ -16,6 +16,7 @@
 //!   is `[y/N]`. Pairing is permanent, so it has its own banner and needs
 //!   `yes` typed in full; `y` does not pair.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::pairing::{ConfirmRequest, Role};
 use crate::transfer::PromptRequest;
-use crate::ui;
+use crate::{ui, untrusted};
 
 /// Set while a question is on screen, so a progress line does not redraw over
 /// it. Read by `terminal::TerminalReporter`.
@@ -49,7 +50,8 @@ impl Question {
         match self {
             Self::Transfer(r) => format!(
                 "A file from {} ({}) was refused: it waited too long behind another question.",
-                r.peer_name, r.file_name
+                untrusted::name(&r.peer_name),
+                untrusted::name(&r.file_name)
             ),
             Self::Pairing(r) => format!(
                 "A pairing request from {} was refused: it waited too long behind another question.",
@@ -81,9 +83,10 @@ impl Question {
                     Some(_) => writeln!(out, "Incoming file (resuming)")?,
                     None => writeln!(out, "Incoming file")?,
                 }
-                ui::field(out, "From", &request.peer_name)?;
+                ui::field(out, "From", &untrusted::name(&request.peer_name))?;
                 ui::field(out, "Fingerprint", &request.fingerprint)?;
-                ui::field(out, "File", &request.file_name)?;
+                // Cut in the middle if long, so the extension stays in view.
+                ui::field(out, "File", &untrusted::name(&request.file_name))?;
                 ui::field(out, "Size", &ui::format_bytes(request.size))?;
                 if let Some(resume) = &request.resume {
                     let mut already = format!(
@@ -103,6 +106,8 @@ impl Question {
                 }
             }
             Self::Pairing(request) => {
+                // Sanitised once, used everywhere it appears below.
+                let name = untrusted::name(&request.name);
                 let rule = "=".repeat(64);
                 writeln!(out)?;
                 writeln!(out, "{rule}")?;
@@ -117,19 +122,17 @@ impl Question {
                         writeln!(out, "The device you looked up knows the code you typed.")?
                     }
                 }
-                ui::field(out, "Save as", &request.name)?;
+                ui::field(out, "Save as", &name)?;
                 ui::field(out, "Their key", &request.peer_fingerprint.to_string())?;
                 ui::field(out, "Your key", &request.own_fingerprint.to_string())?;
                 writeln!(out)?;
                 writeln!(
                     out,
-                    "Once paired, {} can send you files (each one still needs your Accept)",
-                    request.name
+                    "Once paired, {name} can send you files (each one still needs your Accept)"
                 )?;
                 writeln!(
                     out,
-                    "until you run `beam remove {}`. Check that the other screen shows",
-                    request.name
+                    "until you run `beam remove {name}`. Check that the other screen shows"
                 )?;
                 writeln!(out, "the same two fingerprints, the other way round.")?;
                 write!(out, "Type \"yes\" to pair, anything else to refuse{left}: ")
@@ -155,19 +158,28 @@ struct Job {
     reply: Sender<bool>,
 }
 
-/// Hands questions to the desk thread. Cheap to clone; every clone feeds the
-/// same queue.
+/// What the desk thread is handed: a question to ask, or a line to show.
+enum Msg {
+    Ask(Job),
+    Notice(String),
+}
+
+/// How often an open question checks for notices to show.
+const POLL: Duration = Duration::from_millis(50);
+
+/// Hands questions and notices to the desk thread. Cheap to clone; every
+/// clone feeds the same queue.
 #[derive(Clone)]
 pub struct PromptDesk {
-    jobs: Sender<Job>,
+    queue: Sender<Msg>,
 }
 
 impl PromptDesk {
     /// Starts a desk reading from `lines` and drawing on `out`.
     pub fn start(lines: impl Lines, out: impl Write + Send + 'static) -> Self {
-        let (jobs, queue) = channel();
-        std::thread::spawn(move || serve(queue, lines, out));
-        Self { jobs }
+        let (queue, incoming) = channel();
+        std::thread::spawn(move || serve(incoming, lines, out));
+        Self { queue }
     }
 
     /// A desk on the real keyboard and stdout.
@@ -185,43 +197,101 @@ impl PromptDesk {
             full: timeout,
             reply,
         };
-        if self.jobs.send(job).is_err() {
+        if self.queue.send(Msg::Ask(job)).is_err() {
             return false;
         }
         answer.recv_timeout(timeout + REPLY_GRACE).unwrap_or(false)
     }
+
+    /// Shows one or more lines of information. With no question open they are
+    /// printed at once. With a question open they are printed below it and
+    /// the question is drawn again, with the time it has left, so it is never
+    /// left scrolled away half-hidden (M6 item 5).
+    pub fn notice(&self, text: impl Into<String>) {
+        let _ = self.queue.send(Msg::Notice(text.into()));
+    }
 }
 
-/// The desk thread: takes one question at a time until every desk handle is
-/// gone.
-fn serve(queue: Receiver<Job>, mut lines: impl Lines, mut out: impl Write) {
-    for job in queue {
+/// The desk thread: one question at a time, notices in between or on top,
+/// until every desk handle is gone.
+fn serve(incoming: Receiver<Msg>, mut lines: impl Lines, mut out: impl Write) {
+    let mut waiting: VecDeque<Job> = VecDeque::new();
+    loop {
+        let job = match waiting.pop_front() {
+            Some(job) => job,
+            None => match incoming.recv() {
+                Ok(Msg::Ask(job)) => job,
+                Ok(Msg::Notice(text)) => {
+                    let _ = writeln!(out, "{text}");
+                    let _ = out.flush();
+                    continue;
+                }
+                Err(_) => return,
+            },
+        };
+        ask_one(job, &incoming, &mut waiting, &mut lines, &mut out);
+    }
+}
+
+/// Puts one question on screen and waits for its answer, showing notices as
+/// they come and queueing any question that arrives meanwhile.
+fn ask_one(
+    job: Job,
+    incoming: &Receiver<Msg>,
+    waiting: &mut VecDeque<Job>,
+    lines: &mut impl Lines,
+    out: &mut impl Write,
+) {
+    let now = Instant::now();
+    if now >= job.deadline {
+        let _ = writeln!(out, "\n{}", job.question.expired_note());
+        let _ = out.flush();
+        let _ = job.reply.send(false);
+        return;
+    }
+    // Only mention the time if the question lost some of it in the queue.
+    let remaining = job.deadline - now;
+    let left = (job.full.saturating_sub(remaining) > Duration::from_secs(1)).then_some(remaining);
+
+    lines.discard_pending();
+    PROMPT_OPEN.store(true, Ordering::SeqCst);
+    let _ = job.question.render(out, left);
+    let _ = out.flush();
+
+    let answer = loop {
         let now = Instant::now();
         if now >= job.deadline {
-            let _ = writeln!(out, "\n{}", job.question.expired_note());
+            break None;
+        }
+        let slice = (job.deadline - now).min(POLL);
+        if let Some(line) = lines.next_line(slice) {
+            break Some(line);
+        }
+        // Between slices: anything to show, or to queue?
+        let mut redraw = false;
+        while let Ok(msg) = incoming.try_recv() {
+            match msg {
+                Msg::Notice(text) => {
+                    let _ = writeln!(out, "\n{text}");
+                    redraw = true;
+                }
+                Msg::Ask(other) => waiting.push_back(other),
+            }
+        }
+        if redraw {
+            let left = job.deadline.saturating_duration_since(Instant::now());
+            let _ = job.question.render(out, Some(left));
             let _ = out.flush();
-            let _ = job.reply.send(false);
-            continue;
         }
-        let remaining = job.deadline - now;
-        // Only mention the time if the question lost some of it in the queue.
-        let left =
-            (job.full.saturating_sub(remaining) > Duration::from_secs(1)).then_some(remaining);
-
-        lines.discard_pending();
-        PROMPT_OPEN.store(true, Ordering::SeqCst);
-        let _ = job.question.render(&mut out, left);
-        let _ = out.flush();
-        let answer = lines.next_line(remaining);
-        if answer.is_none() {
-            let _ = writeln!(out);
-        }
-        PROMPT_OPEN.store(false, Ordering::SeqCst);
-        let _ = out.flush();
-
-        let yes = answer.is_some_and(|a| job.question.is_yes(&a));
-        let _ = job.reply.send(yes);
+    };
+    if answer.is_none() {
+        let _ = writeln!(out);
     }
+    PROMPT_OPEN.store(false, Ordering::SeqCst);
+    let _ = out.flush();
+
+    let yes = answer.is_some_and(|a| job.question.is_yes(&a));
+    let _ = job.reply.send(yes);
 }
 
 /// Answers transfer prompts through the desk.
@@ -452,6 +522,69 @@ mod tests {
 
         typed.send("y".into()).unwrap();
         assert!(file.join().unwrap());
+    }
+
+    /// M6 item 5: a notice printed while a question is open is followed by
+    /// the question again, with the time it has left, and the answer still
+    /// counts.
+    #[test]
+    fn a_notice_during_a_question_redraws_the_question() {
+        let (desk, typed, screen) = desk();
+        let answer = ask_later(&desk, pairing("carol"), LONG);
+        screen.wait_for("Type \"yes\" to pair", PATIENCE);
+
+        desk.notice("New pairing code: 123 456 (the last one expired)");
+        screen.wait_for("New pairing code", PATIENCE);
+        // The question is drawn again after the notice.
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let text = screen.text();
+            let after = text.split("New pairing code").nth(1).unwrap_or("");
+            if after.contains("PAIRING REQUEST") && after.contains("s left): ") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "not redrawn:\n{text}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(screen.text().matches("PAIRING REQUEST").count(), 2);
+
+        typed.send("yes".into()).unwrap();
+        assert!(
+            answer.join().unwrap(),
+            "the answer after a redraw still counts"
+        );
+    }
+
+    #[test]
+    fn a_notice_with_no_question_open_is_printed_at_once() {
+        let (desk, _typed, screen) = desk();
+        desk.notice("Registered with the rendezvous server again.");
+        screen.wait_for("Registered with the rendezvous server again.", PATIENCE);
+        assert!(!screen.text().contains("Accept"));
+    }
+
+    /// A question arriving while another is open still waits its turn when
+    /// notices are flowing too.
+    #[test]
+    fn notices_do_not_let_a_queued_question_jump_in() {
+        let (desk, typed, screen) = desk();
+        let first = ask_later(&desk, transfer("alice", "a.txt"), LONG);
+        screen.wait_for("Accept? [y/N]: ", PATIENCE);
+        let second = ask_later(&desk, pairing("carol"), LONG);
+        std::thread::sleep(Duration::from_millis(200));
+        desk.notice("something happened");
+        screen.wait_for("something happened", PATIENCE);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !screen.text().contains("PAIRING REQUEST"),
+            "{}",
+            screen.text()
+        );
+        typed.send("y".into()).unwrap();
+        assert!(first.join().unwrap());
+        screen.wait_for("PAIRING REQUEST", PATIENCE);
+        typed.send("yes".into()).unwrap();
+        assert!(second.join().unwrap());
     }
 
     /// A question keeps its own deadline while it waits. One whose time runs

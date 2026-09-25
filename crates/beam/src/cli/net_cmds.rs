@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use super::desk::{DeskPrompt, PromptDesk};
 use super::terminal::Keyboard;
-use super::transfer_cmds::{ReceiveJson, SendJson, reporter_for};
+use super::terminal::TerminalReporter;
+use super::transfer_cmds::{EitherReporter, ReceiveJson, SendJson, reporter_for};
 use super::{App, CommandError, Io};
 use crate::config::Config;
 use crate::identity::{Fingerprint, encode_public_key};
@@ -21,7 +22,7 @@ use crate::transfer::{
 };
 use crate::transport::dial::{DialError, dial, send_on};
 use crate::transport::endpoint::{self, Bind, XFER_ALPN};
-use crate::ui;
+use crate::{ui, untrusted};
 
 impl App {
     fn network(&self, loopback: bool) -> Result<Network, CommandError> {
@@ -64,10 +65,11 @@ impl App {
         }
 
         let desk = PromptDesk::terminal(Keyboard::start());
-        let prompt = DeskPrompt::new(desk, DEFAULT_ACCEPT_TIMEOUT);
+        let prompt = DeskPrompt::new(desk.clone(), DEFAULT_ACCEPT_TIMEOUT);
         let options = ListenOptions {
             out_dir: out_dir.clone(),
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
+            stall_timeout: crate::transfer::engine::DEFAULT_STALL_TIMEOUT,
             pairing: Policy::default(),
             timeouts: Timeouts::default(),
         };
@@ -76,6 +78,7 @@ impl App {
             json,
             out_dir: out_dir.display().to_string(),
             store: self.store.clone(),
+            desk: desk.clone(),
         };
 
         let runtime = self.runtime()?;
@@ -85,7 +88,13 @@ impl App {
             network,
             options,
             prompt,
-            move || reporter_for(json),
+            move || {
+                if json {
+                    reporter_for(true)
+                } else {
+                    EitherReporter::Terminal(TerminalReporter::with_desk(desk.clone()))
+                }
+            },
             move |event| screen.show(event),
         ));
         runtime.shutdown_timeout(Duration::from_secs(1));
@@ -163,9 +172,11 @@ impl App {
                     },
                 )?;
             } else {
+                // The name is the receiver's to choose, so it is shown safely.
                 let saved = summary
                     .final_name
-                    .clone()
+                    .as_deref()
+                    .map(crate::untrusted::name)
                     .unwrap_or_else(|| "the peer did not say".to_string());
                 let skipped = if summary.bytes_skipped > 0 {
                     format!(
@@ -199,9 +210,13 @@ fn unreachable_message(
     CommandError::Message(match error {
         DialError::NotListening => format!(
             "{peer} ({fingerprint}) is not reachable.\n       \
-             Either it is not running `beam listen`, or it ran `beam init` again and\n       \
-             has a new key. In that case you must re-pair: `beam remove {peer}`, then\n       \
-             `beam pair <its Short ID> --name {peer}`."
+             Either {peer} is not running `beam listen`, or {peer}'s key has changed\n       \
+             because it ran `beam init` again. beam never follows a key change by itself.\n\n       \
+             WARNING: if you did not expect {peer} to have a new key, someone could be\n       \
+             impersonating {peer}. Check the new fingerprint with {peer} in person before\n       \
+             you re-pair:\n           \
+             beam remove {peer}\n           \
+             beam pair <{peer}'s new Short ID> --name {peer}"
         ),
         DialError::Unreachable(why) => {
             format!("{peer} ({fingerprint}) is listening but could not be reached: {why}")
@@ -218,8 +233,12 @@ fn refused_message(peer: &str, error: TransferError) -> CommandError {
         }
         TransferError::Rejected(RejectReason::UnknownPeer) => CommandError::Message(format!(
             "{peer} does not recognise this device's key.\n       \
-             If you ran `beam init` again since pairing, you must re-pair: ask {peer} to\n       \
-             run `beam remove` for this device, then pair again with `beam pair`."
+             Either {peer} removed this device, or this device's key changed since pairing\n       \
+             because `beam init` was run again here.\n\n       \
+             WARNING: a changed key is exactly what an impersonator would present, so {peer}\n       \
+             must not simply accept it. To re-pair, compare fingerprints in person:\n           \
+             on {peer}:  beam remove <this device>, then beam listen\n           \
+             here:     beam pair <{peer}'s Short ID> --name {peer}"
         )),
         TransferError::Rejected(RejectReason::Declined) => {
             CommandError::Message(format!("{peer} declined the transfer"))
@@ -237,15 +256,24 @@ struct Screen {
     json: bool,
     out_dir: String,
     store: crate::identity::Store,
+    /// Everything `listen` prints goes through the desk, so a notice never
+    /// lands in the middle of an open question without the question being
+    /// drawn again (M6 item 5).
+    desk: PromptDesk,
 }
 
 impl Screen {
     fn show(&self, event: ListenEvent) {
-        let mut out = std::io::stdout().lock();
-        let mut err = std::io::stderr().lock();
-        let _ = self.write(event, &mut out, &mut err);
-        let _ = out.flush();
-        let _ = err.flush();
+        // Warnings and information share the one screen the desk manages.
+        let mut text = Vec::new();
+        let mut warnings = Vec::new();
+        let _ = self.write(event, &mut text, &mut warnings);
+        text.extend_from_slice(&warnings);
+        let text = String::from_utf8_lossy(&text);
+        let text = text.trim_end_matches('\n');
+        if !text.is_empty() {
+            self.desk.notice(text);
+        }
     }
 
     /// The name a fingerprint is paired under, if any.
@@ -340,6 +368,7 @@ impl Screen {
                 peer.short()
             ),
             ListenEvent::Paired { name, fingerprint } => {
+                let name = untrusted::name(&name);
                 writeln!(out, "Paired with {name} ({fingerprint}).")?;
                 writeln!(
                     out,
@@ -348,8 +377,9 @@ impl Screen {
             }
             ListenEvent::PairingFailed { peer, error } => writeln!(
                 out,
-                "Not paired with {}: {error}. Nothing was saved.",
-                peer.short()
+                "Not paired with {}: {}. Nothing was saved.",
+                peer.short(),
+                untrusted::text(&error)
             ),
             ListenEvent::TransferTurnedAway { peer } => writeln!(
                 out,
@@ -380,16 +410,17 @@ impl Screen {
                     out,
                     "Received {} from {} ({}), saved as {}{}",
                     ui::format_bytes(summary.bytes),
-                    summary.peer_name,
+                    untrusted::name(&summary.peer_name),
                     summary.fingerprint,
-                    summary.final_name,
+                    untrusted::name(&summary.final_name),
                     how
                 )
             }
             ListenEvent::TransferFailed { peer, error } => writeln!(
                 err,
-                "beam: transfer from {} failed: {error}",
-                self.who(&peer)
+                "beam: transfer from {} failed: {}",
+                self.who(&peer),
+                untrusted::text(&error)
             ),
         }
     }
