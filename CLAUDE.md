@@ -10,6 +10,7 @@ other; file data must not be stored on or normally routed through the server.
 beam init                      # generate device keypair (once per machine)
 beam listen                    # wait for transfers; shows short ID + pairing code
 beam pair <ID> --name alice    # first-time pairing using ID + pairing code
+beam pair --wait --name bob    # M4: the waiting side of pairing (merges into listen in M5)
 beam send alice project.zip    # send a file to a paired peer
 beam peers                     # list paired peers + fingerprints
 beam rename alice ali
@@ -37,7 +38,7 @@ beam newcode                   # regenerate pairing code
 
 ## Technology
 
-- Language: **Rust** (edition 2024, MSRV 1.88). The project was specified in Go and
+- Language: **Rust** (edition 2024, MSRV 1.91). The project was specified in Go and
   M0/M1 were first built that way; it moved to Rust at the team's request. See
   ADR-0010 in `docs/decisions.md`. The Go implementation is preserved in commit
   `a1ae4ec`.
@@ -126,8 +127,12 @@ own workspace crates only if compile times demand it.
   Short ID and a pairing code; `beam pair` uses `spake2` to exchange and confirm public
   keys. Relay URL is configurable (n0's relay for development). **Do not use n0's DNS
   discovery** — the address comes from our own server. See `docs/n0-data.md`.
+  In M4 the receiver waits with `beam pair --wait`; M5 merges it into `listen`
+  (ADR-0028). Pairing codes are single use; registrations are signed.
+  ADR-0026..0029.
 - **M5** Use the iroh transport in real `send`/`listen`, keeping the same transfer
   engine. Show `[Direct P2P]` or `[Relay]` in the progress line. Absorbs the old M7.
+  `listen` takes over waiting for pairing, and `beam newcode` is implemented.
 - **M6** Replaces Noise KK. Write `docs/threat-model.md`. Add security tests proving
   impersonation fails at the transport level: an unknown key, a known key without its
   secret key, a rendezvous server returning a wrong address, and a peer that re-ran

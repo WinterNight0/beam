@@ -14,7 +14,7 @@ when that pin moves.
 | Service | iroh's default | **What beam does** |
 |---|---|---|
 | Discovery (pkarr/DNS) | publishes your endpoint id and relay URL to `dns.iroh.link`, republished every 5 minutes | **not used at all.** beam's own rendezvous server maps a Short ID to an address (M4) |
-| Relay | falls back through n0's relays, including one in Asia-Pacific | **used by default during development**, configurable, replaced by a self-hosted `iroh-relay` later |
+| Relay | falls back through n0's relays, including one in Asia-Pacific | **one relay, n0's Asia-Pacific one, by default during development**; set by `relay` in `~/.beam/config.toml`, or `"none"`; replaced by a self-hosted `iroh-relay` later |
 | File contents | never sent to either | never sent to either |
 
 Nothing beam does sends a file, a file name, a peer nickname, or a private key
@@ -51,6 +51,9 @@ to an iroh endpoint address, so the lookup that discovery would do is done by a
 server the project controls, holding the same information for as long as a peer
 is actually listening.
 
+`tests/no_n0_discovery.rs` enforces this: it fails if any beam source file
+uses `presets::N0`, a pkarr or DNS address lookup, or n0's default relay map.
+
 In code, the difference is which preset the endpoint is built with:
 
 ```rust
@@ -85,7 +88,14 @@ connection is still encrypted.
 
 ### Choosing a different relay, or none
 
-Relay selection is configuration, not code:
+Relay selection is configuration, not code. In `~/.beam/config.toml`:
+
+```toml
+relay = "https://relay.example.org"   # your own iroh-relay
+relay = "none"                        # direct connections only
+```
+
+which beam turns into one of iroh's relay modes:
 
 | `RelayMode` | Effect |
 |---|---|
@@ -106,15 +116,15 @@ be self-hosted. Putting one in or near Thailand is on the roadmap after M5.
   a `SecretKey` in memory to terminate TLS; it is never transmitted.
 - **File contents and file names.** Only to the peer, inside the encrypted
   connection.
-- **`known_peers`.** Local only. The rendezvous server in M4 learns which Short
-  ID is asking for which Short ID — that is what a rendezvous server is for —
-  but never who you have paired with.
-- **Pairing codes and the PAKE exchange.** M4's pairing proves both sides knew
-  the code without sending it.
+- **`known_peers`.** Local only. The rendezvous server learns, while a device
+  is waiting to pair, its Short ID, public key and IP addresses, and the IP of
+  whoever looks it up — that is what a rendezvous server is for — but never who
+  you have paired with. It keeps that in memory only and logs nothing
+  (ADR-0027, S-22).
+- **Pairing codes and the PAKE exchange.** Pairing proves both sides knew the
+  code without sending it; the code never reaches the rendezvous server.
 
 ## How to check, rather than trust this page
-
-Once M4 lands:
 
 ```bash
 beam whoami --json          # the endpoint id beam would use

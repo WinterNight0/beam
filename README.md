@@ -2,19 +2,20 @@
 
 Identity-based peer-to-peer file transfer for the terminal.
 
-beam sends a file straight from one computer to another. A small signaling
-server only helps two peers find each other — it never stores your files. Every
+beam sends a file straight from one computer to another. A small rendezvous
+server only helps two devices find each other — it never sees your files. Every
 incoming transfer has to be accepted by hand, and only peers you have paired
 with can ask.
 
-> **Status: milestone M3.** Identity, file transfer and resume work over a TCP
-> address you give by hand. Pairing (`pair`, `newcode`) is stubbed and exits
-> with code 2. There is no encryption yet and the sender's identity is only
-> claimed, not proven — see [What this does not protect you from](#what-this-does-not-protect-you-from).
+> **Status: milestone M4.** Pairing works: a rendezvous server, SPAKE2 over an
+> iroh connection, and a fingerprint confirmation on both devices. File
+> transfer and resume still run over a TCP address you give by hand, without
+> encryption, until M5 moves them onto iroh — see
+> [What this does not protect you from](#what-this-does-not-protect-you-from).
 
 ## Build
 
-Requires Rust 1.88 or newer (edition 2024). On Windows you also need the MSVC
+Requires Rust 1.91 or newer (edition 2024). On Windows you also need the MSVC
 build tools, which `rustup` will point you at.
 
 ```
@@ -43,12 +44,15 @@ beam send alice project.zip    # send a file to a paired peer
 beam transfers                 # list partly received transfers
 beam transfers --clear         # discard them
 
-beam pair <ID> --name alice    # first-time pairing          (M4)
-beam newcode                   # regenerate the pairing code (M4)
+beam pair --wait --name alice  # wait to be paired: shows Short ID + code
+beam pair <ID> --name bob      # pair with a waiting device, typing its code
+beam newcode                   # regenerate the pairing code (M5)
+
+beam-server                    # the rendezvous server
 ```
 
-Until M4 brings peer discovery, `listen` and `send` need a TCP address. That is
-scaffolding, so the flag is hidden:
+Until M5 moves transfers onto iroh, `listen` and `send` need a TCP address.
+That is scaffolding, so the flag is hidden:
 
 ```
 beam listen --addr 127.0.0.1:7777 --out ~/Downloads
@@ -60,33 +64,70 @@ beam send alice project.zip --addr 127.0.0.1:7777
 Global flags: `--beam-dir <path>` (default `$BEAM_DIR`, else `~/.beam`) and
 `--json` for machine-readable output.
 
-## Trying it, with two terminals
+Where the rendezvous server and the relay are is set in `~/.beam/config.toml`,
+which is optional:
 
-Both peers can live on one machine. Give each its own `~/.beam` with
-`--beam-dir`, and pair them by hand — `beam pair` arrives in M4.
+```toml
+rendezvous = "ws://127.0.0.1:8787/v1"            # the default: beam-server on this machine
+relay      = "https://aps1-1.relay.n0.iroh.link./"  # the default; or "none"
+```
 
-**Set up, once.** In any terminal:
+beam never uses n0's discovery service; the relay is the only n0 infrastructure
+it touches, and only if you leave the default. See [docs/n0-data.md](docs/n0-data.md).
+
+## Trying it on one machine
+
+Both devices can live on one machine: give each its own beam home with
+`BEAM_DIR`. You need three terminals — the rendezvous server, and one for each
+device.
+
+**Set up, once.**
 
 ```bash
 mkdir -p /tmp/beam-demo/{alice,bob,inbox}
 cd /tmp/beam-demo
-
 BEAM_DIR=$PWD/alice beam init
 BEAM_DIR=$PWD/bob   beam init
-
-# Each side stores the other's public key, which is what `beam pair` will
-# automate in M4.
-alice_key=$(BEAM_DIR=$PWD/alice beam whoami --json | grep -o '"public_key": "[^"]*' | cut -d'"' -f4)
-bob_key=$(BEAM_DIR=$PWD/bob     beam whoami --json | grep -o '"public_key": "[^"]*' | cut -d'"' -f4)
-
-printf '# beam known_peers v1\nalice  ed25519 %s  added=2026-01-01T00:00:00Z\n' "$alice_key" > bob/known_peers
-printf '# beam known_peers v1\nbob    ed25519 %s  added=2026-01-01T00:00:00Z\n' "$bob_key"   > alice/known_peers
-
 head -c 5M /dev/urandom > payload.bin      # something worth sending
 ```
 
+**Terminal 0 — the rendezvous server.** It only introduces the two devices.
+
+```bash
+beam-server              # listens on ws://127.0.0.1:8787/v1, beam's default
+```
+
+**Pair them.** In terminal 1, bob waits; in terminal 2, alice joins with the
+Short ID bob's screen shows:
+
+```bash
+# terminal 1
+cd /tmp/beam-demo && BEAM_DIR=$PWD/bob beam pair --wait --name alice
+# terminal 2
+cd /tmp/beam-demo && BEAM_DIR=$PWD/alice beam pair <bob's Short ID> --name bob
+```
+
+Terminal 1 shows the code; type it into terminal 2 when asked. Both terminals
+then show both fingerprints and ask:
+
+```
+The other device knows the code.
+  Save as       alice
+  Their key     SHA256:390f55e08994ce1e...
+  Your key      SHA256:10a44acf76456739...
+
+Check that the other screen shows the same two fingerprints, the other way round.
+Pair with this device? [y/N]:
+```
+
+Answer `y` in both. `beam peers` on either side now lists the other.
+
+Offline, the default relay cannot be reached and `pair --wait` spends ten
+seconds finding that out before carrying on with direct addresses. To skip it,
+put `relay = "none"` in `alice/config.toml` and `bob/config.toml`.
+
 <details>
-<summary><strong>The same setup in PowerShell</strong></summary>
+<summary><strong>The same in PowerShell</strong></summary>
 
 Every command below was run on Windows PowerShell 5.1.
 
@@ -94,45 +135,47 @@ Every command below was run on Windows PowerShell 5.1.
 $demo = "$env:USERPROFILE\beam-demo"
 New-Item -ItemType Directory -Force -Path "$demo\alice", "$demo\bob", "$demo\inbox" | Out-Null
 Set-Location $demo
-
 $env:BEAM_DIR = "$demo\alice"; beam init
 $env:BEAM_DIR = "$demo\bob";   beam init
-
-# Each side stores the other's public key, which `beam pair` will automate in M4.
-$env:BEAM_DIR = "$demo\alice"; $aliceKey = (beam whoami --json | ConvertFrom-Json).public_key
-$env:BEAM_DIR = "$demo\bob";   $bobKey   = (beam whoami --json | ConvertFrom-Json).public_key
-
-"# beam known_peers v1`nalice  ed25519 $aliceKey  added=2026-01-01T00:00:00Z" |
-    Set-Content "$demo\bob\known_peers" -Encoding utf8
-"# beam known_peers v1`nbob  ed25519 $bobKey  added=2026-01-01T00:00:00Z" |
-    Set-Content "$demo\alice\known_peers" -Encoding utf8
 
 # 5 MiB of something worth sending
 $bytes = New-Object byte[] (5MB)
 (New-Object Random 1).NextBytes($bytes)
 [System.IO.File]::WriteAllBytes("$demo\payload.bin", $bytes)
-
-beam peers        # should list the other side
 ```
 
-`Set-Content -Encoding utf8` writes a byte-order mark on PowerShell 5.1. beam
-ignores a leading BOM in `known_peers` for exactly this reason, so the natural
-command works rather than failing with a baffling parse error on line 1.
+**Terminal 0 — the rendezvous server.**
 
-**Terminal 1 — the receiver.**
+```powershell
+beam-server
+```
+
+**Terminal 1 — bob waits to pair.**
 
 ```powershell
 $demo = "$env:USERPROFILE\beam-demo"
 $env:BEAM_DIR = "$demo\bob"
-beam listen --addr 127.0.0.1:7777 --out "$demo\inbox"
+beam pair --wait --name alice
 ```
 
-**Terminal 2 — the sender.**
+**Terminal 2 — alice joins**, with the Short ID from terminal 1, and types the
+code when asked:
 
 ```powershell
 $demo = "$env:USERPROFILE\beam-demo"
 $env:BEAM_DIR = "$demo\alice"
-beam send bob "$demo\payload.bin" --addr 127.0.0.1:7777
+beam pair <bob's Short ID> --name bob
+```
+
+Answer `y` in both terminals once they show the fingerprints. If you write a
+`config.toml` with PowerShell 5.1's `Set-Content -Encoding utf8`, it gets a
+byte-order mark; beam skips a leading BOM for exactly this reason.
+
+**Then send.** Terminal 1 receives, terminal 2 sends:
+
+```powershell
+beam listen --addr 127.0.0.1:7777 --out "$demo\inbox"     # terminal 1
+beam send bob "$demo\payload.bin" --addr 127.0.0.1:7777   # terminal 2
 ```
 
 Answer the prompt in terminal 1 with `y`, then check the two hashes match:
@@ -145,6 +188,19 @@ Get-FileHash "$demo\inbox\payload.bin" -Algorithm SHA256
 The table of things to try below applies unchanged; only the shell differs.
 
 </details>
+
+**Things worth trying while pairing.**
+
+| Try this | What should happen |
+|---|---|
+| Type a wrong code | Both sides fail, neither is asked `[y/N]`, nothing is saved, and bob's code is used up: `pair --wait` exits and has to be run again |
+| Answer `n` on either side | Both sides fail and nothing is saved on either |
+| Leave `pair --wait` for ten minutes | The code expires and bob stops being findable |
+| Pair again under a name you already use | Refused before anything touches the network |
+| Stop `beam-server`, then run `beam pair` | It says it cannot reach the rendezvous server, and where that address is configured |
+
+**Now send a file.** Transfers still use a TCP address you give by hand until
+M5; pairing is what put each device's key in the other's `known_peers`.
 
 **Terminal 1 — the receiver.**
 
@@ -250,15 +306,18 @@ A few things worth knowing:
 
 ## What this does not protect you from
 
-This is the transfer engine, not the security model. Two things are missing,
-and both arrive later:
+Pairing is done properly: it runs over an iroh connection, where each side
+proves it holds its private key, and SPAKE2 proves the other side knows the
+code. But transfers still run over the M2 development transport, so two things
+are missing until M5:
 
-- **There is no encryption.** Anyone who can see the network path can read the
-  file. WebRTC brings DTLS in M5.
+- **Transfers are not encrypted.** Anyone who can see the network path can read
+  the file. M5 moves transfers onto iroh's QUIC, which is encrypted end to end.
 - **The sender's identity is claimed, not proven.** The receiver checks the
   public key in a request against its own `known_peers`, but nothing checks that
   the sender holds the matching private key. A public key is public: anyone who
-  has seen one can put it in a request. The Noise KK handshake closes this in M6.
+  has seen one can put it in a request. iroh's handshake closes this in M5, and
+  M6 adds the tests that prove it.
 
 So: use `127.0.0.1` for now. `beam listen` warns when you bind anywhere else,
 and that warning is worth reading rather than dismissing. See ADR-0018 and
@@ -280,6 +339,7 @@ Everything lives in `~/.beam/`:
 id_ed25519        private key, PEM-wrapped PKCS#8, mode 0600 — never leaves this device
 id_ed25519.pub    ed25519 <base64 key> <comment>
 known_peers       one peer per line; the trust root for receiving
+config.toml       optional: where the rendezvous server and relay are
 tmp/<id>/         a transfer in progress: state.json, part, hashes, lock
 ```
 
@@ -307,7 +367,7 @@ silently dropped.
 ## Identifiers
 
 **Fingerprint** — `SHA256:` plus the SHA-256 of your public key. This is the
-thing to compare out of band, and what the server routes by.
+thing to compare out of band, and what both screens show when pairing.
 
 **Short ID** — 9 digits derived from the fingerprint, for reading aloud during
 the very first pairing. It is a lookup hint, not a security guarantee: security
@@ -322,6 +382,8 @@ comes from the PAKE during pairing and from the stored public key afterwards.
   without a prompt.
 - If a peer's key changes, beam aborts with a warning and never updates the
   stored key by itself. You re-pair, deliberately.
+- Pairing saves nothing until a person on each device has compared both
+  fingerprints and answered yes. A pairing code works for one attempt.
 
 ## Layout
 
@@ -330,9 +392,14 @@ crates/beam/
   src/main.rs          CLI entry point
   src/cli/             command definitions
   src/identity/        keys, fingerprints, Short IDs, known_peers, store
+  src/pairing/         pairing codes, SPAKE2 + key confirmation, the two roles
+  src/rendezvous/      rendezvous protocol, server and client
+  src/transfer/        protocol, state machine, chunking, resume, integrity
+  src/transport/       iroh endpoint; the M2 TCP stand-in
+  src/config.rs        ~/.beam/config.toml
   src/ui.rs            terminal output helpers
-  tests/cli.rs         command-level tests
-crates/beam-server/    signaling server (M4)
+  tests/               command, integration and two-process tests
+crates/beam-server/    the rendezvous server binary
 docs/                  requirements, design decisions, test plan
 ```
 

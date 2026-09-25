@@ -911,3 +911,308 @@ test could even be run.
 If those tests come back showing frequent connection failures rather than
 merely relayed connections, that is the result that would reopen this ADR.
 Relayed-but-working is expected and is not a reason to revisit.
+
+---
+
+## ADR-0026 — Pairing: SPAKE2, key confirmation over both proved keys, single-use codes
+
+**Status:** accepted (M4)
+
+**Context.** Pairing turns nine digits read aloud (the Short ID) and six digits
+read off a screen (the pairing code) into a public key stored in `known_peers`
+on both devices. A six-digit code is a weak password, and it crosses a network
+that includes a rendezvous server nobody should have to trust (ADR-0027). The
+approval of M4 set five conditions; this ADR is where the first four are met.
+
+### Decision
+
+Pairing runs **over an iroh connection** on ALPN `beam/pair/1`. That matters: by
+the time the first pairing message is read, iroh's TLS handshake has already
+proved that the peer holds the private key for `connection.remote_id()`, which
+is its beam public key (ADR-0025). Pairing's job is the other half — proving
+that the key belongs to the person holding the code.
+
+```text
+joiner (typed the code)                         waiter (shows the code)
+  Start    {version, short_id, public_key, spake_A}  ──►
+                                   ◄──  Reply {public_key, spake_B, confirm_W}
+  Confirm  {confirm_J}                              ──►
+  Decision {accept}                ◄──►              Decision {accept}
+```
+
+1. **SPAKE2** (`spake2::Ed25519Group`, joiner is side A). The password is
+   `beam-pair-v1|<short id>|<code>`, so a code is only good for the Short ID it
+   was shown with. The SPAKE2 identities are the role plus the public key
+   *the transport proved* for each side.
+2. **Key confirmation** — condition 2. Each side sends
+   `HMAC-SHA256(k, "beam-pair-confirm-v1" ‖ role ‖ short_id ‖ joiner_key ‖ waiter_key)`
+   where `k` is the SPAKE2 key. The MAC names the **speaker's role**, so a
+   confirmation cannot be reflected; it covers **both public keys** and the
+   **Short ID**, so it cannot be moved to another key or another Short ID.
+   Verification is constant-time (`Mac::verify_slice`).
+3. **Keys come from the transport, not the messages.** Each message still
+   carries the sender's public key, but it must equal the connection's
+   `remote_id()` or the run ends with `KeyMismatch`. The key that is returned —
+   and saved — is `remote_id()`.
+4. **Two people decide** — condition 4. Only after the peer has proved it knows
+   the code does each side show both fingerprints and ask `[y/N]`. The rules are
+   the Accept rules: no flag, config or trusted-peer bypass; no answer within
+   60 s is a no; typed-ahead input is discarded. Both sides exchange their
+   decisions and **nothing is written unless both said yes**.
+5. **Single use, ten minutes** — condition 1. The waiter's code is spent by
+   the first connection that reaches the protocol, *whatever happens next*: a
+   wrong guess, a dropped connection and a success all use it up. `beam pair
+   --wait` then exits; a new code means running it again. A code also expires
+   ten minutes after it is shown. The waiter removes itself from the rendezvous
+   server the moment an attempt starts.
+
+### Why this is enough, in numbers
+
+SPAKE2 gives an active attacker who does not know the code exactly one guess
+per protocol run and nothing to test offline. With one run per code, a guess
+succeeds with probability 10⁻⁶. Even then the attacker has only reached the
+fingerprint prompt, where a person who compares the two screens says no.
+
+### What the tests show
+
+| Claim | Test |
+|---|---|
+| An attacker relaying between two honest devices with its own key, rewriting every claimed key to match, cannot complete pairing | `pairing::protocol::an_attacker_relaying_with_its_own_key_cannot_complete_pairing` |
+| A claimed key that is not the proved key is refused, on either side | `a_claimed_key_that_differs_from_the_proved_key_is_refused`, `a_reply_claiming_a_different_key_is_refused` |
+| The MAC is bound to role, both keys and Short ID | `confirmations_are_bound_to_the_role`, `confirmations_are_bound_to_both_keys_and_the_short_id` |
+| The key returned is the one proved on the iroh connection | `tests/pairing.rs::pairing_returns_the_key_each_side_proved_on_the_connection` |
+| A wrong code pairs nobody, asks nobody, and burns the code | `a_wrong_code_pairs_nobody_and_uses_the_code_up`, and two real processes in `tests/end_to_end.rs` |
+| Codes expire | `a_code_expires_after_its_ttl`, `an_expired_code_ends_the_wait_and_unregisters` |
+
+The first test was checked by mutation: with the keys removed from the SPAKE2
+identities and the MAC, the relaying attacker succeeds and the test fails.
+
+### The crate: `spake2 =0.5.0-pre.0`, pinned
+
+CLAUDE.md asks for a maintenance check before adopting `spake2`. It is
+RustCrypto's (`RustCrypto/PAKEs`), the same organisation as `sha2` and the
+dalek crates beam already uses. The repository is active — the move to
+curve25519-dalek v5 landed in July 2026 — but releases are rare: 0.4.0 in July
+2023, then **0.5.0-pre.0 in January 2026**.
+
+We use the pre-release, pinned exactly, because it is built on the same
+curve25519-dalek 5, sha2 0.11 and rand_core 0.10 that iroh and beam already
+compile. 0.4.0 would add a second, older copy of that whole stack to the binary.
+The algorithm and its test vectors did not change between the two. `hmac 0.13`
+(RustCrypto) is added for the confirmation. When 0.5.0 is released, the pin moves
+in its own commit.
+
+### Consequences
+
+- The final `Decision` messages cross in flight. If the connection drops after
+  one side has received the other's yes but before its own yes is delivered,
+  one side can save and the other not. The QUIC stream is finished and its
+  acknowledgement awaited before closing, which makes this a narrow race, not a
+  normal outcome; the fix, if it ever matters, is to pair again.
+- A person who learns the code by looking over a shoulder, and connects first,
+  pairs *as themselves*. The fingerprint prompt is the defence, which is why it
+  shows both fingerprints and asks the person to compare them with the other
+  screen.
+
+---
+
+## ADR-0027 — The rendezvous server: signed registrations, and why it need not be trusted
+
+**Status:** accepted (M4)
+
+**Context.** `beam pair <ID>` needs to turn a Short ID into an iroh endpoint
+address. beam does not use n0's DNS discovery (ADR-0025, S-17), so it runs its
+own rendezvous server. The approval's third condition: registrations are signed
+by the device key with a timestamp; the server verifies the signature, rejects
+stale timestamps, and checks that the public key derives the claimed Short ID;
+and this ADR states that Short ID collisions can be ground, and why that is
+harmless.
+
+### Decision
+
+`beam-server` holds an in-memory table **Short ID → [(public key, endpoint
+address)]** and answers two requests, JSON over a WebSocket at `/v1`.
+
+**`register`** carries `body` — the exact JSON text that was signed — and an
+Ed25519 signature over `"beam-rendezvous-register-v1\0" ‖ body`. The body holds
+the Short ID, public key, Unix timestamp and endpoint address. The server
+accepts it only if:
+
+- the signature verifies (`verify_strict`) under the public key in the body;
+- the timestamp is within **±60 s** of the server's clock;
+- the timestamp is **strictly newer** than the last one accepted for that key,
+  so a captured registration cannot be replayed to restore an old address;
+- `SHA-256(public key)` derives the claimed **Short ID**;
+- the address is for **that key's endpoint id**, has at most 16 entries, and
+  contains only IP and relay addresses.
+
+A registration lives **90 s** unless refreshed; the waiter refreshes every 30 s
+and the entry is removed at once when its WebSocket closes. The waiter also
+closes it as soon as a pairing attempt starts.
+
+**`lookup`** returns **every** live entry for the Short ID. The client checks
+each one again — key derives the Short ID, address is that key's endpoint — and
+drops any that fail, whatever the server said.
+
+Nothing is written to disk. The server prints two lines at start-up and never
+logs a request: a log line tying a Short ID to an IP address is exactly the
+record a rendezvous server should not keep.
+
+### Short IDs can be ground — and why that is harmless
+
+A Short ID is `SHA-256(public key)` reduced to nine digits: about **30 bits**
+(10⁹ ≈ 2²⁹·⁹). An attacker who wants a particular Short ID generates Ed25519
+keys until one lands on it: about 10⁹ key generations and hashes — somewhere
+between an hour and a day on one ordinary computer depending on its cores, and
+far less on many. **The signature check does
+not stop this, and is not meant to**; it only makes the attacker's entry carry
+the attacker's own key.
+
+What the attacker then has is a second, correctly signed entry under the
+victim's Short ID. That gains nothing:
+
+1. **The real device is still found.** Lookup returns every entry; a collision
+   cannot hide the waiting device.
+2. **The attacker does not know the code.** The joiner tries each entry in turn.
+   Against the attacker's entry SPAKE2 fails on the key confirmation. That costs
+   the attacker's one online guess (10⁻⁶), and it does **not** use up the real
+   waiter's code, which is only spent by a connection to the real waiter.
+3. **Everything after pairing uses the full key.** The Short ID is never used
+   again once a key is in `known_peers`, so a collision later means nothing.
+4. **A person still confirms a fingerprint** that would not be the one on the
+   other screen.
+
+The Short ID is a routing hint for the first lookup, exactly as CLAUDE.md
+describes it. The security comes from SPAKE2 and from the stored key.
+
+### What a malicious server — or one ground collision — *can* do
+
+It can **deny service**: refuse registrations, return nothing, return entries
+that fail the client's checks, or hand out an address that does not connect.
+Grinding eight colliding keys fills a Short ID's eight slots (a bound that exists
+so one Short ID cannot grow without limit), which blocks the real device from
+registering. That is 8 × 2³⁰ work for a denial of service on one pairing, and it
+is accepted for M4.
+
+It **cannot** make a device pair with a key other than the one the person
+confirmed. iroh dials by endpoint id, so a wrong address fails the TLS handshake
+rather than reaching an impostor; the client re-checks every entry; and SPAKE2
+plus the fingerprint prompt stand behind both.
+
+What the server **learns**, while a device is waiting: its Short ID, public key
+and the IP addresses in its endpoint address; and the IP of whoever looks it up.
+It keeps that in memory for at most 90 seconds after the waiter leaves.
+
+### Transport, and the crate
+
+The server speaks `ws://` and the client also speaks `wss://` (rustls with
+webpki roots). The integrity of what the server says does not depend on TLS —
+registrations are signed and lookups re-checked — but the privacy of *who looks
+up whom* does, so a deployed server should sit behind `wss://`.
+
+The WebSocket crate is `tokio-websockets 0.13`, which iroh's relay client
+already compiles, with the `server` feature added. `futures-util` (sink helpers
+only, also already in iroh's tree) is needed to drive it. Both were approved at
+the start of M4.
+
+The server's code lives in `beam::rendezvous`, and `beam-server` is a wrapper
+around `serve()`, so beam's own tests run a real server in-process.
+
+---
+
+## ADR-0028 — In M4 the waiting side is `beam pair --wait`; M5 merges it into `beam listen`
+
+**Status:** accepted (M4)
+
+**Context.** CLAUDE.md's user experience has `beam listen` show the Short ID and
+pairing code. In M4, though, `listen` still receives transfers over the
+development TCP transport (ADR-0018), while pairing needs an iroh endpoint and
+the rendezvous server. Condition 5 of the M4 approval: say clearly which command
+waits for pairing in M4, and how it becomes part of `listen` in M5.
+
+### Decision
+
+**In M4 the receiver waits with `beam pair --wait --name <name>`.**
+
+```text
+device B:  beam pair --wait --name alice      shows Short ID + code, waits
+device A:  beam pair 123456789 --name bob     looks up, asks for the code
+```
+
+Both ends name the other device up front, and both confirm a fingerprint before
+anything is saved (ADR-0026). `pair --wait` takes one attempt and exits, so the
+code lives exactly as long as the process: running it again is how a new code is
+made. For that reason **`beam newcode` stays a stub until M5**, where there is a
+long-running process for it to act on.
+
+**In M5, `beam listen` becomes the waiting side.** It opens one iroh endpoint
+with two ALPNs, `beam/pair/1` and the transfer protocol's, registers with the
+rendezvous server, and shows the Short ID and a code next to "waiting for
+transfers". A pairing attempt spends the code as it does now; `listen` keeps
+receiving transfers but stops offering pairing until `beam newcode` gives it a
+fresh code. How `newcode` reaches the running `listen` is designed in the M5
+plan. The pairing prompt and the Accept prompt already share one keyboard reader
+(`cli::terminal::Keyboard`), so they cannot steal each other's answers. `beam
+pair --wait` stays, for pairing without also accepting files.
+
+**Hidden `--loopback` flag.** Like `--addr` on `listen`/`send`, `pair` has a
+hidden development flag that advertises only `127.0.0.1`. It exists so the
+end-to-end tests can pair two beam homes on one machine without depending on
+the network; ordinary use never needs it. It is on the `pair` flag allowlist
+test, which also proves there is no flag that answers the `[y/N]`.
+
+### Consequences
+
+In M4 a receiver runs two commands in turn, `pair --wait` and then `listen`.
+That is a milestone seam, not the intended experience, and it closes in M5.
+
+---
+
+## ADR-0029 — `config.toml`, the relay setting, and what M4 added to the build
+
+**Status:** accepted (M4)
+
+**Context.** The rendezvous server and the relay are infrastructure, and they
+change between a laptop demo, a campus deployment and a self-hosted setup. They
+are also the first settings beam has.
+
+### Decision
+
+`~/.beam/config.toml`, optional, two keys:
+
+```toml
+rendezvous = "ws://127.0.0.1:8787/v1"            # the default
+relay      = "https://aps1-1.relay.n0.iroh.link./"  # the default; or "none"
+```
+
+- **TOML, not JSON**, because people edit it by hand (approved in the M4 plan).
+  Unknown keys are an error, so `realy = "none"` is reported rather than
+  silently ignored; a leading byte-order mark is skipped, as for `known_peers`.
+- **The default rendezvous is `beam-server`'s own default address on this
+  machine.** There is no public beam server, and inventing one would be worse
+  than a default that obviously needs changing for two machines.
+- **The relay is one URL, or `none`.** It becomes `RelayMode::custom([url])`:
+  exactly the relay configured, not n0's four-relay default map. `none` gives
+  direct connections only — maximally private, likely to fail behind mobile
+  CGNAT (see `n0-data.md`). The development default is n0's Asia-Pacific relay,
+  to be replaced by a self-hosted `iroh-relay` later (F-14).
+- The endpoint is built from `presets::Minimal`. `tests/no_n0_discovery.rs`
+  fails if the code ever installs a discovery service or n0's default relays
+  (S-17).
+
+### What M4 added to the build
+
+| Crate | Why | Already in iroh's tree? |
+|---|---|---|
+| `iroh =1.2.0` | the transport (ADR-0025) | — |
+| `spake2 =0.5.0-pre.0` | the PAKE (ADR-0026) | no; adds `hkdf` |
+| `hmac 0.13` | key confirmation (ADR-0026) | no |
+| `tokio-websockets 0.13` | rendezvous WebSocket (ADR-0027) | yes |
+| `futures-util 0.3` (`sink` only) | to drive the WebSocket (ADR-0027) | yes |
+| `toml 1.1` (`parse`, `serde`) | this file | shares its parser crates with iroh's `toml_edit` |
+
+Each was approved before it was added. The duplicate crate versions in
+`cargo tree -d` all come from inside iroh's own dependency tree.
+
+**MSRV 1.89 → 1.91.** iroh 1.2.0 requires Rust 1.91. The exact pin makes this a
+hard floor rather than a choice.

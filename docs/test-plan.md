@@ -127,9 +127,9 @@ completed transfer on stdout and a refused one on stderr.
 **What S-7's test does not prove.** It shows that an *unrecognised* key is turned
 away. It does not show that a sender presenting a *recognised* key holds the
 matching private key, because in M2 nothing checks that (ADR-0019, requirement
-S-7a). When the Noise KK handshake lands in M6, this test gains a sibling that
-replays a known peer's public key without its private key and expects a refusal —
-a test that would fail today.
+S-7a). When transfers move onto iroh in M5, the handshake proves the sender's
+key, and M6 adds a sibling test that presents a known peer's public key without
+its private key and expects a refusal — a test that would fail today.
 
 ## Implemented (M3)
 
@@ -197,6 +197,89 @@ than once, and both would have failed in CI eventually.
   prompt returning in nanoseconds sometimes beat it. Those tests now use a
   prompt that takes 300 ms, as a person does.
 
+## Implemented (M4)
+
+Nothing in this section touches the internet. The integration and end-to-end
+tests run a real rendezvous server in-process, pair over real iroh endpoints
+bound to `127.0.0.1`, and set `relay = "none"`, so they pass offline and on CI.
+
+### Unit tests
+
+| Module | What is covered |
+|---|---|
+| `config` | defaults when the file is missing or empty; both keys read; `relay = "none"`; unknown keys, non-WebSocket rendezvous URLs and non-URL relays refused; BOM skipped |
+| `transport::endpoint` | the endpoint id is the beam public key byte for byte; a bound endpoint uses the device key and, on loopback, advertises only loopback |
+| `pairing::code` | six digits, uniform, leading zeros kept; typed with spaces or dashes; malformed codes refused; `Debug` redacted; **taken once**; **expires** after its TTL and stays gone |
+| `pairing::protocol` | the attack tests below, plus declines on either side, an unanswered confirmation, version, oversize, unknown-field and silence handling |
+| `rendezvous::proto` | a signed registration verifies; tampered body, another key's signature, garbage signatures, a signature without the domain label; stale and future timestamps; a Short ID the key does not derive; an address for another endpoint; too many addresses; unknown fields; the client dropping lookup entries that do not check out |
+| `rendezvous::server` | lookup until expiry; refresh extends and updates; **old timestamps cannot be replayed**; **colliding Short IDs return every entry**; a bounded number of entries per Short ID; closing a connection removes its entries |
+
+### The five conditions of the M4 approval
+
+| Condition | Tests |
+|---|---|
+| 1. Codes are single use and expire | `pairing::code::a_code_can_be_taken_once`, `a_code_expires_after_its_ttl`; `tests/pairing.rs::a_wrong_code_pairs_nobody_and_uses_the_code_up` (the right code afterwards finds nobody), `an_expired_code_ends_the_wait_and_unregisters`; `tests/end_to_end.rs::pairing::a_wrong_code_between_two_processes_saves_nothing_on_either_side` |
+| 2. The MAC covers both keys, Short ID and roles; the saved key is `remote_id()`; a substituted key fails | `pairing::protocol::an_attacker_relaying_with_its_own_key_cannot_complete_pairing`, `a_claimed_key_that_differs_from_the_proved_key_is_refused`, `a_reply_claiming_a_different_key_is_refused`, `confirmations_are_bound_to_the_role`, `confirmations_are_bound_to_both_keys_and_the_short_id`, `the_code_is_bound_to_the_short_id`; `tests/pairing.rs::pairing_returns_the_key_each_side_proved_on_the_connection` |
+| 3. Signed, timestamped registrations; derivation checked | `rendezvous::proto` tests above; `tests/pairing.rs::the_server_refuses_registrations_that_do_not_check_out` (a real server, raw requests) |
+| 4. The receiver confirms with `[y/N]`, no bypass | `pairing::protocol::if_the_waiter_declines_neither_side_pairs`, `an_unanswered_confirmation_is_a_no`, `nobody_is_asked_to_confirm_after_a_wrong_code`; `tests/pairing.rs::if_the_waiter_says_no_neither_side_pairs`, `a_device_that_is_already_paired_is_not_offered_again`; `tests/cli.rs::pair_has_no_flag_that_could_stand_in_for_the_confirmation`; `tests/end_to_end.rs::pairing::answering_no_to_pairing_saves_nothing_on_either_side` |
+| 5. Which command waits | `beam pair --wait` (ADR-0028); `tests/end_to_end.rs::pairing::beam_pair_between_two_processes_then_a_transfer` |
+
+Three of these were checked by mutation — the check removed, the test run,
+the check restored: removing both keys from the SPAKE2 identities and the MAC
+lets the relaying attacker pair and fails its test; removing the claimed-key
+check fails both claimed-key tests; removing the server's Short ID derivation
+check fails its test.
+
+### Integration tests — `tests/pairing.rs`
+
+Besides the rows above: an unknown Short ID is reported as "not waiting" with
+the command to run; a server that is down is reported as unreachable, naming
+`beam-server`; a taken name fails before any network traffic; pairing with your
+own Short ID is refused; a registration lasts only as long as its connection.
+
+### End-to-end tests — `tests/end_to_end.rs::pairing`
+
+Two real `beam pair` processes and an in-process server. As with the transfer
+tests, every prompt is waited for on the child's stdout before it is answered:
+the code prompt, then both `[y/N]` prompts, which must each show both
+fingerprints. The successful case then runs `listen` and `send` between the two
+freshly paired homes, so pairing is shown to produce a `known_peers` entry the
+transfer engine accepts.
+
+### S-17 — `tests/no_n0_discovery.rs`
+
+iroh cannot report which address lookup services a bound endpoint has, so the
+test checks the source: no `presets::N0`, pkarr or DNS lookup, `address_lookup`
+call or `RelayMode::Default` anywhere in `beam` or `beam-server`, and every
+`Endpoint::builder` uses `presets::Minimal`.
+
+### Command tests — `tests/cli.rs`
+
+`pair` needs `--name`; needs a Short ID or `--wait` but not both; a malformed
+Short ID, a taken name and a missing identity all fail before the network; a
+broken `config.toml` names the file; `newcode` is still a stub (M5).
+
+### Manual: pairing two real machines
+
+On the same Wi-Fi, with `beam-server` on machine A:
+
+```bash
+# machine A
+beam-server --addr 0.0.0.0:8787
+# machine A and B: point ~/.beam/config.toml at it
+echo 'rendezvous = "ws://<A-LAN-IP>:8787/v1"' > ~/.beam/config.toml
+# machine B
+beam pair --wait --name laptop-a
+# machine A
+beam pair <B's Short ID> --name laptop-b
+```
+
+Check: both screens show the same two fingerprints, the other way round; typing
+a wrong code fails on both sides and `beam pair --wait` has to be run again; an
+unanswered prompt gives up after about a minute; `beam peers` lists the other
+machine on both sides afterwards.
+
+
 ## Manual test steps
 
 Some things cannot honestly be covered by an automated test on one machine.
@@ -253,15 +336,6 @@ question you have not seen is exactly what S-1 forbids.
 
 ## Planned
 
-### M4 — rendezvous server and pairing
-
-Registration and expiry; lookup by Short ID returns an iroh endpoint address;
-server restart; server unreachable; a Short ID that is not registered; a
-successful SPAKE2 pairing writes exactly one `known_peers` entry on each side; a
-wrong pairing code fails on both sides and writes nothing; `newcode` invalidates
-the previous code; the relay URL is read from configuration; and a test that
-beam never installs n0's discovery services (S-17).
-
 ### M5 — the iroh transport
 
 The M2 and M3 transfer tests re-run unchanged over an iroh stream, which is the
@@ -291,6 +365,14 @@ S-7a moves from "outstanding" to "met".
 - The Accept prompt's own rendering is not covered by a test: it writes to
   the real stdout from a blocking thread. What it shows is asserted through
   the engine instead, in `s6_the_prompt_shows_who_what_and_how_big`.
+- Pairing across two real networks, and through a real relay, is a manual
+  step (README); the automated tests pair on loopback with the relay off so
+  that CI never depends on the internet.
+- Short ID collisions are tested at the table level, not by grinding a real
+  colliding key: that would take ~2³⁰ key generations per test run. The part
+  that matters — every entry is returned, and the joiner moves past one that
+  fails the code — is covered by `colliding_short_ids_return_every_entry` and
+  the candidate loop in `pairing::session::join`.
 - `beam listen` blocks until a peer connects, so its success path has no
   *command-level* test; it is covered by `tests/end_to_end.rs`, which runs it as
   a real process, and by the manual walkthrough in `README.md`.

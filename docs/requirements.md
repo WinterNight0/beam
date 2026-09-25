@@ -1,9 +1,9 @@
 # Beam — requirements
 
 Beam is a terminal-only tool that sends a file directly from one computer to
-another. A signaling server helps two peers find each other; file data is never
-stored on the server and is only routed through it when a direct connection is
-impossible (TURN relay, M7).
+another. A rendezvous server helps two devices find each other; file data never
+passes through it. When a direct connection is impossible, the encrypted
+connection is carried by a relay (F-14, M5).
 
 Requirement IDs are stable. Tests reference them.
 
@@ -16,12 +16,12 @@ Requirement IDs are stable. Tests reference them.
 | F-3 | `beam peers` lists paired peers with their fingerprints. | M1 |
 | F-4 | `beam rename <old> <new>` changes a peer's local nickname. | M1 |
 | F-5 | `beam remove <name>` forgets a peer, after confirmation. | M1 |
-| F-6 | `beam listen` waits for incoming transfers and shows the Short ID and pairing code. | M2/M4 |
+| F-6 | `beam listen` waits for incoming transfers. From M5 it also shows the Short ID and pairing code; in M4 that is `beam pair --wait` (ADR-0028). | M2/M5 |
 | F-7 | `beam send <peer> <file>` sends a file to a paired peer. | M2 |
-| F-8 | `beam pair <ID> --name <name>` performs first-time pairing using a Short ID and a pairing code, exchanging and confirming public keys with `spake2`. | M4 |
+| F-8 | `beam pair <ID> --name <name>` performs first-time pairing using a Short ID and a pairing code, exchanging and confirming public keys with `spake2`. The other device waits with `beam pair --wait --name <name>`. | M4 |
 | F-13 | A rendezvous server maps a Short ID to an iroh endpoint address. beam never uses n0's DNS discovery. | M4 |
 | F-14 | The relay URL is configurable; n0's relay is the development default and a self-hosted `iroh-relay` replaces it later. | M4 |
-| F-9 | `beam newcode` regenerates this device's pairing code. | M4 |
+| F-9 | `beam newcode` regenerates this device's pairing code. In M4 a code lives as long as `beam pair --wait`, so running that again is how a new code is made (ADR-0028). | M5 |
 | F-10 | A transfer resumes after an interruption without re-sending verified chunks. Resuming is triggered only by running `beam send` again: there is no automatic reconnection and no `beam resume`. | M3 |
 | F-12 | `beam transfers` lists partially received transfers; `beam transfers --clear` deletes them after confirmation. | M3 |
 | F-11 | The progress line states whether the connection is `[Direct P2P]` or `[Relay]`. | M5 |
@@ -42,10 +42,15 @@ convenience loses.
 | S-7 | The receiver only accepts requests from peers present in its own `known_peers`; unknown senders are rejected without prompting. | M2 |
 | S-7a | The sender's identity is *proven*, not merely claimed. In M2–M4 the receiver checks the public key a sender presents against `known_peers`, but nothing proves the sender holds the matching private key; see ADR-0019. Satisfied in M5 by the transport (ADR-0025) and demonstrated by tests in M6. Tests that turn on the gap are marked `STRENGTHEN IN M6:`. | M5/M6 |
 | S-8 | A changed peer key is a hard abort with an SSH-style warning. A stored key is never updated automatically; the user must re-pair. A peer that re-ran `beam init` therefore fails to connect, with a message that says to re-pair. | M6 |
-| S-9 | Private keys never leave the device and are never sent to the signaling server. | M1 |
+| S-9 | Private keys never leave the device and are never sent to the rendezvous server. | M1 |
 | S-10 | Peer authentication is provided by the transport: iroh's QUIC/TLS proves possession of the Ed25519 private key behind an endpoint id before a connection exists, so a rendezvous server returning a wrong address cannot mount a MITM. | M5 |
 | S-16 | A written threat model (`docs/threat-model.md`) states what an attacker can and cannot do, backed by tests that demonstrate each claim. | M6 |
 | S-17 | beam publishes nothing to third-party infrastructure by default beyond relayed (encrypted) traffic; what would otherwise be published, and how to disable it, is documented in `docs/n0-data.md`. | M4 |
+| S-18 | A pairing code is six digits, **single use** and expires after 10 minutes. The first attempt that uses it spends it, whatever the outcome; a wrong guess never leaves the code usable (ADR-0026). | M4 |
+| S-19 | Pairing key confirmation is an HMAC under the SPAKE2 key over both public keys, the Short ID and the speaker's role. Both keys are the ones the iroh connection proved; a key claimed in a message that differs from the proved one ends the pairing, and the key saved to `known_peers` is the connection's `remote_id()` (ADR-0026). | M4 |
+| S-20 | A rendezvous registration is signed by the device key with a timestamp. The server rejects a bad signature, a timestamp more than 60 s from its clock or not newer than the last for that key, and a key that does not derive the claimed Short ID. Clients re-check every lookup answer (ADR-0027). | M4 |
+| S-21 | Pairing saves nothing until a person on **each** device has seen both fingerprints and answered yes. The same no-bypass rules as Accept apply: no flag or config answers it, no answer within 60 s is a no, and input typed before the question is discarded. | M4 |
+| S-22 | The rendezvous server keeps registrations in memory only and does not log requests. | M4 |
 | S-11 | Transfer IDs are random; replayed or expired IDs are rejected. | M2/M3 |
 | S-14 | A partial transfer is matched by (sender fingerprint, file_sha256, size, chunk_size) and never by a sender-supplied transfer ID, so no peer can attach to another peer's partial. | M3 |
 | S-15 | A have-bitmap from a peer is validated — exact length, no bits past the end — and a bad one aborts the transfer rather than being repaired. | M3 |
@@ -95,13 +100,14 @@ vectors pass in both implementations.
 
 ## 6. Open investigations
 
-Before M4 the team runs SPIKE-001, a timeboxed comparison of `webrtc-rs`,
-`str0m` and `iroh` as the P2P transport, and records the choice as an ADR. The
-result can change how much of M4 there is to build, which is why it happens
-before that milestone rather than before M5. See `spikes.md`.
+SPIKE-001 is closed: the transport is iroh (ADR-0025). What remains unproven is
+the cross-network behaviour — whether hole punching gets through Thai mobile
+CGNAT, how often it falls back to a relay, and how slow that path is. The steps
+are in `spikes/transport.md`, and the result would only reopen the decision if
+connections fail outright rather than merely relay.
 
 ## 7. Out of scope
 
 Folder transfer, transfer history, bandwidth limiting and a `ratatui` TUI are
-stretch goals, attempted only after M7. Multi-file transfers, a web client and
+stretch goals, attempted only after M6. Multi-file transfers, a web client and
 any kind of account system are out of scope entirely.
