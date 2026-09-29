@@ -17,7 +17,7 @@ const SHORT_ID_MODULUS: u64 = 1_000_000_000;
 /// The SHA-256 digest of a raw 32-byte Ed25519 public key.
 ///
 /// This is the canonical, full-strength identifier for a device: users compare
-/// it out of band, and both screens show it when pairing.
+/// it out of band, and it can be compared out of band.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; FINGERPRINT_SIZE]);
 
@@ -96,7 +96,7 @@ impl FromStr for Fingerprint {
 ///
 /// It exists only so a human can read an identifier aloud for the very first
 /// pairing; it is a routing hint, **not** a security guarantee. Security comes
-/// from the PAKE during pairing and from the stored public key afterwards.
+/// from the future authenticated transport.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct ShortId(u32);
 

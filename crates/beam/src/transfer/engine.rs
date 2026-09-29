@@ -149,8 +149,9 @@ pub enum Progress {
     Rechecking,
     /// The peer is checking the whole-file hash; sender side only.
     PeerVerifying { done: u64, total: u64 },
-    /// The connection moved to a different path mid-transfer, e.g. from the
-    /// relay to a direct path once hole punching succeeded (F-11).
+    /// The connection moved to a different transport path mid-transfer.
+    /// Stage 1 uses only [`PathKind::Direct`]; this remains for future
+    /// transport/discovery work.
     PathChanged { from: PathKind, to: PathKind },
 }
 

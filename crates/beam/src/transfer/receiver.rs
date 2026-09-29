@@ -2,7 +2,8 @@
 //!
 //! Four rules shape this file:
 //!
-//! * only peers in `known_peers` get as far as the prompt (S-7);
+//! * Stage 1 may accept a direct peer without prior trust; later identity
+//!   policy can re-enable the known-peer gate without changing the protocol;
 //! * a person answers every prompt, and there is no way to skip it (S-1);
 //! * silence is a Reject (S-5);
 //! * anything carrying file bytes that arrives before ACCEPT ends the transfer
@@ -99,12 +100,14 @@ pub struct ReceiveOptions {
     /// How the peers are connected, for the progress line. It can change
     /// during the transfer; see [`Route`].
     pub route: Route,
-    /// The sender's key **as proved by the transport**, when the transport
-    /// proves one. Over iroh this is the connection's `remote_id()`; the M2
-    /// TCP stand-in proves nothing and leaves it `None`. When it is set, the
-    /// sender is looked up by it, and a request claiming any other key is
-    /// refused. See ADR-0031.
+    /// The sender's key as proved by a future authenticated transport.
+    /// Stage 1 leaves this unset because direct TCP is intentionally a
+    /// transport-only prototype.
     pub proven_sender: Option<ed25519_dalek::VerifyingKey>,
+    /// Stage 1 accepts a direct TCP peer without requiring a pre-existing
+    /// prior trust. The sender's public key is still carried in the request so
+    /// the later trust layer can reuse the same wire format.
+    pub accept_unpaired: bool,
     /// How long an untouched partial survives.
     pub max_partial_age: StdDuration,
 }
@@ -122,6 +125,7 @@ impl ReceiveOptions {
             verify_pause: Duration::ZERO,
             route: fixed_route(PathKind::Direct),
             proven_sender: None,
+            accept_unpaired: false,
             max_partial_age: super::partial::DEFAULT_MAX_AGE,
         }
     }
@@ -252,12 +256,19 @@ where
         ));
     }
 
-    // S-7: a sender this machine has not paired with never reaches the prompt.
-    let Some((peer_name, fingerprint)) = known_sender(known_peers, &request.sender_public_key)
-    else {
-        refuse(&mut writer, request.transfer_id, RejectReason::UnknownPeer).await;
-        machine.apply(Event::Declined)?;
-        return Err(TransferError::Rejected(RejectReason::UnknownPeer));
+    let (peer_name, fingerprint) = if options.accept_unpaired {
+        let fingerprint = decode_public_key(&request.sender_public_key)
+            .map(|key| Fingerprint::of(&key))
+            .map_err(|_| TransferError::BadRequest("sender public key is invalid".into()))?;
+        ("direct peer".to_string(), fingerprint)
+    } else {
+        let Some((peer_name, fingerprint)) = known_sender(known_peers, &request.sender_public_key)
+        else {
+            refuse(&mut writer, request.transfer_id, RejectReason::UnknownPeer).await;
+            machine.apply(Event::Declined)?;
+            return Err(TransferError::Rejected(RejectReason::UnknownPeer));
+        };
+        (peer_name, fingerprint)
     };
 
     // Find or start the partial. Matched on what the sender cannot change
@@ -560,17 +571,7 @@ async fn read_request(
     }
 }
 
-/// Looks the sender up in `known_peers`.
-///
-/// Over iroh — the only transport beam uses for real — the key looked up here
-/// has already been required to equal the key the connection proved
-/// (`ReceiveOptions::proven_sender`), so this is a lookup of a *proven*
-/// identity (S-7a, met in M6; `tests/listen.rs::impersonation`).
-///
-/// Over the hidden, test-only TCP transport (`--addr`) nothing proves the
-/// claim. That is recorded as an accepted risk in `docs/threat-model.md`: the
-/// flag is hidden, prints a warning on any non-loopback address, and exists
-/// so the engine can be tested without iroh. See ADR-0019 and ADR-0031.
+/// Looks the sender up in the optional known-peer trust store.
 fn known_sender(known_peers: &KnownPeers, claimed_key: &str) -> Option<(String, Fingerprint)> {
     let key = decode_public_key(claimed_key).ok()?;
     let peer = known_peers.lookup_key(&key)?;

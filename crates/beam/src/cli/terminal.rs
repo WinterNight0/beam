@@ -1,4 +1,4 @@
-//! The terminal's side of a transfer and of pairing: the keyboard and the
+//! The terminal's side of a transfer : the keyboard and the
 //! progress line. The questions themselves go through `desk`.
 
 use std::io::{IsTerminal, Write};
@@ -14,8 +14,8 @@ use crate::ui;
 /// Lines are read by one long-lived thread and handed over a channel, so an
 /// answer typed after a question has already expired cannot be picked up by
 /// the next question: each question throws away anything typed before it
-/// started. The Accept prompt and the pairing prompts share this, so they
-/// share that rule.
+/// started. The Accept prompt uses this same input discipline so stale input cannot
+/// answer a later question.
 #[derive(Clone)]
 pub struct Keyboard {
     lines: Arc<Mutex<Receiver<String>>>,

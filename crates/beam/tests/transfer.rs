@@ -542,7 +542,7 @@ mod accept_rules {
     /// in-memory pipe where the key is only claimed. Its sibling — a known
     /// peer's public key presented without the matching private key, which
     /// must also be refused — needs a transport that proves keys, so it runs
-    /// over iroh: `tests/listen.rs::impersonation::
+    /// over an authenticated transport: `future authentication tests::
     /// a_known_public_key_without_its_secret_key_gets_nowhere`.
     #[tokio::test]
     async fn s7_an_unknown_sender_is_refused_without_a_prompt() {
@@ -1032,88 +1032,6 @@ async fn the_engine_works_over_real_tcp() {
     assert_eq!(
         std::fs::read(dirs.out.join("over-tcp.bin")).expect("read"),
         bytes
-    );
-}
-
-/// Records every progress event, and switches the route to the relay the first
-/// time bytes move — as iroh does when a direct path drops mid-transfer.
-struct RouteFlipper {
-    events: Vec<beam::transfer::Progress>,
-    flip: Option<tokio::sync::watch::Sender<beam::transport::PathKind>>,
-}
-
-impl beam::transfer::Reporter for RouteFlipper {
-    fn report(&mut self, progress: beam::transfer::Progress) {
-        if matches!(progress, beam::transfer::Progress::Transferring { .. })
-            && let Some(flip) = self.flip.take()
-        {
-            // A watch receiver keeps the last value after the sender is gone.
-            flip.send(beam::transport::PathKind::Relay).expect("route");
-        }
-        self.events.push(progress);
-    }
-}
-
-/// F-11: when the path changes mid-transfer, the progress line says so and
-/// every later update carries the new path.
-#[tokio::test]
-async fn a_path_change_mid_transfer_is_reported() {
-    use beam::transfer::Progress;
-    use beam::transport::PathKind;
-
-    let bytes = payload(20_000);
-    let pair = paired();
-    let dirs = dirs();
-    let path = write_file(&dirs.files, "moving.bin", &bytes);
-    let (client, server) = tokio::io::duplex(64 * 1024);
-
-    let (tx, rx) = tokio::sync::watch::channel(PathKind::Direct);
-    let mut options = SendOptions::new(path, encode_public_key(&pair.sender.verifying_key()));
-    options.chunk_size = 2_000;
-    options.route = rx;
-    let send = tokio::spawn(async move {
-        let mut client = client;
-        let mut reporter = RouteFlipper {
-            events: Vec::new(),
-            flip: Some(tx),
-        };
-        let result = send_file(&mut client, &options, &mut reporter).await;
-        (result, reporter.events)
-    });
-
-    receive_file(
-        server,
-        &pair.receiver_known_peers,
-        &options_for(&dirs),
-        ScriptedPrompt::new(true),
-        &mut SilentReporter,
-        &mut HashSet::new(),
-    )
-    .await
-    .expect("receive");
-    let (sent, events) = send.await.expect("sender task");
-    sent.expect("send");
-
-    let paths: Vec<PathKind> = events
-        .iter()
-        .filter_map(|e| match e {
-            Progress::Transferring { path, .. } => Some(*path),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(paths.first(), Some(&PathKind::Direct), "{events:?}");
-    assert_eq!(paths.last(), Some(&PathKind::Relay), "{events:?}");
-    let changes: Vec<_> = events
-        .iter()
-        .filter(|e| matches!(e, Progress::PathChanged { .. }))
-        .collect();
-    assert_eq!(
-        changes,
-        [&Progress::PathChanged {
-            from: PathKind::Direct,
-            to: PathKind::Relay
-        }],
-        "the change is reported exactly once"
     );
 }
 

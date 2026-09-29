@@ -156,8 +156,7 @@ impl Store {
     /// Writes the keypair.
     ///
     /// Unless `force` is set this refuses to overwrite an existing key, because
-    /// replacing a key silently would invalidate every pairing other peers hold
-    /// for this device.
+    /// replacing a key silently changes this device's identity.
     pub fn save_identity(&self, identity: &Identity, force: bool) -> Result<(), StoreError> {
         if !force && self.has_identity() {
             return Err(StoreError::IdentityExists(self.private_key_path()));

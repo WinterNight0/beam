@@ -1,9 +1,7 @@
 //! The prompt desk: one question on screen at a time.
 //!
-//! `beam listen` can be asked two things at once: a paired peer wants to send
-//! a file while another device is pairing. Two prompts sharing one screen and
-//! one keyboard would be a trap — a `y` meant for one answering the other — so
-//! every question goes through one desk, which shows them one after another.
+//! `beam listen` can be asked two things at once: a known peer wants to send
+//! a file 
 //!
 //! The rules (S-24, ADR-0030):
 //!
@@ -12,9 +10,7 @@
 //!   that has waited out its deadline in the queue is answered *no* without
 //!   ever being shown, and the screen says so.
 //! * **Nothing typed before a question appears can answer it.**
-//! * **The two kinds look different and are answered differently.** A transfer
-//!   is `[y/N]`. Pairing is permanent, so it has its own banner and needs
-//!   `yes` typed in full; `y` does not pair.
+//! * **Transfer questions use `[y/N]`.**
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -22,7 +18,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
-use crate::pairing::{ConfirmRequest, Role};
 use crate::transfer::PromptRequest;
 use crate::{ui, untrusted};
 
@@ -40,8 +35,6 @@ const REPLY_GRACE: Duration = Duration::from_secs(5);
 pub enum Question {
     /// Accept an incoming file? `[y/N]`.
     Transfer(PromptRequest),
-    /// Save this device as a peer? Type `yes`.
-    Pairing(ConfirmRequest),
 }
 
 impl Question {
@@ -53,10 +46,6 @@ impl Question {
                 untrusted::name(&r.peer_name),
                 untrusted::name(&r.file_name)
             ),
-            Self::Pairing(r) => format!(
-                "A pairing request from {} was refused: it waited too long behind another question.",
-                r.peer_fingerprint.short()
-            ),
         }
     }
 
@@ -65,8 +54,6 @@ impl Question {
         let answer = answer.trim().to_ascii_lowercase();
         match self {
             Self::Transfer(_) => answer == "y" || answer == "yes",
-            // Pairing is permanent: `y` is not enough.
-            Self::Pairing(_) => answer == "yes",
         }
     }
 
@@ -105,38 +92,7 @@ impl Question {
                     write!(out, "Accept? [y/N]{left}: ")
                 }
             }
-            Self::Pairing(request) => {
-                // Sanitised once, used everywhere it appears below.
-                let name = untrusted::name(&request.name);
-                let rule = "=".repeat(64);
-                writeln!(out)?;
-                writeln!(out, "{rule}")?;
-                writeln!(out, "  PAIRING REQUEST - this is permanent")?;
-                writeln!(out, "{rule}")?;
-                match request.role {
-                    Role::Waiter => writeln!(
-                        out,
-                        "A device that knows your pairing code wants to pair with you."
-                    )?,
-                    Role::Joiner => {
-                        writeln!(out, "The device you looked up knows the code you typed.")?
-                    }
-                }
-                ui::field(out, "Save as", &name)?;
-                ui::field(out, "Their key", &request.peer_fingerprint.to_string())?;
-                ui::field(out, "Your key", &request.own_fingerprint.to_string())?;
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "Once paired, {name} can send you files (each one still needs your Accept)"
-                )?;
-                writeln!(
-                    out,
-                    "until you run `beam remove {name}`. Check that the other screen shows"
-                )?;
-                writeln!(out, "the same two fingerprints, the other way round.")?;
-                write!(out, "Type \"yes\" to pair, anything else to refuse{left}: ")
-            }
+
         }
     }
 }
@@ -315,14 +271,6 @@ impl crate::transfer::Prompt for DeskPrompt {
     }
 }
 
-impl crate::pairing::Confirm for DeskPrompt {
-    fn confirm(&mut self, request: &ConfirmRequest) -> std::io::Result<bool> {
-        Ok(self
-            .desk
-            .ask(Question::Pairing(request.clone()), self.timeout))
-    }
-}
-
 /// A channel-backed stand-in for the keyboard, and a shared screen, for tests
 /// here and in `tests/`.
 #[doc(hidden)]
@@ -410,219 +358,39 @@ pub mod testing {
 mod tests {
     use super::testing::desk;
     use super::*;
-    use crate::identity::vectors;
 
     fn transfer(peer: &str, file: &str) -> Question {
         Question::Transfer(PromptRequest {
             peer_name: peer.into(),
-            fingerprint: "SHA256:abcd".into(),
+            fingerprint: "unverified key".into(),
             file_name: file.into(),
             size: 1234,
             resume: None,
         })
     }
 
-    fn pairing(name: &str) -> Question {
-        Question::Pairing(ConfirmRequest {
-            role: Role::Waiter,
-            name: name.into(),
-            peer_fingerprint: vectors::identity("alpha").fingerprint(),
-            own_fingerprint: vectors::identity("bravo").fingerprint(),
-        })
-    }
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
-    const LONG: Duration = Duration::from_secs(10);
-    const PATIENCE: Duration = Duration::from_secs(5);
-
-    /// Asks on a background thread, as the engine does.
-    fn ask_later(
-        desk: &PromptDesk,
-        question: Question,
-        timeout: Duration,
-    ) -> std::thread::JoinHandle<bool> {
+    fn ask_later(desk: &PromptDesk, question: Question) -> std::thread::JoinHandle<bool> {
         let desk = desk.clone();
-        std::thread::spawn(move || desk.ask(question, timeout))
+        std::thread::spawn(move || desk.ask(question, TIMEOUT))
     }
 
     #[test]
     fn a_transfer_is_accepted_with_y() {
         let (desk, typed, screen) = desk();
-        let answer = ask_later(&desk, transfer("alice", "a.txt"), LONG);
-        screen.wait_for("Accept? [y/N]: ", PATIENCE);
+        let answer = ask_later(&desk, transfer("direct peer", "a.txt"));
+        screen.wait_for("Accept? [y/N]: ", TIMEOUT);
         typed.send("y".into()).unwrap();
         assert!(answer.join().unwrap());
     }
 
-    /// Condition 4 of the M5 approval.
     #[test]
-    fn y_does_not_confirm_pairing() {
-        for (typed_answer, pairs) in [
-            ("y", false),
-            ("Y", false),
-            ("ye", false),
-            ("yes please", false),
-            ("", false),
-            ("yes", true),
-            ("  YES ", true),
-        ] {
-            let (desk, typed, screen) = desk();
-            let answer = ask_later(&desk, pairing("carol"), LONG);
-            screen.wait_for("Type \"yes\" to pair", PATIENCE);
-            typed.send(typed_answer.into()).unwrap();
-            assert_eq!(answer.join().unwrap(), pairs, "{typed_answer:?}");
-        }
-    }
-
-    /// Condition 4 again: the two prompts cannot be mistaken for each other.
-    #[test]
-    fn the_pairing_prompt_looks_nothing_like_the_accept_prompt() {
-        let mut accept = Vec::new();
-        transfer("alice", "a.txt")
-            .render(&mut accept, None)
-            .unwrap();
-        let mut pair = Vec::new();
-        pairing("carol").render(&mut pair, None).unwrap();
-        let (accept, pair) = (
-            String::from_utf8(accept).unwrap(),
-            String::from_utf8(pair).unwrap(),
-        );
-
-        assert!(pair.contains("PAIRING REQUEST - this is permanent"));
-        assert!(pair.contains("Type \"yes\""));
-        assert!(!pair.contains("[y/N]"));
-        assert!(!pair.contains("Incoming file"));
-        assert!(accept.contains("Incoming file"));
-        assert!(!accept.contains("PAIRING"));
-        assert!(!accept.contains("\"yes\""));
-    }
-
-    /// Condition 2 of the M5 decisions: a pairing request and a transfer
-    /// request at once. Only one is on screen; the other appears after the
-    /// first is answered, and shows how much of its time is left.
-    #[test]
-    fn two_questions_at_once_are_asked_one_after_the_other() {
+    fn a_transfer_question_can_be_declined() {
         let (desk, typed, screen) = desk();
-        let pair = ask_later(&desk, pairing("carol"), LONG);
-        screen.wait_for("PAIRING REQUEST", PATIENCE);
-        let file = ask_later(&desk, transfer("alice", "report.pdf"), LONG);
-
-        // The transfer is queued, not drawn over the pairing question.
-        std::thread::sleep(Duration::from_millis(1500));
-        assert!(
-            !screen.text().contains("Incoming file"),
-            "a second question appeared while the first was open:\n{}",
-            screen.text()
-        );
-
-        typed.send("yes".into()).unwrap();
-        screen.wait_for("Incoming file", PATIENCE);
-        assert!(pair.join().unwrap());
-        // It waited about 1.5 s, so it says how much time it has left.
-        assert!(screen.text().contains("s left): "), "{}", screen.text());
-
-        typed.send("y".into()).unwrap();
-        assert!(file.join().unwrap());
-    }
-
-    /// M6 item 5: a notice printed while a question is open is followed by
-    /// the question again, with the time it has left, and the answer still
-    /// counts.
-    #[test]
-    fn a_notice_during_a_question_redraws_the_question() {
-        let (desk, typed, screen) = desk();
-        let answer = ask_later(&desk, pairing("carol"), LONG);
-        screen.wait_for("Type \"yes\" to pair", PATIENCE);
-
-        desk.notice("New pairing code: 123 456 (the last one expired)");
-        screen.wait_for("New pairing code", PATIENCE);
-        // The question is drawn again after the notice.
-        let deadline = Instant::now() + PATIENCE;
-        loop {
-            let text = screen.text();
-            let after = text.split("New pairing code").nth(1).unwrap_or("");
-            if after.contains("PAIRING REQUEST") && after.contains("s left): ") {
-                break;
-            }
-            assert!(Instant::now() < deadline, "not redrawn:\n{text}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(screen.text().matches("PAIRING REQUEST").count(), 2);
-
-        typed.send("yes".into()).unwrap();
-        assert!(
-            answer.join().unwrap(),
-            "the answer after a redraw still counts"
-        );
-    }
-
-    #[test]
-    fn a_notice_with_no_question_open_is_printed_at_once() {
-        let (desk, _typed, screen) = desk();
-        desk.notice("Registered with the rendezvous server again.");
-        screen.wait_for("Registered with the rendezvous server again.", PATIENCE);
-        assert!(!screen.text().contains("Accept"));
-    }
-
-    /// A question arriving while another is open still waits its turn when
-    /// notices are flowing too.
-    #[test]
-    fn notices_do_not_let_a_queued_question_jump_in() {
-        let (desk, typed, screen) = desk();
-        let first = ask_later(&desk, transfer("alice", "a.txt"), LONG);
-        screen.wait_for("Accept? [y/N]: ", PATIENCE);
-        let second = ask_later(&desk, pairing("carol"), LONG);
-        std::thread::sleep(Duration::from_millis(200));
-        desk.notice("something happened");
-        screen.wait_for("something happened", PATIENCE);
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            !screen.text().contains("PAIRING REQUEST"),
-            "{}",
-            screen.text()
-        );
-        typed.send("y".into()).unwrap();
-        assert!(first.join().unwrap());
-        screen.wait_for("PAIRING REQUEST", PATIENCE);
-        typed.send("yes".into()).unwrap();
-        assert!(second.join().unwrap());
-    }
-
-    /// A question keeps its own deadline while it waits. One whose time runs
-    /// out in the queue is refused unseen, and the screen says so.
-    #[test]
-    fn a_question_that_expires_in_the_queue_is_refused_unseen() {
-        let (desk, _typed, screen) = desk();
-        let first = ask_later(&desk, pairing("carol"), Duration::from_millis(600));
-        screen.wait_for("PAIRING REQUEST", PATIENCE);
-        let second = ask_later(
-            &desk,
-            transfer("alice", "report.pdf"),
-            Duration::from_millis(200),
-        );
-
-        assert!(!first.join().unwrap(), "unanswered is a no");
-        assert!(!second.join().unwrap(), "expired in the queue is a no");
-        let text = screen.text();
-        assert!(!text.contains("Incoming file"), "{text}");
-        assert!(
-            text.contains("A file from alice (report.pdf) was refused"),
-            "{text}"
-        );
-    }
-
-    /// An answer pasted along with the answer to the first question is not
-    /// carried over to the next one.
-    #[test]
-    fn typing_ahead_cannot_answer_the_next_question() {
-        let (desk, typed, screen) = desk();
-        let first = ask_later(&desk, transfer("alice", "a.txt"), LONG);
-        screen.wait_for("Accept? [y/N]: ", PATIENCE);
-        let second = ask_later(&desk, pairing("carol"), Duration::from_millis(1500));
-        // Two lines in one paste: the second is meant to pre-answer the
-        // pairing question that has not been shown yet.
-        typed.send("y\nyes".into()).unwrap();
-
-        assert!(first.join().unwrap());
-        assert!(!second.join().unwrap(), "a typed-ahead yes paired a device");
+        let answer = ask_later(&desk, transfer("direct peer", "a.txt"));
+        screen.wait_for("Accept? [y/N]: ", TIMEOUT);
+        typed.send("n".into()).unwrap();
+        assert!(!answer.join().unwrap());
     }
 }

@@ -91,8 +91,9 @@ impl<'de> Deserialize<'de> for TransferId {
 #[serde(deny_unknown_fields)]
 pub struct TransferRequest {
     pub transfer_id: TransferId,
-    /// The sender's Ed25519 public key, base64. In M2 this is *claimed*, not
-    /// proven; see ADR-0019.
+    /// The sender's Ed25519 public key, base64. Stage 1 carries it as a
+    /// claim; a later authenticated transport can prove it without changing
+    /// the transfer message format.
     pub sender_public_key: String,
     pub file_name: String,
     pub size: u64,

@@ -96,7 +96,7 @@ impl Identity {
         Fingerprint::of(&self.verifying_key())
     }
 
-    /// The 9-digit pairing lookup hint.
+    /// The 9-digit future peer lookup hint.
     pub fn short_id(&self) -> ShortId {
         self.fingerprint().short_id()
     }
