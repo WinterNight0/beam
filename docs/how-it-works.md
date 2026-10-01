@@ -213,7 +213,7 @@ Both sides add a line to `known_peers`. The joiner (Alice) also saves where the
 invite said Bob is:
 
 ```
-bob  ed25519 ZlkPsCvVC8ccXvMeWhtQe8o8VZDVoYtUVrrgg7tI3Mc=  added=2026-10-01T13:50:23Z addrs=192.168.1.20:7820,202.28.63.102:37038
+bob  ed25519 4V1sbBWRwKcMoCdgmMZSy3enESln8Qgij/DzRjafNjs=  added=2026-10-01T13:50:23Z addrs=192.168.1.20:7820,203.0.113.7:41641
 ```
 
 `relay=<url>` is added too, but only if Bob's relay differs from Alice's own.

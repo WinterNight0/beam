@@ -100,7 +100,7 @@ cd /tmp/beam-demo && BEAM_DIR=$PWD/bob beam listen --out $PWD/inbox
 ```
 
 ```
-  Invite        beam1ahbhrwknvsrckecrobv6oheburq4l4hoceutaw2lf36qf3p3nh5ywaifaqfcbjhyd2gai...
+  Invite        beam1ahqv23dmcwi4bjymuatwbgggklfxpjyrfft7ccbcr7ypgrrwt43dwaicatakqaiud2gajsyaoed2fkjcxgtwg
   Pairing code  685 821
   Fingerprint   SHA256:10a44acf76456739...
   Relay         https://aps1-1.relay.n0.iroh.link./
@@ -120,7 +120,7 @@ With `port` fixed (the default), it stays the same each time `listen` starts.
 types the code when asked:
 
 ```bash
-cd /tmp/beam-demo && BEAM_DIR=$PWD/alice beam pair beam1ahbhrwkn... --name bob
+cd /tmp/beam-demo && BEAM_DIR=$PWD/alice beam pair beam1ahqv23dm... --name bob
 ```
 
 Both terminals then show the pairing question. It looks deliberately unlike the

@@ -16,4 +16,13 @@ Thumbs.db
 /spike/*/target/
 /spike/*/*/target/
 
-.github/
+# beam homes created inside the repo while testing (e.g. --beam-dir ./alice).
+# These hold private keys and peer lists; they must never be committed.
+id_ed25519
+id_ed25519.pub
+known_peers
+*.pem
+
+# local secrets
+.env
+.env.*
