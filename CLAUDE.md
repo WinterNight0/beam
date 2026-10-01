@@ -4,10 +4,11 @@ University Software Engineering project. Beam is a terminal-only tool that sends
 directly between two computers (peer-to-peer). File data must not be stored on or normally
 routed through any server.
 
-> **Branch `main-test`: no rendezvous server (ADR-0036).** Peers meet through an *invite*
+> **No rendezvous server (ADR-0036, merged after M6).** Peers meet through an *invite*
 > (key + relay + direct addresses, pasted once) and are found again by key through the
-> relay. The `rendezvous` module and `beam-server` crate are gone. `main` keeps the
-> rendezvous design. Where this file and ADR-0036 disagree on this branch, ADR-0036 wins.
+> relay. The `rendezvous` module and `beam-server` crate are gone. The milestone list
+> below is history: where it mentions the server, ADR-0036 is what holds now. How the
+> whole system works is explained in `docs/how-it-works.md`.
 
 ## Core user experience
 
@@ -60,7 +61,7 @@ beam whoami                    # show own ID + fingerprint
   cannot exist without the peer proving possession of its private key. There is no
   Noise KK layer; see ADR-0025 for what replaced it.
 - Async runtime: `tokio`, introduced at M2 with the transfer engine.
-- Rendezvous server: **none on this branch** (ADR-0036). The invite carries the
+- Rendezvous server: **none** (ADR-0036). The invite carries the
   address for the first meeting; afterwards a peer is dialled by key through its relay
   and at the addresses saved in `known_peers` (`relay=`, `addrs=`). `listen` binds a
   fixed UDP port (`port` in `config.toml`, default 7820) so its invite stays stable.
@@ -114,11 +115,10 @@ crates/beam/
   src/identity/        keygen, fingerprint, short ID, known_peers
   src/pairing/         PAKE pairing flow
   src/transport/       iroh endpoint, connection, relay configuration
-  src/rendezvous/      client for the rendezvous server
+  src/invite.rs        invites, and where a paired peer is found
   src/transfer/        protocol messages, state machine, chunking, resume, integrity
   src/ui.rs            prompts, progress bar
   tests/               command-level and integration tests
-crates/beam-server/    rendezvous server
 docs/                  requirements, diagrams, test plan, design decisions
 ```
 
@@ -138,7 +138,7 @@ own workspace crates only if compile times demand it.
   discovery** — the address comes from our own server. See `docs/n0-data.md`.
   In M4 the receiver waits with `beam pair --wait`; M5 merges it into `listen`
   (ADR-0028). Pairing codes are single use; registrations are signed.
-  ADR-0026..0029.
+  ADR-0026..0029. *(The server was later removed; see ADR-0036 below.)*
 - **M5** Use the iroh transport in real `send`/`listen`, keeping the same transfer
   engine. Show `[Direct P2P]` or `[Relay]` in the progress line. Absorbs the old M7.
   `listen` serves pairing and transfers on one endpoint, one question at a time;
@@ -151,13 +151,19 @@ own workspace crates only if compile times demand it.
   `STRENGTHEN IN M6:` marker and make S-7a pass. Done: also terminal-injection
   defence, limits for a misbehaving paired peer, and redraw-after-notice
   (ADR-0033..0035).
+- **Post-M6 (ADR-0036)** No rendezvous server: `listen` shows an invite, `beam pair
+  <INVITE>` pairs, peers are dialled by key through the relay and saved addresses,
+  `listen` binds a fixed port (7820). Merged 2026-10-02 after a cross-network test.
+- **Next (to be planned before coding):** throughput. Known limits: QUIC stream window
+  1.25 MB (noq default), one 4 MiB chunk in flight at a time, two fsyncs per chunk,
+  n0's public relay being rate-limited.
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.
 
 ## Testing expectations
 
 - Unit tests: chunk splitting, hashing, bitmap, state machine transitions, known_peers
   parsing, fingerprint/short-ID derivation.
-- Integration: client↔client on localhost, client↔server, client↔relay.
+- Integration: client↔client on localhost, client↔relay.
 - Failure tests: connection drop mid-transfer, corrupted chunk, duplicate chunk, peer goes
   offline, server down, disk full, cancel, crash then resume.
 - Security tests: data before Accept, request from unknown peer, changed key, replayed

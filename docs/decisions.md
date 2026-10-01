@@ -916,7 +916,7 @@ Relayed-but-working is expected and is not a reason to revisit.
 
 ## ADR-0026 — Pairing: SPAKE2, key confirmation over both proved keys, single-use codes
 
-**Status:** accepted (M4)
+**Status:** accepted (M4), amended by ADR-0036 (the Short ID comes from the invite's key)
 
 **Context.** Pairing turns nine digits read aloud (the Short ID) and six digits
 read off a screen (the pairing code) into a public key stored in `known_peers`
@@ -1018,7 +1018,7 @@ in its own commit.
 
 ## ADR-0027 — The rendezvous server: signed registrations, and why it need not be trusted
 
-**Status:** accepted (M4), superseded on the `main-test` branch by ADR-0036
+**Status:** accepted (M4), superseded by ADR-0036 (the rendezvous server was removed)
 
 **Context.** `beam pair <ID>` needs to turn a Short ID into an iroh endpoint
 address. beam does not use n0's DNS discovery (ADR-0025, S-17), so it runs its
@@ -1216,7 +1216,7 @@ not covered by the confirmation MAC because nothing relies on it.
 
 ## ADR-0029 — `config.toml`, the relay setting, and what M4 added to the build
 
-**Status:** accepted (M4)
+**Status:** accepted (M4), amended by ADR-0036 (`rendezvous` removed, `port` added)
 
 **Context.** The rendezvous server and the relay are infrastructure, and they
 change between a laptop demo, a campus deployment and a self-hosted setup. They
@@ -1328,7 +1328,7 @@ partial is kept for a resume.
 
 ## ADR-0031 — `send` finds a peer by its full key, and the connection's proof outranks the request
 
-**Status:** accepted (M5)
+**Status:** accepted (M5), amended by ADR-0036 (the address comes from `known_peers`, not a lookup)
 
 **Context.** M5 decision 3.
 
@@ -1540,8 +1540,10 @@ promptly; a question still gets its whole deadline.
 
 ## ADR-0036 — No rendezvous server: invites, and peers found by key through the relay
 
-**Status:** proposed, on the `main-test` branch. Supersedes ADR-0027 there;
-amends ADR-0026, ADR-0029 and ADR-0031.
+**Status:** accepted (post-M6). Built and tested on the `main-test` branch,
+including a cross-network test between two home networks about 50 km apart,
+and merged into `main` on 2026-10-02. Supersedes ADR-0027; amends ADR-0026,
+ADR-0029 and ADR-0031.
 
 **Context.** The rendezvous server (ADR-0027) is the one piece of beam that
 someone has to run. There is no public one, so the default in `config.toml`
@@ -1651,4 +1653,5 @@ was (CLAUDE.md, identity model):
   are connected to it, as it already did.
 * **What was lost:** a 9-digit ID that can be read over the phone, and the
   server-side tests of signed registrations, which go with the server. The
-  main branch keeps the rendezvous design, so both can be compared.
+  rendezvous implementation is preserved in history: commit `fc86508` is the
+  end of M6 with the server.

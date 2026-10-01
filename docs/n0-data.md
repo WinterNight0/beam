@@ -13,7 +13,7 @@ when that pin moves.
 
 | Service | iroh's default | **What beam does** |
 |---|---|---|
-| Discovery (pkarr/DNS) | publishes your endpoint id and relay URL to `dns.iroh.link`, republished every 5 minutes | **not used at all.** On `main-test` the address travels in an invite and is saved in `known_peers` (ADR-0036); on `main`, beam's own rendezvous server maps a Short ID to an address (M4) |
+| Discovery (pkarr/DNS) | publishes your endpoint id and relay URL to `dns.iroh.link`, republished every 5 minutes | **not used at all.** The address travels in an invite and is saved in `known_peers` (ADR-0036). Until then, beam's own rendezvous server mapped a Short ID to an address (M4–M6) |
 | Relay | falls back through n0's relays, including one in Asia-Pacific | **one relay, n0's Asia-Pacific one, by default during development**; set by `relay` in `~/.beam/config.toml`, or `"none"`; replaced by a self-hosted `iroh-relay` later |
 | File contents | never sent to either | never sent to either |
 
@@ -46,12 +46,10 @@ roughly when it was last online. That is not catastrophic — it is a public key
 and a relay hostname — but it is a standing, third-party-hosted statement that a
 particular device is online, and beam's users did not ask for one.
 
-**beam does not enable it.** On `main`, M4 builds a rendezvous server that maps
-a Short ID to an iroh endpoint address, so the lookup that discovery would do is
-done by a server the project controls. On `main-test` (ADR-0036) no lookup is
-needed at all: the first meeting uses an invite the person pastes, and after
-that a peer is dialled by its key through its relay. Nothing is published
-anywhere.
+**beam does not enable it.** M4 first replaced it with a rendezvous server the
+project controlled. ADR-0036 then removed the need for any lookup: the first
+meeting uses an invite the person pastes, and after that a peer is dialled by
+its key through its relay. Nothing is published anywhere.
 
 `tests/no_n0_discovery.rs` enforces this: it fails if any beam source file
 uses `presets::N0`, a pkarr or DNS address lookup, or n0's default relay map.
@@ -118,10 +116,10 @@ be self-hosted. Putting one in or near Thailand is on the roadmap after M5.
   a `SecretKey` in memory to terminate TLS; it is never transmitted.
 - **File contents and file names.** Only to the peer, inside the encrypted
   connection.
-- **`known_peers`.** Local only. On `main-test` there is no rendezvous server;
-  the relay sees which keys are connected to it, as below, and an invite shows
-  a device's addresses to whoever reads it. On `main`, the rendezvous server
-  learns, while a device
+- **`known_peers`.** Local only. There is no rendezvous server any more
+  (ADR-0036): the relay sees which keys are connected to it, as below, and an
+  invite shows a device's addresses to whoever reads it. Before ADR-0036, the
+  rendezvous server learned, while a device
   runs `beam listen` (or `pair --wait`), its Short ID, public key and IP
   addresses — so it knows **when the device is online** — and the IP of
   whoever looks it up, by Short ID or by key. That is what a rendezvous server

@@ -1,9 +1,5 @@
 # Beam — test plan
 
-> **Branch `main-test`:** there is no rendezvous server on this branch;
-> devices meet through invites and are found again by key through the relay
-> (ADR-0036 in `decisions.md`). Rendezvous-server test cases apply to `main`. Here they are replaced by the invite tests (`invite::tests`), `tests/pairing.rs`, and the address tests in `tests/listen.rs` and `tests/cli.rs`.
-
 ## How to run
 
 ```
@@ -203,6 +199,12 @@ than once, and both would have failed in CI eventually.
 
 ## Implemented (M4)
 
+> **Historical.** This section describes the suite as it was at this
+> milestone. The rendezvous server and every test of it were removed by
+> ADR-0036; tests named here that mention the server, registrations or a
+> Short ID lookup no longer exist. What replaced them is listed under
+> "Implemented (post-M6)" below.
+
 Nothing in this section touches the internet. The integration and end-to-end
 tests run a real rendezvous server in-process, pair over real iroh endpoints
 bound to `127.0.0.1`, and set `relay = "none"`, so they pass offline and on CI.
@@ -265,17 +267,13 @@ broken `config.toml` names the file; `newcode` is still a stub (M5).
 
 ### Manual: pairing two real machines
 
-On the same Wi-Fi, with `beam-server` on machine A:
+Updated for ADR-0036: no server and no `config.toml`.
 
 ```bash
-# machine A
-beam-server --addr 0.0.0.0:8787
-# machine A and B: point ~/.beam/config.toml at it
-echo 'rendezvous = "ws://<A-LAN-IP>:8787/v1"' > ~/.beam/config.toml
 # machine B
-beam pair --wait --name laptop-a
-# machine A
-beam pair <B's Short ID> --name laptop-b
+beam pair --wait --name laptop-a      # or: beam listen
+# machine A — paste the Invite line machine B shows
+beam pair <B's invite> --name laptop-b
 ```
 
 Check: both screens show the same two fingerprints, the other way round; typing
@@ -285,6 +283,12 @@ machine on both sides afterwards.
 
 
 ## Implemented (M5)
+
+> **Historical.** This section describes the suite as it was at this
+> milestone. The rendezvous server and every test of it were removed by
+> ADR-0036; tests named here that mention the server, registrations or a
+> Short ID lookup no longer exist. What replaced them is listed under
+> "Implemented (post-M6)" below.
 
 As in M4, nothing here touches the internet: real iroh endpoints bound to
 `127.0.0.1`, a real rendezvous server in-process, `relay = "none"`.
@@ -367,14 +371,15 @@ path are checked by hand, on two networks (the steps in
 3. With `relay = "none"` on both, over those same two networks, expect the
    connection to fail rather than relay.
 
-### Manual: the rendezvous server restarting under `listen`
+### ~~Manual: the rendezvous server restarting under `listen`~~
 
-Stop `beam-server` while `beam listen` runs: `listen` warns on stderr that it
-cannot register and keeps retrying every 5 s. Start the server again: `listen`
-prints "Registered with the rendezvous server again." and is findable again.
+Withdrawn with the server (ADR-0036).
 
 
 ## Implemented (M6)
+
+> **Partly historical.** The rendezvous rows below were replaced by ADR-0036;
+> see "Implemented (post-M6)".
 
 `docs/threat-model.md` maps every threat to the test that demonstrates its
 mitigation; this section lists the tests M6 added.
@@ -438,6 +443,57 @@ slow-verification test fails; the key check on a rendezvous answer → the
 "answer for another key" impersonation test fails. (M4 and M5 mutation checks
 still stand.)
 
+
+## Implemented (post-M6): no rendezvous server (ADR-0036)
+
+Like M4 and M5, nothing here needs the internet: invites carry `127.0.0.1`
+addresses, and the relay is off.
+
+### Unit tests
+
+| Module | What is covered |
+|---|---|
+| `invite` | base32 round-trips every length; an invite round-trips with no relay, the default relay (one byte) and another relay; the usual invite fits in 100 characters; pasting ignores case, spaces and dashes; a one-character typo is caught by the checksum; non-invites and cut-off invites are refused **without quoting the input**; a newer format says to update; link-local and unspecified addresses are left out, IPv4 first; the invite's Short ID is the device's own; a peer on the shared relay follows this device's relay, one on another relay keeps it; no relay and no address means nowhere to look; hand-edited attributes that do not parse are skipped |
+| `config` | `port` read, and refused when it does not fit a `u16`; a config that still has `rendezvous =` loads |
+| `identity::known_peers` | attributes set, replaced, removed and round-tripped; `lookup_key_mut` never changes the key |
+| `transport::endpoint` | a taken port falls back to a random one; a free port is the one bound |
+
+### Integration tests — `tests/pairing.rs`, `tests/listen.rs`
+
+| Requirement | Test |
+|---|---|
+| F-18 / F-8 pairing from an invite | `pairing_returns_the_key_each_side_proved_on_the_connection` (the invite carries the waiter's key and a reachable address) |
+| **S-31 a swapped key in an invite** | `an_invite_with_a_swapped_key_reaches_nobody_and_spends_nothing` — and the genuine invite still works afterwards |
+| **S-31 a wrong address for a paired key** | `impersonation::a_wrong_address_for_a_paired_key_cannot_redirect_a_send` (replaces the two lying-rendezvous tests) |
+| Own invite | `pairing_with_your_own_invite_is_refused` |
+| ADR-0031 re-initialised peer at the saved address | `dialling_a_key_nobody_holds_any_more_finds_nobody` |
+| Every M5 `listen` test | now dials the address from `listen`'s own invite instead of a server lookup |
+
+### Command and end-to-end tests — `tests/cli.rs`, `tests/end_to_end.rs`
+
+| Requirement | Test |
+|---|---|
+| **F-19 / S-32 address update** | `pairing_again_with_a_known_devices_invite_only_updates_its_address` — no code, key and name unchanged, `addrs=` written |
+| A non-invite fails before the network | `pair_with_something_that_is_not_an_invite_fails_before_the_network` |
+| Not reachable at the saved address | `send_to_a_peer_that_is_not_listening_says_how_to_re_pair` (mentions updating the invite and re-pairing) |
+| No relay, no address | `send_with_no_relay_and_no_saved_address_says_where_to_get_one` |
+| **The whole flow as processes** | `pairing::beam_pair_between_two_processes_then_a_transfer` — `pair --wait` shows an invite, the joiner pairs with it and saves `addrs=`, then `listen` and `send` move a file over iroh with no server anywhere |
+| `listen` invites in processes | `over_iroh::listen_pairs_but_only_with_yes_in_full` |
+
+### Manual: across the internet, with no server
+
+Verified on 2026-10-02: two devices on different home networks about 50 km
+apart, default configuration, no server. Pairing with the invite worked, and a
+5 GB file arrived intact (slowly; see `requirements.md` §6).
+
+Before that, on one machine with the default relay: after pairing, every saved
+address was deleted from `known_peers`, and `send` still found the peer by key
+alone through n0's relay, then switched to `[Direct P2P]`.
+
+To repeat it: both run `beam init`; one runs `beam listen` and sends the
+invite by chat and the code by another channel; the other runs `beam pair
+<invite> --name …`; both compare fingerprints and type `yes`; then send in
+**both** directions. Note `[Direct P2P]` or `[Relay]` and the time taken.
 
 ## Manual test steps
 

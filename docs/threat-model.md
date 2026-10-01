@@ -5,8 +5,8 @@ mitigation below names the decision behind it (ADR, in `decisions.md`) and the
 test that demonstrates it; a claim without a test is marked as such.
 
 Written for M6, against the code at that milestone: iroh `=1.2.0` as the
-transport and n0's relay as the default relay. **Revised for the `main-test`
-branch (ADR-0036):** there is no rendezvous server; devices meet through an
+transport and n0's relay as the default relay. **Revised for ADR-0036
+(merged after M6):** there is no rendezvous server; devices meet through an
 invite and are found again by key through the relay. The rows about the
 rendezvous server are replaced by section "I — whoever can alter an invite or
 a saved address".

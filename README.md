@@ -8,8 +8,9 @@ person, and find each other again by key through a relay that only ever carries
 encrypted data. Every incoming transfer has to be accepted by hand, and only
 peers you have paired with can ask.
 
-> **Branch `main-test`:** this branch has no rendezvous server (ADR-0036 in
-> [docs/decisions.md](docs/decisions.md)). `main` keeps the server-based design.
+How it all fits together — invites, pairing, finding a peer, hole punching,
+the transfer protocol — is explained step by step in
+[docs/how-it-works.md](docs/how-it-works.md).
 
 > **Status: milestone M6.** Pairing and file transfer run over iroh: encrypted
 > end to end, direct when possible and through a relay when not, with each
