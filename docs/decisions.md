@@ -1655,3 +1655,172 @@ was (CLAUDE.md, identity model):
   server-side tests of signed registrations, which go with the server. The
   rendezvous implementation is preserved in history: commit `fc86508` is the
   end of M6 with the server.
+
+---
+
+## ADR-0037 — `listen` shows its pairing code once; `whoami` shows the current one
+
+**Status:** accepted (post-M6, branch `main-QoL`). Amends ADR-0028 (how a
+renewed code is announced).
+
+**Context.** `listen` renews its pairing code after every attempt and every
+ten minutes (ADR-0028), and printed each new code as a notice. A first test
+across two home networks sent a 5 GB file. The transfer ran for a long time,
+and the receiver's screen kept filling with `New pairing code: …` lines that
+had nothing to do with it. Codes are needed rarely, once per new device, but
+they were announced every ten minutes for as long as `listen` ran.
+
+The joiner had the opposite problem. A code that had just been renewed fails
+in exactly the same way as a mistyped one, and the message ("If it was typed
+correctly, someone else may be trying to pair…") did not mention the far more
+likely cause.
+
+### Decision
+
+* **`listen` prints the invite and the code once, at start**, and says that
+  `beam whoami` shows the current code. A code renewed because ten minutes
+  passed is not printed at all. After an attempt, one short line says the code
+  was used (or that pairing is back on after a pause) and that `whoami` shows
+  the new one. That line follows something the person just saw happen, so it
+  is not noise.
+* **`beam whoami` shows what a running `listen` offers**: the invite, the code
+  that works now, and when it expires. When there is no code it says why: an
+  attempt is in progress, pairing is paused, or pairing is off after three
+  failures. It also says when `listen` is not running at all. `--json` adds a
+  `listening` object, or `null`.
+* **How a separate process knows.** `listen` writes its state to
+  `~/.beam/listen.json` whenever the code or the pairing state changes. It
+  also holds a lock on `~/.beam/listen.lock` (the standard library's advisory
+  file lock, as partials already use) for as long as it runs. `whoami`
+  believes `listen.json` only while that lock is held. The operating system
+  releases the lock when the process ends, however it ends, so a crashed
+  `listen` never leaves a stale code on show. A clean exit also deletes the
+  file. A second `listen` in the same beam home does not take over the file,
+  and says so.
+* **The joiner is told an expired code is a likely cause.** The wrong-code
+  message now says that the code changes every ten minutes and after every
+  attempt, that an older one no longer works, and to ask for the current one
+  (`beam whoami` on the other device). The possibility of someone pairing in
+  the other device's place is still mentioned. The `listen` side's message
+  says the joiner may have used an older code.
+
+### Why not tell the joiner exactly that the code had expired?
+
+Telling a stale code from a mistyped one would mean checking the joiner's
+attempt against the previous code as well. SPAKE2 is built so that a failed
+run reveals nothing about which code was tried: that is what limits an
+attacker to one guess per attempt. Trying a second code would weaken that and
+amount to inventing cryptography, against rule 4. Keeping the old code valid
+for a grace period would be the same thing in another form, and would also
+make "single use" untrue. A hint is the honest option.
+
+### Consequences
+
+* A long transfer's screen shows only the transfer.
+* **A live pairing code is now on disk** while `listen` runs. The file is
+  private (mode 0600 on Unix, written atomically like `known_peers`). On
+  Windows the mode bits do not apply (ADR-0004), so another account on the
+  same machine could read it. Accepted: the code is single use, lives at most
+  ten minutes, and is only half of pairing. Both people still have to compare
+  fingerprints and type `yes`, and anyone who can read `~/.beam` can already
+  read the private key next to it.
+* Someone who wants the code has to run `whoami` in another terminal. That is
+  one command, against a screen that used to change every ten minutes whether
+  anyone needed a code or not.
+* Tests: `listen_status` unit tests (the code shown and renewed, attempt,
+  pause and off states, a crash's leftover ignored, a clean exit removing the
+  file, a second `listen` not overwriting the first, the file private on
+  Unix); `tests/cli.rs::whoami_says_when_listen_is_not_running`; and
+  `tests/end_to_end.rs::over_iroh::listen_pairs_but_only_with_yes_in_full`,
+  which now reads both codes from `whoami` with a real `listen` running, and
+  checks that the renewed code was never printed.
+
+---
+
+## ADR-0038 — Security review fixes: relay changes need a yes, invite relays are https and public, CI hardened; `advertise` for direct testing
+
+**Status:** accepted (post-M6, branch `main-QoL`). Amends ADR-0036.
+
+**Context.** On 2026-10-02 the project was checked for vulnerabilities (the
+full results are in `SECURITY.md` §7). The dependency check found nothing
+exploitable: no CVE or RustSec vulnerability in any of the 393 locked crates,
+and no CISA KEV entry for anything beam uses. A review of beam's own code,
+focused on what ADR-0036 changed, found four issues:
+
+* **F-1 (medium).** `beam pair <invite>` for an already-paired device saved
+  the invite's relay without asking, and a saved `relay=` overrides this
+  device's own relay. A peer's public key is not secret, so anyone could
+  build an invite naming it with their own relay ("I moved, here's my new
+  invite"). Every later send to that peer would then go through the
+  attacker's relay, which sees when and from where, and can block it. Files
+  stay unreadable: the connection still proves the key. ADR-0036 and R-4
+  described this path as "unreachable at worst", which understated it.
+* **F-2 (low).** `listen`'s fixed port, together with iroh's router port
+  mapping (on by default), makes a running `listen` findable by scanning.
+  Anyone can then open a pairing connection, use up codes, and learn the
+  device's public key.
+* **F-3 (low).** An invite's relay could be any `http://` or `https://` URL,
+  including a host on the local network. A crafted invite could make beam
+  connect to a router's admin page or another local service, or talk to a
+  relay in plain text.
+* **F-4 (low, supply chain).** CI had no `permissions:` block, so its token
+  got the repository default; the third-party actions were referenced by
+  movable tags; and nothing checked dependencies for new advisories.
+
+The rule for fixing: patch now only what does not make beam harder to use.
+
+### Decision
+
+* **F-1: a relay change needs a yes.** When an invite for a paired device
+  would change its saved relay, `beam pair` shows the fingerprint, the relay
+  now and after, and what a relay can see. It saves nothing unless the answer
+  is yes. Address-only updates stay silent: they cannot leak anything,
+  because the relay still reaches the peer. Nearly everyone uses the default
+  relay, so the question is rare. It appears exactly when something unusual
+  is happening.
+* **F-3: invites carry only `https://` relays on public hosts.** A relay URL
+  in an invite, or in a saved `relay=`, that is plain `http://`, or names an
+  IP in a private, loopback, link-local, carrier-grade-NAT or unique-local
+  range, or names `localhost` or `*.local`, is **dropped, not fatal**. The
+  invite still pairs, and the joiner falls back to its own relay.
+  `config.toml` still accepts any relay, including `http://`, because that
+  file is the user's own choice (for example, a test relay on the LAN).
+* **F-4: CI hardened.** `permissions: contents: read`; checkout does not
+  keep credentials; every third-party action is pinned to a full commit
+  hash, with the release named in a comment; and a new `audit` job runs
+  `cargo audit` on every push and pull request. A vulnerability fails the
+  build, and an unmaintained-crate notice is a warning.
+* **F-2: not patched; recorded as open risk R-8.** Both fixes found cost
+  something users would feel:
+  - Turning off port mapping makes direct connections rarer, and is exactly
+    what lets `relay = "none"` work across the internet.
+  - A secret in the invite that `listen` checks before spending a code would
+    change the invite format and the pairing handshake.
+  Both are to be planned and decided before any code changes.
+* **`advertise` in `config.toml`.** It came out of making `relay = "none"`
+  usable for testing direct P2P across the internet. Without a relay, the
+  only public address beam can learn is a router port mapping. With a port
+  forwarded by hand, beam cannot know the public address, so the invite
+  carried only LAN addresses. `advertise = ["<public IP>:7820"]` puts given
+  addresses first in the invite. Separately, with no relay, `listen` now
+  waits up to 3 seconds for the router to report a port mapping before
+  showing the invite. With a relay it waits for the relay, as before.
+
+### Consequences
+
+* The forged-relay attack (F-1) now needs the victim to say yes to a question
+  that explains the risk. A forged address-only update can still make a peer
+  unreachable until the next real invite (R-4, unchanged).
+* A crafted invite can no longer make beam connect to local services, or to a
+  relay in plain text.
+* New advisories against beam's dependencies show up on the next push.
+* With `relay = "none"`, `listen` and `pair --wait` take up to 3 seconds
+  longer to show the invite when the router offers no port mapping.
+* Tests:
+  - `invite::an_http_or_local_relay_in_an_invite_is_dropped_not_used`
+  - `invite::advertised_addresses_come_first_without_duplicates`
+  - `transport::endpoint::only_internet_reachable_addresses_count_as_public`
+  - `config::advertised_addresses_are_read_and_checked`
+  - `tests/cli.rs::an_invite_that_changes_a_peers_relay_needs_a_yes`
+  - `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted`
+  - `tests/pairing.rs::advertised_addresses_lead_the_invite`

@@ -25,6 +25,7 @@ fn network() -> Network {
         relay: Relay::Disabled,
         bind: Bind::Loopback,
         port: 0,
+        advertise: Vec::new(),
     }
 }
 
@@ -255,6 +256,40 @@ async fn an_invite_with_a_swapped_key_reaches_nobody_and_spends_nothing() {
     .await;
     assert_eq!(joined.unwrap(), waiter.verifying_key());
     assert_eq!(waiting.task.await.unwrap().unwrap(), joiner.verifying_key());
+}
+
+/// ADR-0038: `advertise` puts an address beam cannot discover — a port
+/// forwarded by hand, with no relay — first in the invite.
+#[tokio::test]
+async fn advertised_addresses_lead_the_invite() {
+    let waiter = identity("waiter");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut network = network();
+        network.advertise = vec!["203.0.113.7:7820".parse().unwrap()];
+        let known = KnownPeers::with_header();
+        let pairing = Pairing {
+            identity: &waiter,
+            known: &known,
+            name: Some("joiner"),
+            network: &network,
+            timeouts: quick(),
+        };
+        let slot = CodeSlot::new(PairingCode::generate().unwrap(), Duration::from_secs(60));
+        let _ = wait(&pairing, slot, Answer::yes(), move |event| {
+            if let Event::Waiting { invite, .. } = event {
+                let _ = tx.send(invite.clone());
+            }
+        })
+        .await;
+    });
+    let invite = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert_eq!(invite.addrs[0], "203.0.113.7:7820".parse().unwrap());
+    assert!(invite.addrs.len() > 1, "the discovered address is kept too");
 }
 
 #[tokio::test]

@@ -12,9 +12,15 @@
 //! # UDP port `beam listen` binds, so its invite stays the same between
 //! # runs. 0 picks a random port each time.
 //! port = 7820
+//!
+//! # Extra addresses to put first in this device's invite. For testing
+//! # direct connections with `relay = "none"` behind a router whose port
+//! # you forwarded by hand: beam cannot discover that address itself.
+//! advertise = ["203.0.113.7:7820"]
 //! ```
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use iroh::RelayUrl;
@@ -63,6 +69,8 @@ pub struct Config {
     pub relay: Relay,
     /// UDP port for `beam listen`; 0 means a random one.
     pub port: u16,
+    /// Addresses to put first in this device's invite (ADR-0038).
+    pub advertise: Vec<SocketAddr>,
 }
 
 /// Why the config file could not be used.
@@ -78,6 +86,11 @@ pub enum ConfigError {
     Parse { path: PathBuf, message: String },
     #[error("{path}: relay must be a URL or \"{RELAY_NONE}\", not {value:?}")]
     Relay { path: PathBuf, value: String },
+    #[error(
+        "{path}: advertise entries must be IP:port with a real address and a port, \
+         such as \"203.0.113.7:7820\", not {value:?}"
+    )]
+    Advertise { path: PathBuf, value: String },
 }
 
 /// The file as written. Unknown keys are an error, so a typo such as
@@ -91,6 +104,7 @@ struct RawConfig {
     rendezvous: Option<String>,
     relay: Option<String>,
     port: Option<u16>,
+    advertise: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -98,6 +112,7 @@ impl Default for Config {
         Self {
             relay: Relay::Url(DEFAULT_RELAY.parse().expect("the default relay URL parses")),
             port: DEFAULT_PORT,
+            advertise: Vec::new(),
         }
     }
 }
@@ -133,6 +148,18 @@ impl Config {
         }
         if let Some(port) = raw.port {
             config.port = port;
+        }
+        for value in raw.advertise.unwrap_or_default() {
+            let addr = value
+                .trim()
+                .parse::<SocketAddr>()
+                .ok()
+                .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
+                .ok_or_else(|| ConfigError::Advertise {
+                    path: path.to_path_buf(),
+                    value: value.clone(),
+                })?;
+            config.advertise.push(addr);
         }
         Ok(config)
     }
@@ -212,6 +239,31 @@ mod tests {
         for value in ["off", "relay.example.org", ""] {
             let err = parse(&format!("relay = \"{value}\"")).unwrap_err();
             assert!(matches!(err, ConfigError::Relay { .. }), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn advertised_addresses_are_read_and_checked() {
+        let config =
+            parse("relay = \"none\"\nadvertise = [\"203.0.113.7:7820\", \"[2001:db8::7]:7820\"]\n")
+                .unwrap();
+        assert_eq!(config.relay, Relay::Disabled);
+        assert_eq!(
+            config.advertise,
+            [
+                "203.0.113.7:7820".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::7]:7820".parse().unwrap()
+            ]
+        );
+        assert!(Config::default().advertise.is_empty());
+        for bad in [
+            "203.0.113.7",
+            "0.0.0.0:7820",
+            "203.0.113.7:0",
+            "example.org:7820",
+        ] {
+            let err = parse(&format!("advertise = [\"{bad}\"]")).unwrap_err();
+            assert!(matches!(err, ConfigError::Advertise { .. }), "{bad}: {err}");
         }
     }
 

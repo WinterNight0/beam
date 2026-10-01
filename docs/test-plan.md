@@ -495,6 +495,35 @@ invite by chat and the code by another channel; the other runs `beam pair
 <invite> --name …`; both compare fingerprints and type `yes`; then send in
 **both** directions. Note `[Direct P2P]` or `[Relay]` and the time taken.
 
+## Implemented (post-M6): the pairing code on demand (ADR-0037)
+
+| Requirement | Test |
+|---|---|
+| F-21 `whoami` shows the running `listen`'s invite and code; a renewed code updates it | `listen_status::a_running_listen_shows_its_invite_and_the_current_code` |
+| F-21 no code while in use, paused or off, each said so | `listen_status::attempts_pauses_and_switching_off_are_shown_without_a_code` |
+| F-21 a crash leaves no stale code on show | `listen_status::a_status_left_by_a_crash_is_not_believed` (and checked by hand: `whoami` after force-killing `listen` says it is not running) |
+| A clean exit removes the code from disk | `listen_status::a_clean_exit_takes_the_code_off_disk` |
+| A second `listen` in one beam home | `listen_status::a_second_listen_in_the_same_home_does_not_overwrite_the_first` |
+| `listen.json` is private | `listen_status::the_status_file_is_private` (Unix) |
+| `whoami` with no `listen` | `tests/cli.rs::whoami_says_when_listen_is_not_running` (text and `--json`) |
+| **As processes**: `whoami` matches what `listen` printed; after an attempt `listen` says where the new code is, `whoami` shows it, and `listen` never printed it; pairing with it works | `tests/end_to_end.rs::over_iroh::listen_pairs_but_only_with_yes_in_full` |
+
+## Implemented (post-M6): security review fixes (ADR-0038)
+
+| Requirement | Test |
+|---|---|
+| **S-34 a relay change needs a yes** (F-1) | `tests/cli.rs::an_invite_that_changes_a_peers_relay_needs_a_yes`: refused saves nothing, not even addresses; accepted saves relay and addresses, key unchanged; the same invite again asks nothing |
+| **S-33 only `https://` public relays from invites** (F-3) | `invite::an_http_or_local_relay_in_an_invite_is_dropped_not_used` (http, private IPv4, loopback v4/v6, `localhost`, `*.local`; the rest of the invite still counts); a public https relay is kept |
+| What counts as a public address | `transport::endpoint::only_internet_reachable_addresses_count_as_public` (private, CGNAT, link-local, unique-local, documentation ranges are not) |
+| F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
+| S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
+
+### Manual: direct P2P across the internet with no relay
+
+Follow "No relay at all: testing real direct P2P" in `deploy.md`. Record each
+side's situation (UPnP, manual forward with `advertise`, or CGNAT), whether it
+connected, and the time for the same file with and without the relay.
+
 ## Manual test steps
 
 Some things cannot honestly be covered by an automated test on one machine.

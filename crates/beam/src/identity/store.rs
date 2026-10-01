@@ -21,6 +21,10 @@ pub const PUBLIC_KEY_NAME: &str = "id_ed25519.pub";
 pub const KNOWN_PEERS_NAME: &str = "known_peers";
 pub const TMP_NAME: &str = "tmp";
 pub const CONFIG_NAME: &str = "config.toml";
+/// What a running `beam listen` offers, for `beam whoami` (ADR-0037).
+pub const LISTEN_STATUS_NAME: &str = "listen.json";
+/// Held locked by a running `beam listen`; `listen.json` counts only while it is.
+pub const LISTEN_LOCK_NAME: &str = "listen.lock";
 
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -62,7 +66,11 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    fn io(action: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+    pub(crate) fn io(
+        action: &'static str,
+        path: impl Into<PathBuf>,
+        source: std::io::Error,
+    ) -> Self {
         Self::Io {
             action,
             path: path.into(),
@@ -127,6 +135,27 @@ impl Store {
     /// The path of the `known_peers` database.
     pub fn known_peers_path(&self) -> PathBuf {
         self.dir.join(KNOWN_PEERS_NAME)
+    }
+
+    /// Where a running `beam listen` publishes its invite and pairing code.
+    pub fn listen_status_path(&self) -> PathBuf {
+        self.dir.join(LISTEN_STATUS_NAME)
+    }
+
+    /// The lock a running `beam listen` holds.
+    pub fn listen_lock_path(&self) -> PathBuf {
+        self.dir.join(LISTEN_LOCK_NAME)
+    }
+
+    /// Writes `listen.json` atomically. Private: it holds the live pairing
+    /// code (ADR-0037).
+    pub fn save_listen_status(&self, json: &str) -> Result<(), StoreError> {
+        self.ensure_dirs()?;
+        write_atomic(
+            &self.listen_status_path(),
+            json.as_bytes(),
+            Visibility::Private,
+        )
     }
 
     /// The directory for in-progress transfers (used from M2 onwards).

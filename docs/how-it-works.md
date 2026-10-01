@@ -201,7 +201,16 @@ saves Alice's key                                    saves Bob's key + where Bob
 
 - Six digits, **single use**: the first connection that tries it spends it,
   right or wrong.
-- `listen` makes a new one after every attempt and every 10 minutes.
+- `listen` makes a new one after every attempt and every 10 minutes. It
+  prints the code only once, at start. **`beam whoami` shows the current one**,
+  with when it expires (ADR-0037). `listen` keeps it in `~/.beam/listen.json`,
+  a private file that `whoami` believes only while `listen` holds the lock on
+  `~/.beam/listen.lock`, so a crashed `listen` never leaves a stale code on
+  show.
+- A code that has just been renewed fails exactly like a mistyped one, and
+  beam cannot tell them apart: SPAKE2 reveals nothing about which code was
+  tried. The joiner's error therefore says the code may have expired and how
+  to get the current one.
 - A wrong code pauses pairing for 5 seconds, then 10, doubling up to 5 minutes.
   **Three wrong codes in a row turn pairing off** until `listen` is restarted,
   while transfers from paired devices keep working. This bounds guessing to

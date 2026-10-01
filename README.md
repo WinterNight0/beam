@@ -10,7 +10,9 @@ peers you have paired with can ask.
 
 How it all fits together — invites, pairing, finding a peer, hole punching,
 the transfer protocol — is explained step by step in
-[docs/how-it-works.md](docs/how-it-works.md).
+[docs/how-it-works.md](docs/how-it-works.md). What beam protects, what it does
+not, how to use it safely and how to report a problem are in
+[SECURITY.md](SECURITY.md).
 
 > **Status: milestone M6.** Pairing and file transfer run over iroh: encrypted
 > end to end, direct when possible and through a relay when not, with each
@@ -54,7 +56,8 @@ beam pair --wait --name alice  # pair without also receiving files
 ```
 
 `listen` saves into the current directory unless given `--out <dir>`. Its
-pairing code works once and changes every ten minutes; after three wrong codes
+pairing code works once and changes every ten minutes. It is shown once, when
+`listen` starts; `beam whoami` in another terminal shows the current one. After three wrong codes
 in a row it stops offering pairing until it is restarted.
 
 Global flags: `--beam-dir <path>` (default `$BEAM_DIR`, else `~/.beam`) and
@@ -70,6 +73,9 @@ port  = 7820                                   # UDP port `listen` uses; 0 = ran
 
 With `relay = "none"`, only devices that can reach each other directly work: the
 same LAN, a shared VPN (Radmin VPN, ZeroTier, Tailscale…), or a public address.
+To test real direct P2P between two homes, follow the step-by-step guide in
+[docs/deploy.md](docs/deploy.md); `advertise = ["<public IP>:7820"]` puts a
+hand-forwarded public address in the invite.
 
 beam never uses n0's discovery service; the relay is the only n0 infrastructure
 it touches, and only if you leave the default. See [docs/n0-data.md](docs/n0-data.md).
@@ -107,7 +113,7 @@ cd /tmp/beam-demo && BEAM_DIR=$PWD/bob beam listen --out $PWD/inbox
   Saving to     /tmp/beam-demo/inbox
 
 To pair a new device, send it the invite and run on it:  beam pair <invite> --name <a name for this one>
-The pairing code works once and changes every 10 minutes.
+The pairing code works once and changes every 10 minutes; `beam whoami` shows the current one.
 Waiting for transfers. Every one has to be accepted by hand. Ctrl+C to stop.
 ```
 
@@ -224,7 +230,8 @@ a byte-order mark; beam skips it. The table below applies unchanged.
 | Answer the pairing question with `y` | Not paired. Only `yes` pairs |
 | Type a wrong pairing code | Both sides fail, nobody is asked, nothing is saved. `listen` pauses pairing for 5 s, then shows a new code |
 | Type three wrong codes in a row | `listen` turns pairing **off** until it is restarted, and says someone may be guessing. Files from paired devices still arrive |
-| Leave `listen` running for ten minutes | It prints a new pairing code; the old one no longer works |
+| Leave `listen` running for ten minutes | Nothing is printed, but `beam whoami` shows a new code; the old one no longer works, and a joiner who types it is told the code may have expired |
+| Run `beam whoami` while `listen` runs, and after stopping it | It shows `listen`'s invite, the current code and when it expires; afterwards, that `listen` is not running |
 | Answer a file with `n` | Both sides say it was declined, and `inbox/` gains nothing |
 | Answer nothing for 60 seconds | Both sides say it expired. Silence is a Reject, not a maybe |
 | Send twice at once, from two paired devices | The second sender is told `bob is receiving another file; try again later` |

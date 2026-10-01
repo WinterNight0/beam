@@ -55,6 +55,7 @@ impl App {
             relay: config.relay,
             bind: if loopback { Bind::Loopback } else { Bind::Any },
             port: config.port,
+            advertise: config.advertise,
         };
         let timeouts = Timeouts::default();
 
@@ -143,9 +144,43 @@ impl App {
         let peer = known
             .lookup_key_mut(&invite.key)
             .expect("checked by the caller");
-        invite::remember(peer, invite, &network.relay);
         let name = untrusted::name(&peer.name);
         let fingerprint = peer.fingerprint();
+
+        // A different relay is the one change worth a question: whoever runs
+        // a relay sees when this device sends to that peer, and from where,
+        // and can block it. A peer's key is public, so anyone can make an
+        // invite that names it with their own relay (ADR-0038). Addresses
+        // alone are saved without asking: the relay still reaches the peer.
+        let old_relay = peer.attr(invite::RELAY_ATTR).map(str::to_string);
+        let new_relay = invite::relay_attr(invite, &network.relay);
+        if old_relay != new_relay {
+            let describe = |relay: &Option<String>| match relay {
+                Some(url) => url.clone(),
+                None => format!("this device's own relay ({})", network.relay),
+            };
+            writeln!(
+                io.out,
+                "{name} is already paired, and this invite moves it to a different relay:"
+            )?;
+            ui::field(io.out, "Fingerprint", &fingerprint.to_string())?;
+            ui::field(io.out, "Relay now", &describe(&old_relay))?;
+            ui::field(io.out, "Relay after", &describe(&new_relay))?;
+            writeln!(
+                io.out,
+                "Whoever runs a relay can see when you send to {name} and can block it, but \
+                 cannot read the files.\nOnly say yes if {name} told you it changed relay."
+            )?;
+            if !ui::confirm(io.input, io.out, "Use the new relay?")? {
+                writeln!(io.out, "Nothing was changed.")?;
+                return Ok(());
+            }
+        }
+
+        let peer = known
+            .lookup_key_mut(&invite.key)
+            .expect("checked by the caller");
+        invite::remember(peer, invite, &network.relay);
         self.store.save_known_peers(&known)?;
 
         writeln!(
@@ -239,8 +274,9 @@ fn not_paired(error: PairError, waited: bool) -> CommandError {
             "\n       The code is used up. Run `beam pair --wait` again for a new one."
         }
         (PairError::Pairing(_), false) => {
-            "\n       The other device's code is now used up; it shows a new one \
-             (or, with `beam pair --wait`, has to be run again)."
+            "\n       The other device's code is now used up. If it runs `beam listen`, \
+             `beam whoami` there shows the new one;\n       with `beam pair --wait`, it has \
+             to be run again."
         }
         _ => "",
     };

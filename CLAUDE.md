@@ -154,6 +154,13 @@ own workspace crates only if compile times demand it.
 - **Post-M6 (ADR-0036)** No rendezvous server: `listen` shows an invite, `beam pair
   <INVITE>` pairs, peers are dialled by key through the relay and saved addresses,
   `listen` binds a fixed port (7820). Merged 2026-10-02 after a cross-network test.
+- **Post-M6 (ADR-0037)** `listen` prints its code once; `beam whoami` shows the live
+  invite and code from `~/.beam/listen.json` (trusted only while `listen.lock` is held);
+  a joiner with a wrong code is told it may have expired.
+- **Post-M6 (ADR-0038)** Security review: relay changes via invite need a yes; invite
+  relays must be `https://` on public hosts; CI read-only, actions pinned, `cargo audit`;
+  `advertise` config for direct testing. Open: R-8 (scannable `listen`), to be planned.
+  `SECURITY.md` holds the audit results and must be updated with each new check.
 - **Next (to be planned before coding):** throughput. Known limits: QUIC stream window
   1.25 MB (noq default), one 4 MiB chunk in flight at a time, two fsyncs per chunk,
   n0's public relay being rate-limited.

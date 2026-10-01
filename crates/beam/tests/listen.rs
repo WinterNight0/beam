@@ -37,6 +37,7 @@ fn network() -> Network {
         relay: Relay::Disabled,
         bind: Bind::Loopback,
         port: 0,
+        advertise: Vec::new(),
     }
 }
 

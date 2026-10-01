@@ -21,6 +21,8 @@ Thumbs.db
 id_ed25519
 id_ed25519.pub
 known_peers
+listen.json
+listen.lock
 *.pem
 
 # local secrets

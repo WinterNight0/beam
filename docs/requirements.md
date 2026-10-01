@@ -25,7 +25,7 @@ deleted or renumbered.
 | F-8 | `beam pair <INVITE> --name <name>` performs first-time pairing using an invite and a pairing code, exchanging and confirming public keys with `spake2`. The other device waits with `beam listen` or `beam pair --wait --name <name>`. (Originally a 9-digit Short ID looked up on the rendezvous server; changed by ADR-0036.) | M4 |
 | F-13 | ~~A rendezvous server maps a Short ID to an iroh endpoint address.~~ — **Withdrawn (ADR-0036)**. There is no rendezvous server; see F-18. beam still never uses n0's DNS discovery. | M4 |
 | F-14 | The relay URL is configurable; n0's relay is the development default and a self-hosted `iroh-relay` replaces it later. | M4 |
-| F-9 | ~~`beam newcode`~~ — **dropped in M5.** `beam listen` renews its pairing code by itself after every attempt and every 10 minutes, and prints the new one (ADR-0028 amendment). | M5 |
+| F-9 | ~~`beam newcode`~~ — **dropped in M5.** `beam listen` renews its pairing code by itself after every attempt and every 10 minutes (ADR-0028 amendment). It no longer prints each new one; `beam whoami` shows the current code (F-21, ADR-0037). | M5 |
 | F-10 | A transfer resumes after an interruption without re-sending verified chunks. Resuming is triggered only by running `beam send` again: there is no automatic reconnection and no `beam resume`. | M3 |
 | F-12 | `beam transfers` lists partially received transfers; `beam transfers --clear` deletes them after confirmation. | M3 |
 | F-11 | The progress line states whether the connection is `[Direct P2P]` or `[Relay]`, and says so when the path changes mid-transfer (ADR-0032). | M5 |
@@ -34,6 +34,9 @@ deleted or renumbered.
 | F-17 | ~~`docs/deploy.md` explains running `beam-server` behind `wss://`.~~ — **Withdrawn (ADR-0036)**. There is no server to deploy; `deploy.md` now says so and covers pointing beam at another relay. | M5 |
 | F-18 | `beam listen` and `beam pair --wait` show an **invite**: `beam1` + base32 of the device's public key, its relay and up to six direct addresses, with a checksum. A damaged or mistyped invite is refused with a clear message before any network traffic, and the message never quotes the pasted text (ADR-0036). | post-M6 |
 | F-19 | After pairing, the joiner saves where the invite said its peer is (`addrs=`, and `relay=` when it differs from its own) on the peer's `known_peers` line. Running `beam pair <INVITE>` for a device that is already paired only updates those attributes — no code, no network, never the key or the name (ADR-0036). | post-M6 |
+| F-21 | `beam listen` prints its invite and pairing code once, at start; a code renewed after ten minutes is not printed. `beam whoami` shows a running `listen`'s invite, current code and its expiry, or why there is no code (in use, paused, off), or that `listen` is not running. A crashed `listen` never leaves a stale code on show (ADR-0037). | post-M6 |
+| F-22 | A joiner whose code did not match is told that the code may have expired, how often codes change, and how to get the current one (ADR-0037). | post-M6 |
+| F-23 | `advertise` in `config.toml` lists addresses to put first in this device's invite, for a public address beam cannot discover (a port forwarded by hand, with no relay). With `relay = "none"`, `listen` waits briefly for a router port mapping before showing the invite (ADR-0038). | post-M6 |
 | F-20 | `beam listen` binds a fixed UDP port (`port` in `config.toml`, default 7820) so its invite stays the same between runs. If the port is taken it uses another and warns (ADR-0036). | post-M6 |
 
 ## 2. Security requirements
@@ -71,6 +74,9 @@ convenience loses.
 | S-22 | ~~The rendezvous server keeps registrations in memory only and does not log requests.~~ — **Withdrawn (ADR-0036)**. There is no server. | M4 |
 | S-31 | An invite is a routing hint, not a credential. An invite whose key was swapped cannot reach the real device and does not spend its code; a wrong address for a paired key cannot redirect a send (ADR-0036). | post-M6 |
 | S-32 | Updating where a paired device is found (F-19) never changes its stored key; a device with a new key is a new pairing (rule 3, ADR-0036). | post-M6 |
+| S-33 | A relay from an invite or a saved `relay=` is used only if it is `https://` on a public host; anything else is dropped. `config.toml` may name any relay (ADR-0038). | post-M6 |
+| S-34 | An address update that would change a paired device's relay is saved only after the person answers yes to a question showing the old and new relay (ADR-0038). | post-M6 |
+| S-35 | Dependencies are audited against the RustSec database on every push, CI's token is read-only, and CI actions are pinned to commit hashes; the latest manual audit is recorded in `SECURITY.md` (ADR-0038). | post-M6 |
 | S-11 | Transfer IDs are random; replayed or expired IDs are rejected. | M2/M3 |
 | S-14 | A partial transfer is matched by (sender fingerprint, file_sha256, size, chunk_size) and never by a sender-supplied transfer ID, so no peer can attach to another peer's partial. | M3 |
 | S-15 | A have-bitmap from a peer is validated — exact length, no bits past the end — and a bad one aborts the transfer rather than being repaired. | M3 |

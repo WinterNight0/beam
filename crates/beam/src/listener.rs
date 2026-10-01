@@ -218,7 +218,8 @@ where
     // network reach this one. With no relay this is immediate.
     let invite = Invite::new(
         &endpoint::advertised_addr(&endpoint, &shared.network.relay, shared.network.bind).await,
-    );
+    )
+    .with_advertised(&shared.network.advertise);
     shared.tell(ListenEvent::Ready {
         invite,
         fingerprint: shared.identity.fingerprint(),

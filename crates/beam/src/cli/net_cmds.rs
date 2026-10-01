@@ -19,6 +19,7 @@ use super::{App, CommandError, Io};
 use crate::config::Config;
 use crate::identity::{Fingerprint, encode_public_key};
 use crate::invite;
+use crate::listen_status::Board;
 use crate::listener::{ListenEvent, ListenOptions};
 use crate::pairing::rotation::NewCodeReason;
 use crate::pairing::{Network, Policy, Timeouts};
@@ -37,6 +38,7 @@ impl App {
             relay: config.relay,
             bind: if loopback { Bind::Loopback } else { Bind::Any },
             port: config.port,
+            advertise: config.advertise,
         })
     }
 
@@ -69,13 +71,25 @@ impl App {
             Err(e) => writeln!(io.err, "beam: warning: could not tidy old partials: {e}")?,
         }
 
+        // `whoami` shows the current pairing code from here on; `listen`
+        // prints it only once (ADR-0037).
+        let policy = Policy::default();
+        let board = Board::claim(&self.store, policy.code_ttl)?;
+        if !board.is_publishing() {
+            writeln!(
+                io.err,
+                "beam: warning: another `beam listen` is already running with this beam home.\n\
+                 beam: warning: `beam whoami` shows that one's pairing code, not this one's."
+            )?;
+        }
+
         let desk = PromptDesk::terminal(Keyboard::start());
         let prompt = DeskPrompt::new(desk.clone(), DEFAULT_ACCEPT_TIMEOUT);
         let options = ListenOptions {
             out_dir: out_dir.clone(),
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
             stall_timeout: crate::transfer::engine::DEFAULT_STALL_TIMEOUT,
-            pairing: Policy::default(),
+            pairing: policy,
             timeouts: Timeouts::default(),
         };
         let json = self.json;
@@ -84,6 +98,7 @@ impl App {
             out_dir: out_dir.display().to_string(),
             store: self.store.clone(),
             desk: desk.clone(),
+            board: std::sync::Mutex::new(board),
         };
 
         let runtime = self.runtime()?;
@@ -271,6 +286,8 @@ struct Screen {
     /// lands in the middle of an open question without the question being
     /// drawn again (M6 item 5).
     desk: PromptDesk,
+    /// Keeps `listen.json` current for `beam whoami` (ADR-0037).
+    board: std::sync::Mutex<Board>,
 }
 
 impl Screen {
@@ -278,6 +295,12 @@ impl Screen {
         // Warnings and information share the one screen the desk manages.
         let mut text = Vec::new();
         let mut warnings = Vec::new();
+        if let Err(e) = self.board.lock().expect("not poisoned").on_event(&event) {
+            let _ = writeln!(
+                warnings,
+                "beam: warning: could not update the status `beam whoami` reads: {e}"
+            );
+        }
         let _ = self.write(event, &mut text, &mut warnings);
         text.extend_from_slice(&warnings);
         let text = String::from_utf8_lossy(&text);
@@ -327,7 +350,8 @@ impl Screen {
                 )?;
                 writeln!(
                     out,
-                    "The pairing code works once and changes every 10 minutes."
+                    "The pairing code works once and changes every 10 minutes; \
+                     `beam whoami` shows the current one."
                 )?;
                 writeln!(
                     out,
@@ -339,15 +363,19 @@ impl Screen {
                 "beam: warning: port {wanted} is in use, so this is listening on port {got}.\n\
                  beam: warning: peers that saved the old address need the new invite, unless the relay reaches them."
             ),
-            ListenEvent::NewCode { code, reason } => {
-                let why = match reason {
-                    NewCodeReason::Start => "",
-                    NewCodeReason::Used => " (the last one was used)",
-                    NewCodeReason::Expired => " (the last one expired)",
-                    NewCodeReason::CooledDown => " (pairing is back on)",
-                };
-                writeln!(out, "New pairing code: {}{why}", code.grouped())
-            }
+            // A new code is not printed (ADR-0037): it changes every ten
+            // minutes, and printing each one buried long transfers. After an
+            // attempt, a short line says where to find it.
+            ListenEvent::NewCode { reason, .. } => match reason {
+                NewCodeReason::Start | NewCodeReason::Expired => Ok(()),
+                NewCodeReason::Used => writeln!(
+                    out,
+                    "The pairing code was used; `beam whoami` shows the new one."
+                ),
+                NewCodeReason::CooledDown => {
+                    writeln!(out, "Pairing is back on; `beam whoami` shows the new code.")
+                }
+            },
             ListenEvent::PairingPaused { failures, wait } => writeln!(
                 out,
                 "Pairing paused for {} s after a failed attempt ({failures} of 3).",

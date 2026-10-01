@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
 use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, presets};
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey, Watcher};
 
 use crate::config::Relay;
 use crate::identity::Identity;
@@ -41,6 +41,11 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long to wait for the relay before announcing direct addresses only.
 const RELAY_WAIT: Duration = Duration::from_secs(10);
+
+/// With no relay, how long to wait for the router to report a port mapping
+/// (UPnP, NAT-PMP, PCP). That mapping is the only public address a device
+/// can learn without a relay (ADR-0038).
+const PORTMAP_WAIT: Duration = Duration::from_secs(3);
 
 /// Where the endpoint's UDP socket is bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -150,8 +155,27 @@ pub fn bound_port(endpoint: &Endpoint) -> Option<u16> {
 /// relay URL is included. If the relay cannot be reached the address still
 /// carries the direct addresses, which is enough on a LAN.
 pub async fn advertised_addr(endpoint: &Endpoint, relay: &Relay, bind: Bind) -> EndpointAddr {
-    if let Relay::Url(_) = relay {
-        let _ = tokio::time::timeout(RELAY_WAIT, endpoint.online()).await;
+    match (relay, bind) {
+        (Relay::Url(_), _) => {
+            let _ = tokio::time::timeout(RELAY_WAIT, endpoint.online()).await;
+        }
+        // No relay to learn a public address from: give the router's port
+        // mapping a moment to appear, if the router offers one.
+        (Relay::Disabled, Bind::Any) => {
+            let mut watcher = endpoint.watch_addr();
+            let _ = tokio::time::timeout(PORTMAP_WAIT, async {
+                loop {
+                    if watcher.get().ip_addrs().any(|a| is_public(a.ip())) {
+                        break;
+                    }
+                    if watcher.updated().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        (Relay::Disabled, Bind::Loopback) => {}
     }
     let addr = endpoint.addr();
     match bind {
@@ -165,6 +189,30 @@ pub async fn advertised_addr(endpoint: &Endpoint, relay: &Relay, bind: Bind) -> 
                 }
             }
             only_loopback
+        }
+    }
+}
+
+/// Whether an address is reachable from the internet: not loopback,
+/// private, link-local, carrier-grade NAT (100.64.0.0/10), unique-local or
+/// unspecified.
+pub fn is_public(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (a == 100 && (64..128).contains(&b)))
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local())
         }
     }
 }
@@ -212,6 +260,29 @@ mod tests {
         );
         assert!(addr.ip_addrs().next().is_some(), "{addr:?} is not dialable");
         endpoint.close().await;
+    }
+
+    #[test]
+    fn only_internet_reachable_addresses_count_as_public() {
+        for public in ["8.8.8.8", "202.28.63.1", "2001:4860::8888"] {
+            assert!(is_public(public.parse().unwrap()), "{public}");
+        }
+        for local in [
+            "10.0.0.5",
+            "192.168.1.20",
+            "172.16.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "0.0.0.0",
+            "203.0.113.7",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+        ] {
+            assert!(!is_public(local.parse().unwrap()), "{local}");
+        }
     }
 
     #[tokio::test]

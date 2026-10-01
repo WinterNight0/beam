@@ -1030,6 +1030,19 @@ mod over_iroh {
         listener.wait_for("Waiting for transfers");
         let invite = listener.field("Invite");
 
+        // ADR-0037: `whoami` shows what the running `listen` offers.
+        let shown = beam(&bob, &["whoami"]);
+        assert!(shown.contains("beam listen is running"), "{shown}");
+        assert!(shown.contains(&invite), "{shown}");
+        let digits = |text: &str| -> String {
+            let line = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("Pairing code"))
+                .unwrap_or_else(|| panic!("no Pairing code line in:\n{text}"));
+            line.chars().filter(|c| c.is_ascii_digit()).collect()
+        };
+        assert_eq!(digits(&shown), digits(&listener.seen));
+
         // First attempt: bob answers `y`, which is not a yes to pairing.
         let code = listener.field("Pairing code");
         let mut joiner = Watched::spawn(&alice, &["pair", &invite, "--name", "bob", "--loopback"]);
@@ -1048,21 +1061,19 @@ mod over_iroh {
         assert!(!peers.contains(&public_key_of(&alice)), "{peers}");
 
         // A proved code that was then refused is not a guess: a new code is
-        // issued at once. With `yes`, pairing goes through.
-        // Wait for the whole line: output arrives byte by byte.
-        listener.wait_for("(the last one was used)");
-        let line = listener
-            .seen
-            .lines()
-            .rev()
-            .find(|l| l.starts_with("New pairing code:"))
-            .unwrap()
-            .to_string();
-        let code: String = line
-            .trim_start_matches("New pairing code:")
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect();
+        // issued at once. `listen` does not print it (ADR-0037); it says
+        // where to find it, and `whoami` shows it. With `yes`, pairing goes
+        // through.
+        listener.wait_for("`beam whoami` shows the new one.");
+        let code = digits(&beam(&bob, &["whoami"]));
+        assert_eq!(code.len(), 6, "{code:?}");
+        assert_ne!(code, digits(&listener.seen), "the code did not change");
+        let grouped = format!("{} {}", &code[..3], &code[3..]);
+        assert!(
+            !listener.seen.contains(&grouped),
+            "listen printed the new code:\n{}",
+            listener.seen
+        );
         let mut joiner = Watched::spawn(&alice, &["pair", &invite, "--name", "bob", "--loopback"]);
         joiner.wait_for("Pairing code shown on the other device: ");
         joiner.answer(&code);
