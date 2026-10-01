@@ -211,18 +211,8 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
- "tokio-websockets",
  "toml",
  "zeroize",
-]
-
-[[package]]
-name = "beam-server"
-version = "0.1.0"
-dependencies = [
- "beam",
- "clap",
- "tokio",
 ]
 
 [[package]]
@@ -3201,7 +3191,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
- "webpki-roots",
 ]
 
 [[package]]

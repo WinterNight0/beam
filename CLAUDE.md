@@ -1,15 +1,20 @@
 # Beam — Identity-Based P2P File Transfer (CLI)
 
 University Software Engineering project. Beam is a terminal-only tool that sends files
-directly between two computers (peer-to-peer). A small server only helps peers find each
-other; file data must not be stored on or normally routed through the server.
+directly between two computers (peer-to-peer). File data must not be stored on or normally
+routed through any server.
+
+> **Branch `main-test`: no rendezvous server (ADR-0036).** Peers meet through an *invite*
+> (key + relay + direct addresses, pasted once) and are found again by key through the
+> relay. The `rendezvous` module and `beam-server` crate are gone. `main` keeps the
+> rendezvous design. Where this file and ADR-0036 disagree on this branch, ADR-0036 wins.
 
 ## Core user experience
 
 ```
 beam init                      # generate device keypair (once per machine)
-beam listen                    # wait for transfers; shows short ID + pairing code
-beam pair <ID> --name alice    # first-time pairing using ID + pairing code
+beam listen                    # wait for transfers; shows invite + pairing code
+beam pair <INVITE> --name alice  # first-time pairing using invite + pairing code
 beam pair --wait --name bob    # pair without also receiving files
 beam send alice project.zip    # send a file to a paired peer
 beam peers                     # list paired peers + fingerprints
@@ -55,7 +60,10 @@ beam whoami                    # show own ID + fingerprint
   cannot exist without the peer proving possession of its private key. There is no
   Noise KK layer; see ADR-0025 for what replaced it.
 - Async runtime: `tokio`, introduced at M2 with the transfer engine.
-- Rendezvous server: Rust + WebSocket. Maps a Short ID to an iroh endpoint address.
+- Rendezvous server: **none on this branch** (ADR-0036). The invite carries the
+  address for the first meeting; afterwards a peer is dialled by key through its relay
+  and at the addresses saved in `known_peers` (`relay=`, `addrs=`). `listen` binds a
+  fixed UDP port (`port` in `config.toml`, default 7820) so its invite stays stable.
   **beam does not use n0's discovery service**; see `docs/n0-data.md`.
 - Relay: configurable. n0's relay during development, self-hosted `iroh-relay` later.
 - Local storage: files under `~/.beam/` (plain text / JSON); SQLite only if needed later.
@@ -65,9 +73,11 @@ beam whoami                    # show own ID + fingerprint
 - `~/.beam/id_ed25519` (private, file mode 0600), `~/.beam/id_ed25519.pub`
 - `~/.beam/known_peers` — one line per peer: `name  ed25519 <base64 pubkey>  added=<date>`
 - **Fingerprint** = SHA-256 of the public key. The server routes by full fingerprint.
-- **Short ID** (9 digits) is derived from the fingerprint and used ONLY for the first
-  pairing lookup. It is a routing hint, not a security guarantee; security comes from PAKE
-  during pairing and the full stored public key afterwards.
+- **Invite** (`beam1…`, base32) carries the key, relay and direct addresses for the
+  first pairing. Like the Short ID it replaced, it is a routing hint, not a security
+  guarantee; security comes from PAKE during pairing and the full stored public key
+  afterwards. The 9-digit **Short ID** is still derived from the fingerprint and bound
+  into the SPAKE2 transcript.
 - Names like `alice` are local nicknames only. There is no global username registry.
 
 ## Transfer protocol (stateful)

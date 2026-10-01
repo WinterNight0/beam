@@ -12,35 +12,35 @@
 //! Every question to the person at the keyboard goes through one prompt, which
 //! the CLI backs with the desk that shows one question at a time (S-24).
 //!
+//! Nothing registers anywhere. `listen` shows an invite — its key, relay and
+//! direct addresses — and paired peers reach it by its key through its relay
+//! or at the addresses they saved (ADR-0036).
+//!
 //! The service lives in the library, not the CLI, so that tests can run it
-//! against real iroh endpoints and a real rendezvous server.
+//! against real iroh endpoints.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::config::Relay;
-use crate::identity::{Fingerprint, Identity, Peer, ShortId, Store};
+use crate::identity::{Fingerprint, Identity, Peer, Store};
+use crate::invite::Invite;
 use crate::pairing::rotation::{NewCodeReason, Notice, Policy, Rotation, Unavailable};
 use crate::pairing::{
     Confirm, Network, Pairing, PairingCode, Timeouts, attempt_kind, refuse_connection, serve,
 };
-use crate::rendezvous::{REFRESH_EVERY, RendezvousClient};
 use crate::transfer::{
     Prompt, ReceiveOptions, ReceiveSummary, RejectReason, Reporter, TransferId, receive_file,
     turn_away,
 };
 use crate::transport::dial::watch_route;
 use crate::transport::endpoint::{self, EndpointError, PAIR_ALPN, XFER_ALPN, verifying_key};
-
-/// How long to wait before trying the rendezvous server again after it failed.
-const RETRY_EVERY: Duration = Duration::from_secs(5);
 
 /// How long to wait for the peer to close after the last message, so that
 /// message is not cut off by our own close.
@@ -64,17 +64,20 @@ pub struct ListenOptions {
 /// Something worth telling the person watching `listen`.
 #[derive(Clone, Debug)]
 pub enum ListenEvent {
-    /// Listening, registered or not; the first code, if pairing is on.
+    /// Listening: the invite to give a new device, and the first code.
     Ready {
-        short_id: ShortId,
+        invite: Invite,
         fingerprint: Fingerprint,
         code: PairingCode,
         relay: Relay,
     },
-    /// The rendezvous server could not be reached or refused us; retrying.
-    RegistrationFailed(String),
-    /// Registered again after a failure.
-    Registered,
+    /// The configured port was taken, so `listen` is on another one. Its
+    /// invite works, but peers that saved the old address will reach it only
+    /// through the relay until they get the new invite.
+    PortTaken {
+        wanted: u16,
+        got: u16,
+    },
     NewCode {
         code: PairingCode,
         reason: NewCodeReason,
@@ -174,9 +177,12 @@ where
         &identity,
         &network.relay,
         network.bind,
+        network.port,
         &[PAIR_ALPN, XFER_ALPN],
     )
     .await?;
+    let got = endpoint::bound_port(&endpoint).unwrap_or(0);
+    let port_taken = (network.port != 0 && got != network.port).then_some(got);
     let (rotation, first) =
         Rotation::start(options.pairing, Instant::now()).map_err(ListenError::Random)?;
     let Notice::NewCode { code, .. } = first else {
@@ -198,22 +204,23 @@ where
 
     // Dropping the set aborts everything in it, so nothing outlives `run`.
     let mut tasks = JoinSet::new();
-    let (first_attempt, registered) = tokio::sync::oneshot::channel();
-    tasks.spawn(keep_registered(
-        Arc::clone(&shared),
-        endpoint.clone(),
-        first_attempt,
-    ));
     tasks.spawn(tick_codes(Arc::clone(&shared)));
 
-    // Only say "ready" once the first registration has been tried: before
-    // that, nobody can find this device, and a Short ID shown too early sends
-    // the other person to "nobody is waiting". With a relay this takes a few
-    // seconds, because the relay's address is part of the registration.
-    let _ = registered.await;
+    if let Some(got) = port_taken {
+        shared.tell(ListenEvent::PortTaken {
+            wanted: shared.network.port,
+            got,
+        });
+    }
 
+    // The invite is only shown once the relay has had a chance to connect:
+    // the relay URL is part of it, and is what lets a device on another
+    // network reach this one. With no relay this is immediate.
+    let invite = Invite::new(
+        &endpoint::advertised_addr(&endpoint, &shared.network.relay, shared.network.bind).await,
+    );
     shared.tell(ListenEvent::Ready {
-        short_id: shared.identity.short_id(),
+        invite,
         fingerprint: shared.identity.fingerprint(),
         code,
         relay: shared.network.relay.clone(),
@@ -237,50 +244,6 @@ where
         });
     }
     Ok(())
-}
-
-/// Registers with the rendezvous server and keeps the registration fresh,
-/// reconnecting when the server goes away.
-///
-/// `first_attempt` fires once the first attempt has succeeded or failed.
-async fn keep_registered<Q, R>(
-    shared: Arc<Shared<Q, R>>,
-    endpoint: Endpoint,
-    first_attempt: tokio::sync::oneshot::Sender<()>,
-) {
-    let network = &shared.network;
-    let mut failing = false;
-    let mut first_attempt = Some(first_attempt);
-    loop {
-        let result = async {
-            let mut client = RendezvousClient::connect(&network.rendezvous).await?;
-            loop {
-                let addr = endpoint::advertised_addr(&endpoint, &network.relay, network.bind).await;
-                client.register(&shared.identity, &addr).await?;
-                if let Some(first) = first_attempt.take() {
-                    let _ = first.send(());
-                }
-                if failing {
-                    failing = false;
-                    shared.tell(ListenEvent::Registered);
-                }
-                tokio::time::sleep(REFRESH_EVERY).await;
-            }
-        }
-        .await;
-        let error: crate::rendezvous::RendezvousError = match result {
-            Ok(()) => unreachable!("the refresh loop only ends with an error"),
-            Err(e) => e,
-        };
-        if !failing {
-            failing = true;
-            shared.tell(ListenEvent::RegistrationFailed(error.to_string()));
-        }
-        if let Some(first) = first_attempt.take() {
-            let _ = first.send(());
-        }
-        tokio::time::sleep(RETRY_EVERY).await;
-    }
 }
 
 /// Renews an expired code and ends a cool-down, once a second.

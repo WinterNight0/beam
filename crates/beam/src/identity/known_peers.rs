@@ -128,6 +128,42 @@ impl Peer {
     pub fn added_rfc3339(&self) -> Option<String> {
         self.added.and_then(|t| t.format(&Rfc3339).ok())
     }
+
+    /// The value of a `key=value` attribute, if the line has one.
+    pub fn attr(&self, key: &str) -> Option<&str> {
+        self.extra
+            .iter()
+            .find(|a| a.key == key)
+            .map(|a| a.value.as_str())
+    }
+
+    /// Sets an attribute, or removes it with `None`.
+    ///
+    /// `key` must be a valid attribute key and `value` must not contain
+    /// whitespace, or the file would not parse back; both are the caller's
+    /// constants and checked here in debug builds.
+    pub fn set_attr(&mut self, key: &str, value: Option<String>) {
+        debug_assert!(
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                && key != "added"
+        );
+        match value {
+            Some(value) => {
+                debug_assert!(!value.is_empty() && !value.chars().any(char::is_whitespace));
+                match self.extra.iter_mut().find(|a| a.key == key) {
+                    Some(attr) => attr.value = value,
+                    None => self.extra.push(Attr {
+                        key: key.to_string(),
+                        value,
+                    }),
+                }
+            }
+            None => self.extra.retain(|a| a.key != key),
+        }
+    }
 }
 
 /// Either a peer entry or a verbatim comment/blank line.
@@ -276,6 +312,15 @@ impl KnownPeers {
     /// Finds a peer by public key.
     pub fn lookup_key(&self, key: &VerifyingKey) -> Option<&Peer> {
         self.peers().into_iter().find(|p| p.public_key == *key)
+    }
+
+    /// Finds a peer by public key, to change what is stored about it. The key
+    /// itself is never changed this way: a new key means pairing again.
+    pub fn lookup_key_mut(&mut self, key: &VerifyingKey) -> Option<&mut Peer> {
+        self.lines.iter_mut().find_map(|l| match l {
+            Line::Peer(p) if p.public_key == *key => Some(p.as_mut()),
+            _ => None,
+        })
     }
 
     fn index_of(&self, name: &str) -> Option<usize> {
@@ -609,5 +654,26 @@ mod tests {
         ] {
             assert!(validate_name(name).is_err(), "accepted {name:?}");
         }
+    }
+
+    #[test]
+    fn attributes_can_be_set_replaced_and_removed_and_round_trip() {
+        let mut known = KnownPeers::parse(&line_for(0, "alice")).unwrap();
+        let key = verifying_key("alpha");
+        {
+            let alice = known.lookup_key_mut(&key).expect("alice");
+            alice.set_attr("relay", Some("https://relay.example.org/".into()));
+            alice.set_attr("addrs", Some("192.168.1.5:7820".into()));
+            alice.set_attr("addrs", Some("192.168.1.6:7820".into()));
+        }
+        let again = KnownPeers::parse(&known.render()).unwrap();
+        let alice = again.lookup("alice").unwrap();
+        assert_eq!(alice.attr("relay"), Some("https://relay.example.org/"));
+        assert_eq!(alice.attr("addrs"), Some("192.168.1.6:7820"));
+        assert_eq!(alice.public_key, key, "the key is untouched");
+
+        known.lookup_key_mut(&key).unwrap().set_attr("relay", None);
+        assert_eq!(known.lookup("alice").unwrap().attr("relay"), None);
+        assert!(known.lookup_key_mut(&verifying_key("bravo")).is_none());
     }
 }

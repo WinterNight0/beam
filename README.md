@@ -2,10 +2,14 @@
 
 Identity-based peer-to-peer file transfer for the terminal.
 
-beam sends a file straight from one computer to another. A small rendezvous
-server only helps two devices find each other — it never sees your files. Every
-incoming transfer has to be accepted by hand, and only peers you have paired
-with can ask.
+beam sends a file straight from one computer to another. There is no server
+to set up: two devices meet once through an *invite* you paste to the other
+person, and find each other again by key through a relay that only ever carries
+encrypted data. Every incoming transfer has to be accepted by hand, and only
+peers you have paired with can ask.
+
+> **Branch `main-test`:** this branch has no rendezvous server (ADR-0036 in
+> [docs/decisions.md](docs/decisions.md)). `main` keeps the server-based design.
 
 > **Status: milestone M6.** Pairing and file transfer run over iroh: encrypted
 > end to end, direct when possible and through a relay when not, with each
@@ -34,20 +38,18 @@ powershell -ExecutionPolicy Bypass -File scripts\check.ps1
 
 ```
 beam init                      # generate this device's keypair (once per machine)
-beam whoami                    # show your Short ID and fingerprint
+beam whoami                    # show your fingerprint
 beam peers                     # list paired peers
 beam rename alice ali          # change a local nickname
 beam remove alice              # forget a peer
 
-beam listen                    # wait for transfers and pairing: shows Short ID + code
+beam listen                    # wait for transfers and pairing: shows invite + code
 beam send alice project.zip    # send a file to a paired peer
 beam transfers                 # list partly received transfers
 beam transfers --clear         # discard them
 
-beam pair <ID> --name bob      # pair with a listening device, typing its code
+beam pair <INVITE> --name bob  # pair with a listening device, typing its code
 beam pair --wait --name alice  # pair without also receiving files
-
-beam-server                    # the rendezvous server
 ```
 
 `listen` saves into the current directory unless given `--out <dir>`. Its
@@ -57,13 +59,16 @@ in a row it stops offering pairing until it is restarted.
 Global flags: `--beam-dir <path>` (default `$BEAM_DIR`, else `~/.beam`) and
 `--json` for machine-readable output.
 
-Where the rendezvous server and the relay are is set in `~/.beam/config.toml`,
-which is optional:
+There is nothing to configure. `~/.beam/config.toml` exists only to change the
+defaults:
 
 ```toml
-rendezvous = "ws://127.0.0.1:8787/v1"            # the default: beam-server on this machine
-relay      = "https://aps1-1.relay.n0.iroh.link./"  # the default; or "none"
+relay = "https://aps1-1.relay.n0.iroh.link./"  # the default; or "none"
+port  = 7820                                   # UDP port `listen` uses; 0 = random
 ```
+
+With `relay = "none"`, only devices that can reach each other directly work: the
+same LAN, a shared VPN (Radmin VPN, ZeroTier, Tailscale…), or a public address.
 
 beam never uses n0's discovery service; the relay is the only n0 infrastructure
 it touches, and only if you leave the default. See [docs/n0-data.md](docs/n0-data.md).
@@ -71,8 +76,7 @@ it touches, and only if you leave the default. See [docs/n0-data.md](docs/n0-dat
 ## Trying it on one machine
 
 Both devices can live on one machine: give each its own beam home with
-`BEAM_DIR`. You need three terminals — the rendezvous server, and one for each
-device.
+`BEAM_DIR`. You need two terminals, one for each device.
 
 **Set up, once.**
 
@@ -88,12 +92,6 @@ Offline, the default relay cannot be reached and beam spends ten seconds
 finding that out each time it starts. To skip it, put `relay = "none"` in
 `alice/config.toml` and `bob/config.toml`.
 
-**Terminal 0 — the rendezvous server.** It only introduces the two devices.
-
-```bash
-beam-server              # listens on ws://127.0.0.1:8787/v1, beam's default
-```
-
 **Terminal 1 — bob listens.** One command waits for both pairing and files:
 
 ```bash
@@ -101,22 +99,27 @@ cd /tmp/beam-demo && BEAM_DIR=$PWD/bob beam listen --out $PWD/inbox
 ```
 
 ```
-  Short ID      690 340 153
+  Invite        beam1ahbhrwknvsrckecrobv6oheburq4l4hoceutaw2lf36qf3p3nh5ywaifaqfcbjhyd2gai...
   Pairing code  685 821
   Fingerprint   SHA256:10a44acf76456739...
   Relay         https://aps1-1.relay.n0.iroh.link./
   Saving to     /tmp/beam-demo/inbox
 
-To pair a new device, run on it:  beam pair 690340153 --name <a name for this one>
+To pair a new device, send it the invite and run on it:  beam pair <invite> --name <a name for this one>
 The pairing code works once and changes every 10 minutes.
 Waiting for transfers. Every one has to be accepted by hand. Ctrl+C to stop.
 ```
 
-**Terminal 2 — alice pairs with bob**, using the Short ID from terminal 1, and
+The invite holds bob's public key, his relay and his addresses. Send it to the
+other person any way you like — chat, email, LINE. It is not a secret: it only
+says where bob is, and pairing still needs the code and both people saying yes.
+With `port` fixed (the default), it stays the same each time `listen` starts.
+
+**Terminal 2 — alice pairs with bob**, pasting the invite from terminal 1, and
 types the code when asked:
 
 ```bash
-cd /tmp/beam-demo && BEAM_DIR=$PWD/alice beam pair 690340153 --name bob
+cd /tmp/beam-demo && BEAM_DIR=$PWD/alice beam pair beam1ahbhrwkn... --name bob
 ```
 
 Both terminals then show the pairing question. It looks deliberately unlike the
@@ -183,12 +186,6 @@ $bytes = New-Object byte[] (5MB)
 [System.IO.File]::WriteAllBytes("$demo\payload.bin", $bytes)
 ```
 
-**Terminal 0 — the rendezvous server.**
-
-```powershell
-beam-server
-```
-
 **Terminal 1 — bob listens.**
 
 ```powershell
@@ -197,13 +194,13 @@ $env:BEAM_DIR = "$demo\bob"
 beam listen --out "$demo\inbox"
 ```
 
-**Terminal 2 — alice pairs, then sends.** Use the Short ID from terminal 1 and
+**Terminal 2 — alice pairs, then sends.** Paste the invite from terminal 1 and
 type the code when asked; type `yes` in both terminals at the pairing question.
 
 ```powershell
 $demo = "$env:USERPROFILE\beam-demo"
 $env:BEAM_DIR = "$demo\alice"
-beam pair <bob's Short ID> --name bob
+beam pair <bob's invite> --name bob
 beam send bob "$demo\payload.bin"
 ```
 
@@ -233,12 +230,10 @@ a byte-order mark; beam skips it. The table below applies unchanged.
 | Start pairing while a file prompt is open | The pairing question waits until the file question is answered — one question on screen at a time — and still expires 60 s after it arrived |
 | Pipe the answer: `echo y \| beam listen ...` | It does **not** work, on purpose. Each question discards anything typed before it appeared |
 | `beam remove alices-laptop` on bob, then send from alice | Bob refuses without a prompt, and alice is told bob does not recognise her key and how to re-pair |
-| Run `beam init --force` on bob, then send from alice | alice is told bob is not reachable — either not listening or re-initialised — and how to re-pair |
+| Run `beam init --force` on bob, then send from alice | alice is told bob is not reachable — not listening, moved, or re-initialised — and how to update the address or re-pair |
+| Run `beam pair <bob's invite> --name bob` again on alice | Nothing is asked: alice only updates where to find bob. His key is never changed this way |
 | Kill the sender mid-transfer with Ctrl+C, then send again | `listen` notices within 15 s. The second run says `(resuming)` and `Already have`, sends only the rest, and the finished file still matches |
-| Stop `beam-server` while `listen` runs | `listen` warns that it cannot register and keeps retrying; start the server again and it re-registers by itself |
-
-To run the server somewhere other people can reach it — behind `wss://` on a
-VPS or through Cloudflare Tunnel — see [docs/deploy.md](docs/deploy.md).
+| Start a second `listen` while one runs | It warns that port 7820 is taken and uses another; its invite still works |
 
 ## Resuming
 
@@ -306,12 +301,12 @@ relay, if one is used, carries ciphertext.
 
 What is still true, and worth knowing:
 
-- **The rendezvous server knows when you are online.** While `beam listen`
-  runs, the server holds your public key and IP addresses, and sees who looks
-  you up. It cannot forge anything or make you pair with the wrong device, but
-  it is a server someone runs; see [docs/deploy.md](docs/deploy.md) and
-  [docs/n0-data.md](docs/n0-data.md).
-- **A relay sees that two keys talk, when, and how much** — not what.
+- **The relay knows when you are online.** While `beam listen` runs, it is
+  connected to the relay under its public key, and the relay sees that two
+  keys talk, when, and how much — not what. See [docs/n0-data.md](docs/n0-data.md).
+- **An invite shows your addresses** to whoever reads it. It cannot make anyone
+  pair with the wrong device: the connection proves the key, and pairing needs
+  the code and both fingerprints confirmed.
 - **Pairing trusts the fingerprint check.** Someone who learns your code and
   connects first reaches the pairing question as themselves. That is why the
   question shows both fingerprints and needs `yes` typed in full.
@@ -341,7 +336,7 @@ Everything lives in `~/.beam/`:
 id_ed25519        private key, PEM-wrapped PKCS#8, mode 0600 — never leaves this device
 id_ed25519.pub    ed25519 <base64 key> <comment>
 known_peers       one peer per line; the trust root for receiving
-config.toml       optional: where the rendezvous server and relay are
+config.toml       optional: the relay, and the port `listen` uses
 tmp/<id>/         a transfer in progress: state.json, part, hashes, lock
 ```
 
@@ -359,8 +354,11 @@ when it should not be.
 
 ```
 # beam known_peers v1
-alice  ed25519 4V1sbBWRwKcMoCdgmMZSy3enESln8Qgij/DzRjafNjs=  added=2026-09-24T12:00:00Z
+alice  ed25519 4V1sbBWRwKcMoCdgmMZSy3enESln8Qgij/DzRjafNjs=  added=2026-09-24T12:00:00Z addrs=192.168.1.20:7820
 ```
+
+`addrs=` (and `relay=`, when a peer uses a different relay) is where the peer's
+invite said it can be found. Only *where* is ever updated this way, never the key.
 
 Comments, blank lines and attributes beam does not recognise survive edits. A
 malformed line is a hard error naming the line number — a peer entry is never
@@ -371,9 +369,13 @@ silently dropped.
 **Fingerprint** — `SHA256:` plus the SHA-256 of your public key. This is the
 thing to compare out of band, and what both screens show when pairing.
 
-**Short ID** — 9 digits derived from the fingerprint, for reading aloud during
-the very first pairing. It is a lookup hint, not a security guarantee: security
-comes from the PAKE during pairing and from the stored public key afterwards.
+**Invite** — `beam1…`, the public key, relay and direct addresses of a device
+waiting to pair, for pasting to the other person once. It is a routing hint, not
+a security guarantee: security comes from the PAKE during pairing and from the
+stored public key afterwards.
+
+**Short ID** — 9 digits derived from the fingerprint. The pairing code is bound
+to it inside the PAKE.
 
 ## The rules beam will not bend
 
@@ -395,13 +397,12 @@ crates/beam/
   src/cli/             command definitions
   src/identity/        keys, fingerprints, Short IDs, known_peers, store
   src/pairing/         pairing codes, SPAKE2 + key confirmation, the two roles
-  src/rendezvous/      rendezvous protocol, server and client
+  src/invite.rs        invites, and where a paired peer is found
   src/transfer/        protocol, state machine, chunking, resume, integrity
   src/transport/       iroh endpoint; the M2 TCP stand-in
   src/config.rs        ~/.beam/config.toml
   src/ui.rs            terminal output helpers
   tests/               command, integration and two-process tests
-crates/beam-server/    the rendezvous server binary
 docs/                  requirements, design decisions, test plan
 ```
 

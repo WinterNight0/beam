@@ -94,8 +94,8 @@ struct Cli {
 enum Command {
     /// Generate this device's identity keypair
     ///
-    /// The private key never leaves this machine and is never sent to the
-    /// rendezvous server. Run this once per machine.
+    /// The private key never leaves this machine and is never sent anywhere.
+    /// Run this once per machine.
     Init {
         /// Replace an existing identity (invalidates every existing pairing)
         #[arg(long)]
@@ -133,25 +133,29 @@ enum Command {
 
     /// Pair with another device for the first time
     ///
-    /// One device waits and shows its Short ID and a pairing code:
+    /// One device runs `beam listen` (or `beam pair --wait --name <a name for
+    /// the other device>`) and shows an invite and a pairing code. Send the
+    /// invite to the other person any way you like; on their device they run
     ///
-    ///   beam pair --wait --name <a name for the other device>
+    ///   beam pair <INVITE> --name <a name for the waiting device>
     ///
-    /// The other looks it up and types the code:
+    /// and type the code. Both people then compare fingerprints and confirm.
+    /// The code works for one attempt and expires after ten minutes.
     ///
-    ///   beam pair <SHORT ID> --name <a name for the waiting device>
-    ///
-    /// Both people then compare fingerprints and confirm. The code works for
-    /// one attempt and expires after ten minutes. In M5 waiting moves into
-    /// `beam listen`.
+    /// Given the invite of a device that is already paired, this only updates
+    /// where to find it. Its key never changes this way.
     Pair {
-        /// The other device's 9-digit Short ID
-        #[arg(required_unless_present = "wait", conflicts_with = "wait")]
-        short_id: Option<String>,
+        /// The invite the other device shows (starts with "beam1")
+        #[arg(
+            value_name = "INVITE",
+            required_unless_present = "wait",
+            conflicts_with = "wait"
+        )]
+        invite: Option<String>,
         /// Local nickname to store the other device under
         #[arg(long)]
         name: String,
-        /// Wait for the other device, showing this device's Short ID and a
+        /// Wait for the other device, showing this device's invite and a
         /// pairing code
         #[arg(long)]
         wait: bool,
@@ -163,7 +167,7 @@ enum Command {
 
     /// Wait for incoming transfers and pairing requests
     ///
-    /// Shows this device's Short ID and a pairing code. The code works for one
+    /// Shows this device's invite and a pairing code. The code works for one
     /// attempt and changes every ten minutes; after three failed attempts,
     /// pairing is off until `listen` is restarted. Every incoming file has to
     /// be accepted by hand.
@@ -308,11 +312,11 @@ impl App {
             Command::Rename { old_name, new_name } => self.rename(&old_name, &new_name, io),
             Command::Remove { name, yes } => self.remove(&name, yes, io),
             Command::Pair {
-                short_id,
+                invite,
                 name,
                 wait,
                 loopback,
-            } => self.pair(short_id.as_deref(), &name, wait, loopback, io),
+            } => self.pair(invite.as_deref(), &name, wait, loopback, io),
             Command::Listen {
                 addr,
                 out,

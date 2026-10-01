@@ -1,12 +1,12 @@
-//! First-time pairing: turning a Short ID and a six-digit code into a public
+//! First-time pairing: turning an invite and a six-digit code into a public
 //! key in `known_peers`, on both devices, with both people's consent.
 //!
 //! * [`code`] — the code, and the single-use, ten-minute rules.
 //! * [`protocol`] — SPAKE2 and key confirmation, over any byte stream.
-//! * [`session`] — the two roles over the rendezvous server and iroh.
+//! * [`session`] — the two roles over iroh, starting from an invite.
 //!
-//! In M4 the waiting side runs `beam pair --wait`. In M5 that waiting moves
-//! into `beam listen`, next to incoming transfers. See ADR-0026 and ADR-0028.
+//! The waiting side runs `beam listen` (or `beam pair --wait`); the joiner
+//! runs `beam pair <INVITE>`. See ADR-0026, ADR-0028 and ADR-0036.
 
 pub mod code;
 pub mod protocol;

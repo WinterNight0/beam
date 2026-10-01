@@ -1018,7 +1018,7 @@ in its own commit.
 
 ## ADR-0027 — The rendezvous server: signed registrations, and why it need not be trusted
 
-**Status:** accepted (M4)
+**Status:** accepted (M4), superseded on the `main-test` branch by ADR-0036
 
 **Context.** `beam pair <ID>` needs to turn a Short ID into an iroh endpoint
 address. beam does not use n0's DNS discovery (ADR-0025, S-17), so it runs its
@@ -1535,3 +1535,120 @@ cannot break a question either.
 
 The desk waits for the keyboard in 50 ms slices so that notices are shown
 promptly; a question still gets its whole deadline.
+
+---
+
+## ADR-0036 — No rendezvous server: invites, and peers found by key through the relay
+
+**Status:** proposed, on the `main-test` branch. Supersedes ADR-0027 there;
+amends ADR-0026, ADR-0029 and ADR-0031.
+
+**Context.** The rendezvous server (ADR-0027) is the one piece of beam that
+someone has to run. There is no public one, so the default in `config.toml`
+points at `127.0.0.1`, and two people on different machines have to set up a
+server and edit `config.toml` on both sides before they can pair. That is the
+opposite of what beam is for: an easy, all-in-one peer-to-peer tool.
+
+Two facts make the server unnecessary:
+
+1. **iroh can reach a peer with just its key and its home relay URL.** The
+   relay forwards by endpoint id, and iroh then hole-punches to a direct path
+   when the network allows it. beam already keeps every paired peer's full key
+   in `known_peers`, and already relays through one default relay. So after
+   pairing, the lookup the server did ("where is the holder of this key?") is
+   one the relay answers anyway. iroh 1.2.0 opens a connection to any relay URL
+   it is given, not only its own, so peers on different relays still work.
+2. **The first meeting only needs the waiting device's key and address once.**
+   That fits in a line of text a person can paste into a chat.
+
+Three alternatives were considered and rejected:
+
+* **A built-in public rendezvous server**, for example through a named
+  Cloudflare tunnel. Zero configuration for users, but someone has to keep it
+  running, and pairing stops whenever it is down.
+* **n0's discovery service (pkarr/DNS)** or the **BitTorrent DHT**. These are
+  not ours to run, but they publish presence to a public third party
+  (`n0-data.md`), and the DHT would need a new dependency (rule 4).
+* **A VPN such as Radmin VPN, ZeroTier or Tailscale.** These hide a
+  coordination server rather than removing it. beam works over them anyway,
+  because a VPN address is just another direct address in an invite.
+
+### Decision
+
+**There is no rendezvous server.** The `rendezvous` module and the
+`beam-server` crate are removed.
+
+* **`beam listen` (and `beam pair --wait`) shows an invite** instead of a Short
+  ID:
+  `beam1` + base32(version ‖ public key ‖ relay ‖ up to 6 direct addresses ‖
+  4-byte checksum). The built-in default relay costs one byte, not its URL.
+  base32 is lowercase letters and digits, so a double-click selects the whole
+  invite and retyping it is case-insensitive. The checksum turns a typo into
+  "copy it again" instead of a pairing that fails for no visible reason. Parse
+  errors never quote the pasted text (ADR-0034).
+* **`beam pair <INVITE> --name <name>`** connects to the address in the invite
+  and runs the unchanged SPAKE2 protocol (ADR-0026). The Short ID the code is
+  bound to is derived from the invite's key on both sides, so the protocol and
+  its tests are untouched.
+* **The joiner saves where the invite said its peer is**, as attributes on the
+  peer's `known_peers` line: `addrs=<ip:port,…>` and, only when it differs from
+  this device's own relay, `relay=<url>`. A peer on the shared default relay
+  then follows the default if it ever changes. `known_peers` already preserved
+  unknown attributes, so the file format does not change.
+* **`beam send` dials the peer's key** with the saved relay (or this device's
+  own) and the saved addresses. Nothing is looked up.
+* **`listen` binds a fixed UDP port**, `port` in `config.toml` (default 7820),
+  so that its invite and the addresses peers saved stay the same from one run
+  to the next. If the port is taken, it falls back to a random one and warns.
+  `rendezvous` is dropped from `config.toml`; an old file that still has it
+  loads, and the key is ignored.
+* **Pairing again with an already-paired device's invite only updates where to
+  find it.** No code, no network, and never the key or the name. This is how
+  a peer that moved networks or relays is found again.
+
+### Security
+
+The invite is a **routing hint, not a credential**, exactly as the Short ID
+was (CLAUDE.md, identity model):
+
+* A connection to the key in an invite only completes against the holder of
+  that key, and `remote_id()` is checked again (ADR-0025, ADR-0031).
+* An invite whose key was swapped for an attacker's cannot reach the real
+  waiter. If the attacker also runs the endpoint, the attacker still has to
+  know the code, and both people still see and confirm fingerprints
+  (ADR-0026). Tested by
+  `an_invite_with_a_swapped_key_reaches_nobody_and_spends_nothing`.
+* A wrong address for a paired key, from a tampered invite or a hand-edited
+  `addrs=`, cannot redirect a send: the handshake fails before any byte is
+  sent. Tested by
+  `impersonation::a_wrong_address_for_a_paired_key_cannot_redirect_a_send`.
+* The address-update path changes only `relay=` and `addrs=`. Rule 3 holds: a
+  stored key is never replaced, and a new key means `beam remove` and pairing
+  again. The worst a forged update can do is make a peer unreachable until the
+  next real invite.
+* As before, the invite and the code can travel together. If someone could
+  read *and* rewrite that channel, the fingerprint comparison is what stops
+  them, exactly as with a Short ID and a code.
+
+### Consequences
+
+* **Zero setup:** `beam init`, `beam listen`, `beam pair <invite>`,
+  `beam send`. No server, no `config.toml`, no ports to forward.
+* **One third party remains: the relay.** Across NAT, especially carrier-grade
+  NAT, something has to coordinate hole punching and carry traffic when it
+  fails. The relay carries only end-to-end-encrypted QUIC (`n0-data.md`).
+  n0's public relay is free but rate-limited and meant for development.
+  `relay` in `config.toml` points elsewhere, for example to a self-hosted
+  `iroh-relay`.
+* **With `relay = "none"`, only devices that can reach each other directly
+  work:** the same LAN, a shared VPN, or a public address. The joiner can send
+  to the waiter at the addresses it saved. The waiter has no address for the
+  joiner until it is given the joiner's invite. `send` says so instead of
+  timing out.
+* **An invite is about 70–130 characters**, depending on how many network
+  interfaces the device has. It is meant to be pasted, not read aloud.
+* **Presence is no longer held by a server of ours.** The relay sees which keys
+  are connected to it, as it already did.
+* **What was lost:** a 9-digit ID that can be read over the phone, and the
+  server-side tests of signed registrations, which go with the server. The
+  main branch keeps the rendezvous design, so both can be compared.

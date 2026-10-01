@@ -1,15 +1,17 @@
-//! `~/.beam/config.toml`: where the rendezvous server and the relay are.
+//! `~/.beam/config.toml`: the relay, and the port `listen` uses.
 //!
-//! Both are infrastructure choices rather than identity, so they live in a
-//! file a person edits by hand — TOML, not JSON, for that reason. A missing
-//! file means the built-in defaults. See ADR-0029.
+//! Both are network choices rather than identity, so they live in a file a
+//! person edits by hand — TOML, not JSON, for that reason. A missing file
+//! means the built-in defaults, and the defaults are meant to be all anyone
+//! needs: there is no server to point beam at. See ADR-0029 and ADR-0036.
 //!
 //! ```toml
-//! # Where Short IDs are announced and looked up.
-//! rendezvous = "ws://127.0.0.1:8787/v1"
-//!
 //! # Relay for connections that cannot go direct, or "none".
 //! relay = "https://aps1-1.relay.n0.iroh.link./"
+//!
+//! # UDP port `beam listen` binds, so its invite stays the same between
+//! # runs. 0 picks a random port each time.
+//! port = 7820
 //! ```
 
 use std::fmt;
@@ -18,18 +20,19 @@ use std::path::{Path, PathBuf};
 use iroh::RelayUrl;
 use serde::Deserialize;
 
-/// The rendezvous server used when the config file does not name one.
-///
-/// There is no public beam rendezvous server, so the default is the port
-/// `beam-server` listens on by default, on this machine.
-pub const DEFAULT_RENDEZVOUS: &str = "ws://127.0.0.1:8787/v1";
-
 /// The relay used when the config file does not name one.
 ///
 /// number 0's Asia-Pacific relay: free, immediately usable, and it carries
 /// QUIC it cannot decrypt. It is the development default only; a self-hosted
 /// `iroh-relay` replaces it later. See `docs/n0-data.md`.
 pub const DEFAULT_RELAY: &str = "https://aps1-1.relay.n0.iroh.link./";
+
+/// The UDP port `beam listen` binds when the config file does not name one.
+///
+/// A fixed port keeps a device's invite — and the addresses its peers saved
+/// from it — the same from one `listen` to the next. If the port is taken,
+/// `listen` falls back to a random one and says so.
+pub const DEFAULT_PORT: u16 = 7820;
 
 /// The value of `relay` that turns relaying off.
 pub const RELAY_NONE: &str = "none";
@@ -55,10 +58,11 @@ impl fmt::Display for Relay {
 /// The settings beam reads from `config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// `ws://` or `wss://` URL of the rendezvous server.
-    pub rendezvous: String,
-    /// Relay for connections that cannot go direct.
+    /// Relay for connections that cannot go direct. It is also where peers
+    /// find each other: a peer is reached by its key through its relay.
     pub relay: Relay,
+    /// UDP port for `beam listen`; 0 means a random one.
+    pub port: u16,
 }
 
 /// Why the config file could not be used.
@@ -72,8 +76,6 @@ pub enum ConfigError {
     },
     #[error("{path}: {message}")]
     Parse { path: PathBuf, message: String },
-    #[error("{path}: rendezvous must start with ws:// or wss://, not {value:?}")]
-    Rendezvous { path: PathBuf, value: String },
     #[error("{path}: relay must be a URL or \"{RELAY_NONE}\", not {value:?}")]
     Relay { path: PathBuf, value: String },
 }
@@ -83,15 +85,19 @@ pub enum ConfigError {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    /// Accepted so a config written for the rendezvous server still loads,
+    /// and otherwise ignored: beam no longer uses one (ADR-0036).
+    #[allow(dead_code)]
     rendezvous: Option<String>,
     relay: Option<String>,
+    port: Option<u16>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            rendezvous: DEFAULT_RENDEZVOUS.to_string(),
             relay: Relay::Url(DEFAULT_RELAY.parse().expect("the default relay URL parses")),
+            port: DEFAULT_PORT,
         }
     }
 }
@@ -119,21 +125,14 @@ impl Config {
         })?;
 
         let mut config = Self::default();
-        if let Some(value) = raw.rendezvous {
-            let value = value.trim().to_string();
-            if !(value.starts_with("ws://") || value.starts_with("wss://")) {
-                return Err(ConfigError::Rendezvous {
-                    path: path.to_path_buf(),
-                    value,
-                });
-            }
-            config.rendezvous = value;
-        }
         if let Some(value) = raw.relay {
             config.relay = parse_relay(value.trim()).ok_or_else(|| ConfigError::Relay {
                 path: path.to_path_buf(),
                 value: value.clone(),
             })?;
+        }
+        if let Some(port) = raw.port {
+            config.port = port;
         }
         Ok(config)
     }
@@ -162,7 +161,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&dir.path().join("config.toml")).unwrap();
         assert_eq!(config, Config::default());
-        assert_eq!(config.rendezvous, DEFAULT_RENDEZVOUS);
+        assert_eq!(config.port, DEFAULT_PORT);
     }
 
     #[test]
@@ -173,11 +172,8 @@ mod tests {
 
     #[test]
     fn both_settings_are_read() {
-        let config = parse(
-            "rendezvous = \"wss://rv.example.org/v1\"\nrelay = \"https://relay.example.org\"\n",
-        )
-        .unwrap();
-        assert_eq!(config.rendezvous, "wss://rv.example.org/v1");
+        let config = parse("relay = \"https://relay.example.org\"\nport = 0\n").unwrap();
+        assert_eq!(config.port, 0);
         assert_eq!(
             config.relay,
             Relay::Url("https://relay.example.org".parse().unwrap())
@@ -198,9 +194,17 @@ mod tests {
     }
 
     #[test]
-    fn a_rendezvous_that_is_not_a_websocket_url_is_refused() {
-        let err = parse("rendezvous = \"http://example.org\"").unwrap_err();
-        assert!(matches!(err, ConfigError::Rendezvous { .. }), "{err}");
+    fn a_config_written_for_the_rendezvous_server_still_loads() {
+        let config = parse("rendezvous = \"wss://rv.example.org/v1\"\nrelay = \"none\"\n").unwrap();
+        assert_eq!(config.relay, Relay::Disabled);
+    }
+
+    #[test]
+    fn a_port_that_does_not_fit_is_refused() {
+        for value in ["70000", "-1", "\"7820\""] {
+            let err = parse(&format!("port = {value}")).unwrap_err();
+            assert!(matches!(err, ConfigError::Parse { .. }), "{value}: {err}");
+        }
     }
 
     #[test]

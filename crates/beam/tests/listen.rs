@@ -1,5 +1,5 @@
-//! `beam listen` as a service, over real iroh endpoints on loopback and a real
-//! rendezvous server in-process.
+//! `beam listen` as a service, over real iroh endpoints on loopback. No server:
+//! each test dials the address the listener put in its invite (ADR-0036).
 //!
 //! These are the M2/M3 guarantees re-proved on the M5 transport — every Accept
 //! rule and resume — plus what only exists here: the sender proved by the
@@ -19,7 +19,6 @@ use beam::pairing::{
     Confirm, ConfirmRequest, Network, PairError, Pairing, PairingCode, PairingError, Policy,
     Timeouts, join,
 };
-use beam::rendezvous::{ServerConfig, serve};
 use beam::transfer::frame::{read_message, write_message};
 use beam::transfer::message::{ChunkStart, Message, RejectReason, TransferId, TransferRequest};
 use beam::transfer::{
@@ -28,23 +27,16 @@ use beam::transfer::{
 use beam::transport::PathKind;
 use beam::transport::dial::{DialError, dial, send_on};
 use beam::transport::endpoint::{self, Bind, XFER_ALPN};
-use tokio::net::TcpListener;
+use iroh::EndpointAddr;
 use tokio::sync::mpsc;
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
-async fn start_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, ServerConfig::default()));
-    format!("ws://{addr}/v1")
-}
-
-fn network(url: &str) -> Network {
+fn network() -> Network {
     Network {
-        rendezvous: url.to_string(),
         relay: Relay::Disabled,
         bind: Bind::Loopback,
+        port: 0,
     }
 }
 
@@ -115,6 +107,19 @@ struct Home {
     identity: Identity,
     inbox: PathBuf,
     files: PathBuf,
+    /// The address this home's `listen` put in its invite, once it has one.
+    listening_at: Mutex<Option<EndpointAddr>>,
+}
+
+impl Home {
+    /// Where a peer that saved this home's invite would dial it.
+    fn at(&self) -> EndpointAddr {
+        self.listening_at
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("this home is not listening")
+    }
 }
 
 fn home(comment: &str) -> Home {
@@ -132,6 +137,7 @@ fn home(comment: &str) -> Home {
         identity,
         inbox,
         files,
+        listening_at: Mutex::new(None),
     }
 }
 
@@ -198,11 +204,11 @@ fn options(home: &Home, policy: Policy) -> ListenOptions {
     }
 }
 
-async fn listen(home: &Home, url: &str, prompt: Script, options: ListenOptions) -> Listening {
+async fn listen(home: &Home, prompt: Script, options: ListenOptions) -> Listening {
     let (tx, mut events) = mpsc::unbounded_channel();
     let identity = home.identity.clone();
     let store = home.store.clone();
-    let network = network(url);
+    let network = network();
     let task = tokio::spawn(async move {
         let _ = run(
             identity,
@@ -218,41 +224,20 @@ async fn listen(home: &Home, url: &str, prompt: Script, options: ListenOptions) 
         .await;
     });
     let code = match tokio::time::timeout(PATIENCE, events.recv()).await {
-        Ok(Some(ListenEvent::Ready { code, .. })) => code,
+        Ok(Some(ListenEvent::Ready { code, invite, .. })) => {
+            assert_eq!(invite.key, home.identity.verifying_key());
+            *home.listening_at.lock().unwrap() = Some(invite.endpoint_addr());
+            code
+        }
         other => panic!("listen did not start: {other:?}"),
     };
-    let mut listening = Listening { events, code, task };
-    // Registered is only announced after a failure; give the first
-    // registration a moment by looking ourselves up.
-    wait_until_registered(url, &home.identity).await;
-    let _ = &mut listening;
-    listening
-}
-
-async fn wait_until_registered(url: &str, identity: &Identity) {
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    loop {
-        let mut client = beam::rendezvous::RendezvousClient::connect(url)
-            .await
-            .unwrap();
-        if client
-            .lookup_key(&identity.verifying_key())
-            .await
-            .unwrap()
-            .is_some()
-        {
-            return;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "never registered");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    Listening { events, code, task }
 }
 
 /// Sends `bytes` as `name` from `from` to the peer it calls `to`.
 async fn send(
     from: &Home,
     to: &Home,
-    url: &str,
     name: &str,
     bytes: &[u8],
     tweak: impl FnOnce(&mut SendOptions),
@@ -260,12 +245,10 @@ async fn send(
 ) -> Result<beam::transfer::SendSummary, TransferError> {
     let path = from.files.join(name);
     std::fs::write(&path, bytes).unwrap();
-    let endpoint = endpoint::bind(&from.identity, &Relay::Disabled, Bind::Loopback, &[])
+    let endpoint = endpoint::bind(&from.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
         .await
         .unwrap();
-    let connection = dial(&endpoint, url, &to.identity.verifying_key(), XFER_ALPN)
-        .await
-        .expect("dial");
+    let connection = dial(&endpoint, to.at(), XFER_ALPN).await.expect("dial");
     let mut options = SendOptions::new(
         path,
         beam::identity::encode_public_key(&from.identity.verifying_key()),
@@ -284,25 +267,16 @@ fn payload(len: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_paired_peer_sends_a_file_over_iroh() {
-    let url = start_server().await;
     let (alice, bob) = (home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     let prompt = Script::default().transfers(&[true]);
-    let mut listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+    let mut listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
     let bytes = payload(300_000);
     let mut progress = Recorder::default();
-    let sent = send(
-        &alice,
-        &bob,
-        &url,
-        "hello.bin",
-        &bytes,
-        |_| {},
-        &mut progress,
-    )
-    .await
-    .expect("send");
+    let sent = send(&alice, &bob, "hello.bin", &bytes, |_| {}, &mut progress)
+        .await
+        .expect("send");
 
     assert_eq!(sent.bytes_sent, bytes.len() as u64);
     match listening
@@ -332,12 +306,10 @@ impl Reporter for Recorder {
 /// S-1 / S-2 over iroh: a decline saves nothing and the sender is told.
 #[tokio::test]
 async fn a_declined_transfer_saves_nothing() {
-    let url = start_server().await;
     let (alice, bob) = (home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     let _listening = listen(
         &bob,
-        &url,
         Script::default().transfers(&[false]),
         options(&bob, Policy::default()),
     )
@@ -346,7 +318,6 @@ async fn a_declined_transfer_saves_nothing() {
     let sent = send(
         &alice,
         &bob,
-        &url,
         "no.bin",
         &payload(1000),
         |_| {},
@@ -363,19 +334,17 @@ async fn a_declined_transfer_saves_nothing() {
 /// S-5 over iroh: an unanswered request expires and counts as a Reject.
 #[tokio::test]
 async fn an_unanswered_transfer_expires() {
-    let url = start_server().await;
     let (alice, bob) = (home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     let prompt = Script::default();
     let _hold = prompt.hold_next_transfer();
     let mut opts = options(&bob, Policy::default());
     opts.accept_timeout = Duration::from_millis(500);
-    let _listening = listen(&bob, &url, prompt, opts).await;
+    let _listening = listen(&bob, prompt, opts).await;
 
     let sent = send(
         &alice,
         &bob,
-        &url,
         "late.bin",
         &payload(10),
         |_| {},
@@ -393,7 +362,6 @@ async fn an_unanswered_transfer_expires() {
 /// refused and bob is never asked.
 #[tokio::test]
 async fn an_unpaired_device_is_refused_without_a_prompt() {
-    let url = start_server().await;
     let (stranger, bob) = (home("stranger"), home("bob"));
     // The stranger knows bob; bob does not know the stranger.
     let mut known = stranger.store.load_known_peers().unwrap();
@@ -402,12 +370,11 @@ async fn an_unpaired_device_is_refused_without_a_prompt() {
         .unwrap();
     stranger.store.save_known_peers(&known).unwrap();
     let prompt = Script::default().transfers(&[true]);
-    let _listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+    let _listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
     let sent = send(
         &stranger,
         &bob,
-        &url,
         "x.bin",
         &payload(10),
         |_| {},
@@ -428,18 +395,16 @@ async fn an_unpaired_device_is_refused_without_a_prompt() {
 /// that claims to be *another* paired device is refused, unasked.
 #[tokio::test]
 async fn a_paired_device_claiming_another_ones_key_is_refused() {
-    let url = start_server().await;
     let (alice, carol, bob) = (home("alice"), home("carol"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     pair_by_hand(&carol, "bob", &bob, "carol");
     let prompt = Script::default().transfers(&[true]);
-    let _listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+    let _listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
     // carol connects as herself but claims alice's key in the request.
     let sent = send(
         &carol,
         &bob,
-        &url,
         "forged.bin",
         &payload(10),
         |o| {
@@ -459,19 +424,16 @@ async fn a_paired_device_claiming_another_ones_key_is_refused() {
 /// is kept.
 #[tokio::test]
 async fn data_before_accept_is_discarded() {
-    let url = start_server().await;
     let (alice, bob) = (home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     let prompt = Script::default();
     let hold = prompt.hold_next_transfer();
-    let mut listening = listen(&bob, &url, prompt, options(&bob, Policy::default())).await;
+    let mut listening = listen(&bob, prompt, options(&bob, Policy::default())).await;
 
-    let endpoint = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
+    let endpoint = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
         .await
         .unwrap();
-    let connection = dial(&endpoint, &url, &bob.identity.verifying_key(), XFER_ALPN)
-        .await
-        .unwrap();
+    let connection = dial(&endpoint, bob.at(), XFER_ALPN).await.unwrap();
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
     let data = payload(1000);
     let request = TransferRequest {
@@ -523,11 +485,10 @@ async fn data_before_accept_is_discarded() {
 /// again asks again (S-2) and sends only the rest.
 #[tokio::test]
 async fn an_interrupted_transfer_resumes_with_a_new_accept() {
-    let url = start_server().await;
     let (alice, bob) = (home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     let prompt = Script::default().transfers(&[true, true]);
-    let mut listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+    let mut listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
     let bytes = payload(2_000_000);
     let path = alice.files.join("big.bin");
@@ -537,14 +498,13 @@ async fn an_interrupted_transfer_resumes_with_a_new_accept() {
     let (progressed, mut five_chunks) = mpsc::unbounded_channel();
     let first = {
         let identity = alice.identity.clone();
-        let bob_key = bob.identity.verifying_key();
-        let url = url.clone();
+        let bob_at = bob.at();
         let path = path.clone();
         tokio::spawn(async move {
-            let endpoint = endpoint::bind(&identity, &Relay::Disabled, Bind::Loopback, &[])
+            let endpoint = endpoint::bind(&identity, &Relay::Disabled, Bind::Loopback, 0, &[])
                 .await
                 .unwrap();
-            let connection = dial(&endpoint, &url, &bob_key, XFER_ALPN).await.unwrap();
+            let connection = dial(&endpoint, bob_at, XFER_ALPN).await.unwrap();
             let mut options = SendOptions::new(
                 &path,
                 beam::identity::encode_public_key(&identity.verifying_key()),
@@ -570,7 +530,6 @@ async fn an_interrupted_transfer_resumes_with_a_new_accept() {
     let sent = send(
         &alice,
         &bob,
-        &url,
         "big.bin",
         &bytes,
         |o| o.chunk_size = 10_000,
@@ -609,24 +568,21 @@ impl Reporter for SignalAfter {
 /// the receiver is busy — and the first is unaffected.
 #[tokio::test]
 async fn a_second_transfer_while_one_is_open_is_told_to_try_later() {
-    let url = start_server().await;
     let (alice, carol, bob) = (home("alice"), home("carol"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     pair_by_hand(&carol, "bob", &bob, "carol");
     let prompt = Script::default();
     let release = prompt.hold_next_transfer();
-    let mut listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+    let mut listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
     // alice's request sits at the prompt, holding the slot.
     let first = {
-        let url = url.clone();
         let (alice_ref, bob_ref) = (&alice, &bob);
         let bytes = payload(1000);
         async move {
             send(
                 alice_ref,
                 bob_ref,
-                &url,
                 "first.bin",
                 &bytes,
                 |_| {},
@@ -645,7 +601,6 @@ async fn a_second_transfer_while_one_is_open_is_told_to_try_later() {
         let busy = send(
             &carol,
             &bob,
-            &url,
             "second.bin",
             &payload(10),
             |_| {},
@@ -680,12 +635,12 @@ async fn a_second_transfer_while_one_is_open_is_told_to_try_later() {
 async fn join_listener(
     joiner: &Home,
     listener: &Home,
-    url: &str,
     code: PairingCode,
     answer: bool,
 ) -> Result<beam::pairing::Paired, PairError> {
     let known = joiner.store.load_known_peers().unwrap();
-    let network = network(url);
+    let network = network();
+    let invite = beam::invite::Invite::new(&listener.at());
     let pairing = Pairing {
         identity: &joiner.identity,
         known: &known,
@@ -700,7 +655,7 @@ async fn join_listener(
     let script = Script::default().pairings(&[answer]);
     join(
         &pairing,
-        listener.identity.short_id(),
+        &invite,
         || async move { Ok(code) },
         script,
         |_| {},
@@ -710,13 +665,12 @@ async fn join_listener(
 
 #[tokio::test]
 async fn listen_pairs_and_names_the_device_from_its_hint() {
-    let url = start_server().await;
     let (alice, bob) = (home("alices-laptop"), home("bob"));
     let prompt = Script::default().pairings(&[true]);
-    let mut listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+    let mut listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
     let code = listening.code.clone();
-    let paired = join_listener(&alice, &bob, &url, code.clone(), true)
+    let paired = join_listener(&alice, &bob, code.clone(), true)
         .await
         .expect("pair");
     assert_eq!(paired.key, bob.identity.verifying_key());
@@ -738,7 +692,6 @@ async fn listen_pairs_and_names_the_device_from_its_hint() {
 /// without using anything; transfers from paired peers still work.
 #[tokio::test]
 async fn three_failed_attempts_switch_pairing_off_but_not_transfers() {
-    let url = start_server().await;
     let (mallory, alice, bob) = (home("mallory"), home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     let policy = Policy {
@@ -746,7 +699,7 @@ async fn three_failed_attempts_switch_pairing_off_but_not_transfers() {
         ..Policy::default()
     };
     let prompt = Script::default().pairings(&[true]).transfers(&[true]);
-    let mut listening = listen(&bob, &url, prompt.clone(), options(&bob, policy)).await;
+    let mut listening = listen(&bob, prompt.clone(), options(&bob, policy)).await;
 
     let mut code = listening.code.clone();
     for attempt in 1..=3 {
@@ -755,7 +708,7 @@ async fn three_failed_attempts_switch_pairing_off_but_not_transfers() {
             (code.as_str().parse::<u32>().unwrap() + 1) % 1_000_000
         ))
         .unwrap();
-        let result = join_listener(&mallory, &bob, &url, wrong, true).await;
+        let result = join_listener(&mallory, &bob, wrong, true).await;
         assert!(
             matches!(result, Err(PairError::Pairing(PairingError::WrongCode))),
             "attempt {attempt}: {result:?}"
@@ -778,7 +731,7 @@ async fn three_failed_attempts_switch_pairing_off_but_not_transfers() {
     // Even the right code — the last one issued — gets nowhere now, and
     // nobody is asked.
     let dave = home("dave");
-    let result = join_listener(&dave, &bob, &url, code, true).await;
+    let result = join_listener(&dave, &bob, code, true).await;
     match result {
         Err(PairError::Pairing(PairingError::Unavailable(reason))) => {
             assert!(reason.contains("restarted"), "{reason}")
@@ -795,7 +748,6 @@ async fn three_failed_attempts_switch_pairing_off_but_not_transfers() {
     send(
         &alice,
         &bob,
-        &url,
         "still.bin",
         &payload(100),
         |_| {},
@@ -808,13 +760,12 @@ async fn three_failed_attempts_switch_pairing_off_but_not_transfers() {
 /// A pairing attempt during a pause is told to wait, and does not count.
 #[tokio::test]
 async fn an_attempt_during_a_pause_is_refused_without_counting() {
-    let url = start_server().await;
     let (mallory, bob) = (home("mallory"), home("bob"));
     let policy = Policy {
         first_backoff: Duration::from_secs(30),
         ..Policy::default()
     };
-    let mut listening = listen(&bob, &url, Script::default(), options(&bob, policy)).await;
+    let mut listening = listen(&bob, Script::default(), options(&bob, policy)).await;
 
     let wrong = PairingCode::parse("000000").unwrap();
     let wrong = if wrong == listening.code {
@@ -822,7 +773,7 @@ async fn an_attempt_during_a_pause_is_refused_without_counting() {
     } else {
         wrong
     };
-    join_listener(&mallory, &bob, &url, wrong, true)
+    join_listener(&mallory, &bob, wrong, true)
         .await
         .unwrap_err();
     listening
@@ -832,14 +783,8 @@ async fn an_attempt_during_a_pause_is_refused_without_counting() {
         .await;
 
     for _ in 0..3 {
-        let result = join_listener(
-            &mallory,
-            &bob,
-            &url,
-            PairingCode::parse("123456").unwrap(),
-            true,
-        )
-        .await;
+        let result =
+            join_listener(&mallory, &bob, PairingCode::parse("123456").unwrap(), true).await;
         match result {
             Err(PairError::Pairing(PairingError::Unavailable(reason))) => {
                 assert!(reason.contains("paused"), "{reason}")
@@ -870,7 +815,6 @@ async fn an_attempt_during_a_pause_is_refused_without_counting() {
 async fn a_pairing_and_a_transfer_at_once_are_asked_one_at_a_time() {
     use beam::cli::desk::{DeskPrompt, testing};
 
-    let url = start_server().await;
     let (alice, carol, bob) = (home("alice"), home("carol"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     let (desk, typed, screen) = testing::desk();
@@ -880,7 +824,7 @@ async fn a_pairing_and_a_transfer_at_once_are_asked_one_at_a_time() {
     let task = {
         let identity = bob.identity.clone();
         let store = bob.store.clone();
-        let network = network(&url);
+        let network = network();
         let options = options(&bob, Policy::default());
         tokio::spawn(async move {
             let _ = run(
@@ -898,23 +842,17 @@ async fn a_pairing_and_a_transfer_at_once_are_asked_one_at_a_time() {
         })
     };
     let code = match tokio::time::timeout(PATIENCE, events.recv()).await {
-        Ok(Some(ListenEvent::Ready { code, .. })) => code,
+        Ok(Some(ListenEvent::Ready { code, invite, .. })) => {
+            *bob.listening_at.lock().unwrap() = Some(invite.endpoint_addr());
+            code
+        }
         other => panic!("{other:?}"),
     };
-    wait_until_registered(&url, &bob.identity).await;
 
-    let pairing = join_listener(&carol, &bob, &url, code, true);
+    let pairing = join_listener(&carol, &bob, code, true);
     let report = payload(500);
     let mut silent = SilentReporter;
-    let transfer = send(
-        &alice,
-        &bob,
-        &url,
-        "report.pdf",
-        &report,
-        |_| {},
-        &mut silent,
-    );
+    let transfer = send(&alice, &bob, "report.pdf", &report, |_| {}, &mut silent);
     let driver = async {
         let screen = screen.clone();
         tokio::task::spawn_blocking(move || {
@@ -957,28 +895,34 @@ async fn a_pairing_and_a_transfer_at_once_are_asked_one_at_a_time() {
     task.abort();
 }
 
-/// ADR-0031: `send` to a device that is not listening — or that ran `beam
-/// init` again and so has a different key — finds nothing to dial.
+/// ADR-0031: `send` to a device that ran `beam init` again — so a different
+/// key now answers at the saved address — reaches nobody.
 #[tokio::test]
 async fn dialling_a_key_nobody_holds_any_more_finds_nobody() {
-    let url = start_server().await;
     let (alice, bob) = (home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
     // bob re-ran `beam init`: the device listening now has a new key.
     let reinit = home("bob-again");
     let _listening = listen(
         &reinit,
-        &url,
         Script::default(),
         options(&reinit, Policy::default()),
     )
     .await;
 
-    let endpoint = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
+    let endpoint = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
         .await
         .unwrap();
-    let result = dial(&endpoint, &url, &bob.identity.verifying_key(), XFER_ALPN).await;
-    assert!(matches!(result, Err(DialError::NotListening)), "{result:?}");
+    // The address bob's invite named, with bob's old key.
+    let old = EndpointAddr::from_parts(
+        endpoint::endpoint_id(&bob.identity.verifying_key()),
+        reinit.at().addrs,
+    );
+    let result = dial(&endpoint, old, XFER_ALPN).await;
+    assert!(
+        matches!(result, Err(DialError::Unreachable(_))),
+        "{result:?}"
+    );
     endpoint.close().await;
 }
 
@@ -987,22 +931,19 @@ async fn dialling_a_key_nobody_holds_any_more_finds_nobody() {
 /// slot is free again for the next sender.
 #[tokio::test]
 async fn a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send() {
-    let url = start_server().await;
     let (mallory, alice, bob) = (home("mallory"), home("alice"), home("bob"));
     pair_by_hand(&mallory, "bob", &bob, "mallory");
     pair_by_hand(&alice, "bob", &bob, "alice");
     let mut opts = options(&bob, Policy::default());
     opts.stall_timeout = Duration::from_millis(800);
     let prompt = Script::default().transfers(&[true, true]);
-    let mut listening = listen(&bob, &url, prompt, opts).await;
+    let mut listening = listen(&bob, prompt, opts).await;
 
     // mallory: a well-formed request, accepted, then nothing at all.
-    let endpoint = endpoint::bind(&mallory.identity, &Relay::Disabled, Bind::Loopback, &[])
+    let endpoint = endpoint::bind(&mallory.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
         .await
         .unwrap();
-    let connection = dial(&endpoint, &url, &bob.identity.verifying_key(), XFER_ALPN)
-        .await
-        .unwrap();
+    let connection = dial(&endpoint, bob.at(), XFER_ALPN).await.unwrap();
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
     let data = payload(1000);
     let request = TransferRequest {
@@ -1023,7 +964,7 @@ async fn a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send() {
     ));
 
     // While mallory holds it, alice is turned away...
-    let busy = send_file_as(&alice, &bob, &url).await;
+    let busy = send_file_as(&alice, &bob).await;
     assert!(
         matches!(busy, Err(TransferError::Rejected(RejectReason::Busy))),
         "{busy:?}"
@@ -1041,7 +982,7 @@ async fn a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send() {
         }
         _ => unreachable!(),
     }
-    send_file_as(&alice, &bob, &url)
+    send_file_as(&alice, &bob)
         .await
         .expect("the slot is free again");
     drop((send, recv, connection));
@@ -1051,12 +992,10 @@ async fn a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send() {
 async fn send_file_as(
     from: &Home,
     to: &Home,
-    url: &str,
 ) -> Result<beam::transfer::SendSummary, TransferError> {
     send(
         from,
         to,
-        url,
         "after.bin",
         &payload(100),
         |_| {},
@@ -1071,15 +1010,11 @@ async fn send_file_as(
 /// connection proved, and nothing a message says can stand in for that proof.
 mod impersonation {
     use super::*;
-    use beam::rendezvous::proto::{PeerRecord, ServerMessage};
-    use futures_util::{SinkExt, StreamExt};
-    use iroh::EndpointAddr;
 
     /// 1. An unknown key. A device bob never paired with connects and sends a
     ///    well-formed request under its own key: refused before any prompt.
     #[tokio::test]
     async fn an_unknown_key_is_refused_without_a_prompt() {
-        let url = start_server().await;
         let (stranger, bob) = (home("stranger"), home("bob"));
         let mut known = stranger.store.load_known_peers().unwrap();
         known
@@ -1087,12 +1022,11 @@ mod impersonation {
             .unwrap();
         stranger.store.save_known_peers(&known).unwrap();
         let prompt = Script::default().transfers(&[true]);
-        let _listening = listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+        let _listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
         let sent = send(
             &stranger,
             &bob,
-            &url,
             "x.bin",
             &payload(10),
             |_| {},
@@ -1117,7 +1051,6 @@ mod impersonation {
     ///    `tests/transfer.rs` was waiting for.
     #[tokio::test]
     async fn a_known_public_key_without_its_secret_key_gets_nowhere() {
-        let url = start_server().await;
         let (alice, attacker, bob) = (home("alice"), home("attacker"), home("bob"));
         pair_by_hand(&alice, "bob", &bob, "alice");
         let mut known = attacker.store.load_known_peers().unwrap();
@@ -1126,14 +1059,12 @@ mod impersonation {
             .unwrap();
         attacker.store.save_known_peers(&known).unwrap();
         let prompt = Script::default().transfers(&[true]);
-        let mut listening =
-            listen(&bob, &url, prompt.clone(), options(&bob, Policy::default())).await;
+        let mut listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
         let alices_key = beam::identity::encode_public_key(&alice.identity.verifying_key());
         let sent = send(
             &attacker,
             &bob,
-            &url,
             "from-alice.bin",
             &payload(10),
             |o| o.sender_public_key = alices_key,
@@ -1151,7 +1082,7 @@ mod impersonation {
 
         // And the endpoint id cannot be chosen: it follows from the secret.
         let attackers_endpoint =
-            endpoint::bind(&attacker.identity, &Relay::Disabled, Bind::Loopback, &[])
+            endpoint::bind(&attacker.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
                 .await
                 .unwrap();
         assert_ne!(
@@ -1161,43 +1092,12 @@ mod impersonation {
         attackers_endpoint.close().await;
     }
 
-    /// A rendezvous server that answers every request with `answer`.
-    async fn lying_rendezvous(answer: ServerMessage) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/v1", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let answer = answer.clone();
-                tokio::spawn(async move {
-                    let Ok((_, mut ws)) =
-                        tokio_websockets::ServerBuilder::new().accept(stream).await
-                    else {
-                        return;
-                    };
-                    while let Some(Ok(message)) = ws.next().await {
-                        if message.as_text().is_some() {
-                            let text = serde_json::to_string(&answer).unwrap();
-                            if ws
-                                .send(tokio_websockets::Message::text(text))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        url
-    }
-
     /// An attacker endpoint on loopback that counts connections which
     /// complete their handshake.
     async fn attacker_endpoint(
         identity: &Identity,
     ) -> (iroh::Endpoint, std::net::SocketAddr, Arc<Mutex<usize>>) {
-        let endpoint = endpoint::bind(identity, &Relay::Disabled, Bind::Loopback, &[XFER_ALPN])
+        let endpoint = endpoint::bind(identity, &Relay::Disabled, Bind::Loopback, 0, &[XFER_ALPN])
             .await
             .unwrap();
         let addr = endpoint::advertised_addr(&endpoint, &Relay::Disabled, Bind::Loopback).await;
@@ -1215,28 +1115,21 @@ mod impersonation {
         (endpoint, socket, completed)
     }
 
-    /// 3a. A rendezvous server that returns the wrong address: bob's key, the
-    ///     attacker's socket. alice dials the key she paired with; the
-    ///     attacker cannot prove it, so the handshake fails and not one byte
-    ///     of the file leaves alice.
+    /// 3. A wrong address: bob's key, the attacker's socket — what a tampered
+    ///    invite or a hand-edited `addrs=` would produce. alice dials the key
+    ///    she paired with; the attacker cannot prove it, so the handshake
+    ///    fails and not one byte of the file leaves alice.
     #[tokio::test]
-    async fn a_rendezvous_that_returns_the_wrong_address_cannot_redirect_a_send() {
+    async fn a_wrong_address_for_a_paired_key_cannot_redirect_a_send() {
         let (alice, bob, attacker) = (home("alice"), home("bob"), home("attacker"));
         let (attackers, socket, completed) = attacker_endpoint(&attacker.identity).await;
-        let lie = ServerMessage::Found {
-            short_id: bob.identity.short_id().to_string(),
-            peers: vec![PeerRecord {
-                public_key: beam::identity::encode_public_key(&bob.identity.verifying_key()),
-                addr: EndpointAddr::new(endpoint::endpoint_id(&bob.identity.verifying_key()))
-                    .with_ip_addr(socket),
-            }],
-        };
-        let url = lying_rendezvous(lie).await;
+        let lie = EndpointAddr::new(endpoint::endpoint_id(&bob.identity.verifying_key()))
+            .with_ip_addr(socket);
 
-        let alices = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
+        let alices = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
             .await
             .unwrap();
-        let result = dial(&alices, &url, &bob.identity.verifying_key(), XFER_ALPN).await;
+        let result = dial(&alices, lie, XFER_ALPN).await;
         assert!(
             matches!(result, Err(DialError::Unreachable(_))),
             "{result:?}"
@@ -1248,54 +1141,5 @@ mod impersonation {
         );
         alices.close().await;
         attackers.close().await;
-    }
-
-    /// 3b. The same lie told the other way: an entry under bob's name whose
-    ///     key is the attacker's. alice's client drops it before dialling —
-    ///     the answer is not for the key she asked about.
-    #[tokio::test]
-    async fn a_rendezvous_answer_for_another_key_is_ignored() {
-        let (alice, bob, attacker) = (home("alice"), home("bob"), home("attacker"));
-        let (attackers, socket, completed) = attacker_endpoint(&attacker.identity).await;
-        let lie = ServerMessage::Found {
-            short_id: bob.identity.short_id().to_string(),
-            peers: vec![PeerRecord {
-                public_key: beam::identity::encode_public_key(&attacker.identity.verifying_key()),
-                addr: EndpointAddr::new(endpoint::endpoint_id(&attacker.identity.verifying_key()))
-                    .with_ip_addr(socket),
-            }],
-        };
-        let url = lying_rendezvous(lie).await;
-
-        let alices = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
-            .await
-            .unwrap();
-        let result = dial(&alices, &url, &bob.identity.verifying_key(), XFER_ALPN).await;
-        assert!(matches!(result, Err(DialError::NotListening)), "{result:?}");
-        assert_eq!(*completed.lock().unwrap(), 0);
-        alices.close().await;
-        attackers.close().await;
-    }
-
-    /// 3c. A rendezvous server that answers with an error full of escape
-    ///     sequences cannot drive the terminal through beam's error message.
-    #[tokio::test]
-    async fn a_rendezvous_error_cannot_carry_escape_sequences() {
-        let (alice, bob) = (home("alice"), home("bob"));
-        let url = lying_rendezvous(ServerMessage::Error {
-            code: "\u{1B}[2J".into(),
-            message: "\u{1B}]0;owned\u{07}\u{1B}[31mplease re-pair\rSHA256:fake".into(),
-        })
-        .await;
-        let alices = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, &[])
-            .await
-            .unwrap();
-        let err = dial(&alices, &url, &bob.identity.verifying_key(), XFER_ALPN)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(!err.contains('\u{1B}') && !err.contains('\r'), "{err:?}");
-        assert!(err.contains("please re-pair"), "{err}");
-        alices.close().await;
     }
 }

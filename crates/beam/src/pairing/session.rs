@@ -1,13 +1,16 @@
-//! Pairing over the network: the rendezvous lookup, the iroh connection, and
-//! the protocol run, for each of the two roles.
+//! Pairing over the network: the invite, the iroh connection, and the
+//! protocol run, for each of the two roles.
 //!
-//! * The **waiter** has a code and takes attempts on its endpoint. `beam pair
-//!   --wait` takes exactly one and exits ([`wait`]). `beam listen` takes them
-//!   for as long as it runs, renewing the code by the rules in
-//!   [`super::rotation`], and calls [`serve`] or [`refuse_connection`] for each.
-//! * The **joiner** (`beam pair <ID>`) looks the Short ID up, connects to each
-//!   entry that checks out, and runs the protocol with the code the user typed
-//!   ([`join`]).
+//! * The **waiter** shows an invite and a code and takes attempts on its
+//!   endpoint. `beam pair --wait` takes exactly one and exits ([`wait`]).
+//!   `beam listen` takes them for as long as it runs, renewing the code by the
+//!   rules in [`super::rotation`], and calls [`serve`] or [`refuse_connection`]
+//!   for each.
+//! * The **joiner** (`beam pair <INVITE>`) connects to the address in the
+//!   invite and runs the protocol with the code the user typed ([`join`]).
+//!
+//! No server is involved: the invite carries the waiter's key, relay and
+//! direct addresses (ADR-0036).
 //!
 //! The peer key that comes back is always the iroh connection's `remote_id()`
 //! — a key the peer proved it holds — and never a key taken from a message.
@@ -24,21 +27,23 @@ use super::protocol::{self, Offer, PairingError, Role, Session};
 use super::rotation::Attempt;
 use crate::config::Relay;
 use crate::identity::{Fingerprint, Identity, KnownPeers, ShortId, validate_name};
-use crate::rendezvous::{REFRESH_EVERY, RendezvousClient, RendezvousError};
+use crate::invite::Invite;
 use crate::transport::endpoint::{self, Bind, EndpointError, PAIR_ALPN};
 
-/// How long the joiner gives one candidate address to connect.
+/// How long the joiner gives the waiter to answer.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long to wait for the last message to be acknowledged before closing.
 const LINGER: Duration = Duration::from_secs(3);
 
-/// Where the infrastructure is.
+/// How this device uses the network.
 #[derive(Clone, Debug)]
 pub struct Network {
-    pub rendezvous: String,
     pub relay: Relay,
     pub bind: Bind,
+    /// The UDP port a waiting device binds, or 0 for a random one. Dialling
+    /// always uses a random port.
+    pub port: u16,
 }
 
 /// Timeouts, overridable by tests.
@@ -77,22 +82,16 @@ pub trait Confirm: Send + 'static {
 /// Things worth telling the user while pairing runs.
 #[derive(Debug)]
 pub enum Event<'a> {
-    /// The waiter is registered and the code is live.
+    /// The waiter's endpoint is up and the code is live.
     Waiting {
-        short_id: ShortId,
+        invite: &'a Invite,
         code: &'a PairingCode,
         expires_in: Duration,
     },
-    /// The waiter's registration could not be refreshed. It keeps waiting.
-    RefreshFailed(&'a RendezvousError),
     /// Someone connected to the waiter; the code is now spent.
     Attempt { peer: Fingerprint },
-    /// The joiner found this many devices under the Short ID.
-    Found { count: usize },
-    /// The joiner is connecting to one of them.
+    /// The joiner is connecting to the device in the invite.
     Connecting { peer: Fingerprint },
-    /// A candidate did not work out; the joiner moves on to the next.
-    CandidateFailed { peer: Fingerprint, reason: String },
 }
 
 /// Why pairing did not complete. In every case nothing has been saved.
@@ -100,16 +99,13 @@ pub enum Event<'a> {
 pub enum PairError {
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
-    #[error(transparent)]
-    Rendezvous(#[from] RendezvousError),
-    #[error(
-        "no device with Short ID {0} is waiting to pair. Ask the other person to run \
-         `beam listen` (or `beam pair --wait`) and read you the Short ID it shows"
-    )]
-    NotFound(String),
     #[error("{0}; run `beam pair --wait` again for a new code")]
     Code(#[from] CodeUnavailable),
-    #[error("could not connect to the device: {0}")]
+    #[error(
+        "could not connect to the device in the invite ({0}). Check that it is still \
+         running `beam listen` (or `beam pair --wait`) and that this is the invite it \
+         shows now"
+    )]
     Connect(String),
     #[error(transparent)]
     Pairing(#[from] PairingError),
@@ -122,8 +118,8 @@ pub enum PairError {
          in person. Someone who wanted to impersonate {0} would ask you to re-pair too."
     )]
     NameTaken(String),
-    #[error("this is your own Short ID")]
-    OwnShortId,
+    #[error("this is this device's own invite")]
+    OwnInvite,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -212,7 +208,7 @@ pub fn attempt_kind(result: &Result<Paired, PairError>) -> Attempt {
     }
 }
 
-/// `beam pair --wait`: registers, shows the code, and takes one attempt.
+/// `beam pair --wait`: shows the invite and the code, and takes one attempt.
 pub async fn wait<C: Confirm + Clone>(
     pairing: &Pairing<'_>,
     mut slot: CodeSlot,
@@ -230,39 +226,33 @@ pub async fn wait<C: Confirm + Clone>(
         check_name(known, name)?;
     }
 
-    let endpoint = endpoint::bind(identity, &network.relay, network.bind, &[PAIR_ALPN]).await?;
+    let endpoint = endpoint::bind(
+        identity,
+        &network.relay,
+        network.bind,
+        network.port,
+        &[PAIR_ALPN],
+    )
+    .await?;
     let result = async {
-        let mut rendezvous = RendezvousClient::connect(&network.rendezvous).await?;
-        let addr = endpoint::advertised_addr(&endpoint, &network.relay, network.bind).await;
-        rendezvous.register(identity, &addr).await?;
-
+        let invite =
+            Invite::new(&endpoint::advertised_addr(&endpoint, &network.relay, network.bind).await);
         {
             // Peek at the code only to show it; `take` is what spends it.
             let code = slot.peek().expect("a fresh slot holds its code");
             let expires_in = slot.expires_at().saturating_duration_since(Instant::now());
             events(Event::Waiting {
-                short_id: identity.short_id(),
+                invite: &invite,
                 code: &code,
                 expires_in,
             });
         }
 
         let expiry = tokio::time::Instant::from_std(slot.expires_at());
-        let mut refresh = tokio::time::interval_at(
-            tokio::time::Instant::now() + REFRESH_EVERY,
-            REFRESH_EVERY,
-        );
-
         let connection = loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(expiry) => {
                     return Err(PairError::Code(CodeUnavailable::Expired));
-                }
-                _ = refresh.tick() => {
-                    let addr = endpoint::advertised_addr(&endpoint, &network.relay, network.bind).await;
-                    if let Err(e) = rendezvous.register(identity, &addr).await {
-                        events(Event::RefreshFailed(&e));
-                    }
                 }
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else {
@@ -277,12 +267,11 @@ pub async fn wait<C: Confirm + Clone>(
                 }
             }
         };
-        // Stop being findable: this code gets exactly one attempt.
-        rendezvous.close().await;
 
         events(Event::Attempt {
             peer: Fingerprint::of(&endpoint::verifying_key(&connection.remote_id())),
         });
+        // This code gets exactly one attempt: the endpoint closes after it.
         let code = slot.take(Instant::now())?;
         serve(connection, pairing, &code, confirm).await
     }
@@ -329,19 +318,20 @@ pub async fn refuse_connection(connection: Connection, reason: &str) {
     connection.close(0u32.into(), b"unavailable");
 }
 
-/// Looks up `short_id` and pairs with the device behind it.
+/// Pairs with the device in `invite`.
 ///
-/// `read_code` is called once, after the lookup has found someone, so a
-/// mistyped Short ID fails before the person is asked for the code.
+/// `read_code` is called before connecting: the waiter spends its code on the
+/// first connection that arrives, and a person typing it must not be racing
+/// the waiter's message timeout.
 pub async fn join<C, R, Fut>(
     pairing: &Pairing<'_>,
-    short_id: ShortId,
+    invite: &Invite,
     read_code: R,
     confirm: C,
     mut events: impl FnMut(Event<'_>),
 ) -> Result<Paired, PairError>
 where
-    C: Confirm + Clone,
+    C: Confirm,
     R: FnOnce() -> Fut,
     Fut: Future<Output = std::io::Result<PairingCode>>,
 {
@@ -355,111 +345,54 @@ where
     if let Some(name) = name {
         check_name(known, name)?;
     }
-    if short_id == identity.short_id() {
-        return Err(PairError::OwnShortId);
+    if invite.key == identity.verifying_key() {
+        return Err(PairError::OwnInvite);
     }
-
-    let mut rendezvous = RendezvousClient::connect(&network.rendezvous).await?;
-    let found = rendezvous.lookup(short_id).await;
-    rendezvous.close().await;
-    let candidates: Vec<_> = found?
-        .into_iter()
-        .filter(|f| f.public_key != identity.verifying_key())
-        .collect();
-    if candidates.is_empty() {
-        return Err(PairError::NotFound(short_id.grouped()));
-    }
-    events(Event::Found {
-        count: candidates.len(),
-    });
 
     let code = read_code().await?;
 
-    let endpoint = endpoint::bind(identity, &network.relay, network.bind, &[]).await?;
-    let mut last_error = None;
-    let mut result = Err(PairError::NotFound(short_id.grouped()));
-    for candidate in candidates {
-        let peer = Fingerprint::of(&candidate.public_key);
-        events(Event::Connecting { peer });
-
-        let connected = tokio::time::timeout(
+    let endpoint = endpoint::bind(identity, &network.relay, network.bind, 0, &[]).await?;
+    let result = async {
+        events(Event::Connecting {
+            peer: invite.fingerprint(),
+        });
+        let connection = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            endpoint.connect(candidate.addr.clone(), PAIR_ALPN),
+            endpoint.connect(invite.endpoint_addr(), PAIR_ALPN),
         )
-        .await;
-        let connection = match connected {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(e)) => {
-                events(Event::CandidateFailed {
-                    peer,
-                    reason: e.to_string(),
-                });
-                last_error = Some(e.to_string());
-                continue;
-            }
-            Err(_) => {
-                events(Event::CandidateFailed {
-                    peer,
-                    reason: "timed out".into(),
-                });
-                last_error = Some("timed out".into());
-                continue;
-            }
-        };
+        .await
+        .map_err(|_| PairError::Connect("timed out".into()))?
+        .map_err(|e| PairError::Connect(e.to_string()))?;
 
-        // iroh dials by endpoint id, so a connection to anyone but the key we
-        // asked for cannot complete the handshake. Checked anyway: this is
+        // iroh dials by endpoint id, so a connection to anyone but the key in
+        // the invite cannot complete the handshake. Checked anyway: this is
         // the key that ends up in known_peers.
         let peer_key = endpoint::verifying_key(&connection.remote_id());
-        if peer_key != candidate.public_key {
+        if peer_key != invite.key {
             connection.close(1u32.into(), b"wrong peer");
-            last_error = Some("the device answered with a different key".into());
-            continue;
+            return Err(PairError::Connect(
+                "the device answered with a different key".into(),
+            ));
         }
 
-        let (send, recv) = match connection.open_bi().await {
-            Ok(halves) => halves,
-            Err(e) => {
-                last_error = Some(e.to_string());
-                continue;
-            }
-        };
-        let mut session = session(Role::Joiner, short_id, identity, peer_key, timeouts);
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| PairError::Connect(e.to_string()))?;
+        let mut session = session(
+            Role::Joiner,
+            invite.short_id(),
+            identity,
+            peer_key,
+            timeouts,
+        );
         let comment = identity.comment().trim();
         session.name_hint = (!comment.is_empty()).then(|| comment.to_string());
-        let outcome = run_on(
-            connection,
-            send,
-            recv,
-            &session,
-            &code,
-            pairing,
-            confirm.clone(),
-        )
-        .await;
-
-        match outcome {
-            // With a collision, a device that does not know the code fails
-            // here; the real one may still be further down the list.
-            Err(PairError::Pairing(PairingError::WrongCode)) => {
-                events(Event::CandidateFailed {
-                    peer,
-                    reason: "did not know the code".into(),
-                });
-                result = Err(PairError::Pairing(PairingError::WrongCode));
-            }
-            other => {
-                result = other;
-                break;
-            }
-        }
+        run_on(connection, send, recv, &session, &code, pairing, confirm).await
     }
+    .await;
     endpoint.close().await;
-
-    match (&result, last_error) {
-        (Err(PairError::NotFound(_)), Some(e)) => Err(PairError::Connect(e)),
-        _ => result,
-    }
+    result
 }
 
 fn session(

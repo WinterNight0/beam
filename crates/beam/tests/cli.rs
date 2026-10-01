@@ -299,42 +299,40 @@ fn send_is_no_longer_a_stub() {
     );
 }
 
-/// A rendezvous server on a free loopback port, on its own runtime, for as
-/// long as the value lives.
-struct Rendezvous {
-    url: String,
-    _runtime: tokio::runtime::Runtime,
-}
-
-fn rendezvous() -> Rendezvous {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let listener = runtime
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let url = format!("ws://{}/v1", listener.local_addr().unwrap());
-    runtime.spawn(beam::rendezvous::serve(
-        listener,
-        beam::rendezvous::ServerConfig::default(),
-    ));
-    Rendezvous {
-        url,
-        _runtime: runtime,
+/// An invite for `key` that points at a loopback port nobody is listening on.
+fn invite_for(key: ed25519_dalek::VerifyingKey) -> String {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    beam::invite::Invite {
+        key,
+        relay: None,
+        addrs: vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))],
     }
+    .to_string()
 }
 
-/// ADR-0031: a paired device that is not listening — or that ran `beam init`
-/// again, which looks identical from here — gets a message that says both,
-/// and says how to re-pair.
+/// ADR-0031 and ADR-0036: a paired device that does not answer at its saved
+/// address — not listening, moved, or re-initialised, which all look the same
+/// from here — gets a message that says all three, and says how to re-pair.
 #[test]
 fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
     let (tmp, dir) = initialised();
     seed_peers(&dir);
-    let server = rendezvous();
-    std::fs::write(
-        dir.join("config.toml"),
-        format!("rendezvous = \"{}\"\nrelay = \"none\"\n", server.url),
-    )
-    .unwrap();
+    std::fs::write(dir.join("config.toml"), "relay = \"none\"\n").unwrap();
+    // alice "listens" on a port where nothing is.
+    let store = Store::new(&dir);
+    let mut known = store.load_known_peers().unwrap();
+    let key = known.lookup("alice").unwrap().public_key;
+    let invite: beam::invite::Invite = invite_for(key).parse().unwrap();
+    beam::invite::remember(
+        known.lookup_key_mut(&key).unwrap(),
+        &invite,
+        &beam::config::Relay::Disabled,
+    );
+    store.save_known_peers(&known).unwrap();
     let file = tmp.path().join("note.txt");
     std::fs::write(&file, b"hello").unwrap();
 
@@ -351,6 +349,7 @@ fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
         "beam init",
         "re-pair",
         "beam remove alice",
+        "beam pair <alice's invite> --name alice",
     ] {
         assert!(
             outcome.stderr.contains(needle),
@@ -360,15 +359,13 @@ fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
     }
 }
 
+/// With the relay off and no address saved there is nowhere to look; beam says
+/// so, and says how to fix it, instead of waiting for a timeout.
 #[test]
-fn send_with_the_rendezvous_server_down_says_so() {
+fn send_with_no_relay_and_no_saved_address_says_where_to_get_one() {
     let (tmp, dir) = initialised();
     seed_peers(&dir);
-    std::fs::write(
-        dir.join("config.toml"),
-        "rendezvous = \"ws://127.0.0.1:1/v1\"\nrelay = \"none\"\n",
-    )
-    .unwrap();
+    std::fs::write(dir.join("config.toml"), "relay = \"none\"\n").unwrap();
     let file = tmp.path().join("note.txt");
     std::fs::write(&file, b"hello").unwrap();
     let outcome = run(
@@ -377,7 +374,16 @@ fn send_with_the_rendezvous_server_down_says_so() {
         &["send", "alice", file.to_str().unwrap(), "--loopback"],
     );
     assert_eq!(outcome.code, EXIT_ERROR);
-    assert!(outcome.stderr.contains("beam-server"), "{}", outcome.stderr);
+    for needle in [
+        "does not know where to find alice",
+        "beam pair <alice's invite>",
+    ] {
+        assert!(
+            outcome.stderr.contains(needle),
+            "no {needle:?} in: {}",
+            outcome.stderr
+        );
+    }
 }
 
 #[test]
@@ -479,7 +485,7 @@ fn pair_needs_a_name() {
 }
 
 #[test]
-fn pair_needs_a_short_id_or_wait_but_not_both() {
+fn pair_needs_an_invite_or_wait_but_not_both() {
     let (_tmp, dir) = initialised();
     let neither = run(&dir, "", &["pair", "--name", "alice"]);
     assert_eq!(neither.code, EXIT_ERROR, "{}", neither.stderr);
@@ -498,27 +504,89 @@ fn pair_needs_a_short_id_or_wait_but_not_both() {
 }
 
 #[test]
-fn pair_with_a_malformed_short_id_fails_before_the_network() {
+fn pair_with_something_that_is_not_an_invite_fails_before_the_network() {
     let (_tmp, dir) = initialised();
-    // The default rendezvous server is not running; reaching the Short ID
-    // check proves nothing was attempted over the network first.
-    let outcome = run(&dir, "", &["pair", "12345", "--name", "alice"]);
-    assert_eq!(outcome.code, EXIT_ERROR);
-    assert!(outcome.stderr.contains("9 digits"), "{}", outcome.stderr);
+    // A 9-digit Short ID, as the rendezvous version of beam used, is not an
+    // invite; nor is anything else that does not start with beam1.
+    for text in ["123456789", "beam1notreallyaninvite"] {
+        let outcome = run(&dir, "", &["pair", text, "--name", "alice"]);
+        assert_eq!(outcome.code, EXIT_ERROR);
+        assert!(
+            outcome.stderr.contains("invite"),
+            "{text}: {}",
+            outcome.stderr
+        );
+        assert!(
+            !outcome.stdout.contains("Pairing code"),
+            "{text}: asked for a code: {}",
+            outcome.stdout
+        );
+    }
 }
 
 #[test]
 fn pair_with_a_name_that_is_taken_fails_before_the_network() {
     let (_tmp, dir) = initialised();
     seed_peers(&dir);
-    let outcome = run(&dir, "", &["pair", "123456789", "--name", "alice"]);
+    let stranger = Identity::generate("carol").unwrap().verifying_key();
+    let outcome = run(
+        &dir,
+        "",
+        &["pair", &invite_for(stranger), "--name", "alice"],
+    );
     assert_eq!(outcome.code, EXIT_ERROR);
     assert!(
         outcome.stderr.contains("already exists"),
         "{}",
         outcome.stderr
     );
-    assert!(!outcome.stderr.contains("rendezvous"), "{}", outcome.stderr);
+}
+
+/// ADR-0036: the invite of a device that is already paired updates where to
+/// find it — without a code, without the network, and without touching its
+/// key or its name.
+#[test]
+fn pairing_again_with_a_known_devices_invite_only_updates_its_address() {
+    let (_tmp, dir) = initialised();
+    seed_peers(&dir);
+    let store = Store::new(&dir);
+    let key = store
+        .load_known_peers()
+        .unwrap()
+        .lookup("alice")
+        .unwrap()
+        .public_key;
+    let invite = invite_for(key);
+
+    let outcome = run(&dir, "", &["pair", &invite, "--name", "ali"]);
+    assert_eq!(outcome.code, EXIT_OK, "{}", outcome.stderr);
+    assert!(
+        outcome.stdout.contains("alice is already paired"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("beam rename alice ali"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(
+        !outcome.stdout.contains("Pairing code"),
+        "{}",
+        outcome.stdout
+    );
+
+    let known = store.load_known_peers().unwrap();
+    let alice = known.lookup("alice").expect("still called alice");
+    assert_eq!(alice.public_key, key, "the key is unchanged");
+    assert!(
+        alice
+            .attr("addrs")
+            .is_some_and(|a| a.starts_with("127.0.0.1:")),
+        "{:?}",
+        alice.attr("addrs")
+    );
+    assert_eq!(known.len(), 2, "no peer was added");
 }
 
 #[test]

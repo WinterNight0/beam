@@ -1,5 +1,9 @@
 //! `beam listen` and `beam send` over iroh — the real transport from M5 on.
 //!
+//! No server is involved. `listen` shows an invite; `send` reaches a peer by
+//! its key, through its relay or at the addresses its invite named, as saved
+//! in `known_peers` (ADR-0036).
+//!
 //! The M2 TCP stand-in is still there behind the hidden `--addr` flag, for
 //! tests only (see `transfer_cmds.rs` and ADR-0018).
 
@@ -14,6 +18,7 @@ use super::transfer_cmds::{EitherReporter, ReceiveJson, SendJson, reporter_for};
 use super::{App, CommandError, Io};
 use crate::config::Config;
 use crate::identity::{Fingerprint, encode_public_key};
+use crate::invite;
 use crate::listener::{ListenEvent, ListenOptions};
 use crate::pairing::rotation::NewCodeReason;
 use crate::pairing::{Network, Policy, Timeouts};
@@ -29,9 +34,9 @@ impl App {
         let config = Config::load(&self.store.config_path())
             .map_err(|e| CommandError::Message(e.to_string()))?;
         Ok(Network {
-            rendezvous: config.rendezvous,
             relay: config.relay,
             bind: if loopback { Bind::Loopback } else { Bind::Any },
+            port: config.port,
         })
     }
 
@@ -116,14 +121,14 @@ impl App {
         })?;
         let peer_name = peer.name.clone();
         let peer_key = peer.public_key;
+        let network = self.network(loopback)?;
+        let peer_addr = invite::peer_addr(peer, &network.relay);
         if !file.is_file() {
             return Err(CommandError::Message(format!(
                 "{} is not a file",
                 file.display()
             )));
         }
-        let network = self.network(loopback)?;
-
         let mut options = SendOptions::new(file, encode_public_key(&identity.verifying_key()));
         options.accept_timeout = DEFAULT_ACCEPT_TIMEOUT;
         if let Some(chunk_size) = chunk_size {
@@ -141,11 +146,11 @@ impl App {
                 writeln!(io.out, "Looking for {peer_name}...")?;
                 io.out.flush()?;
             }
-            let endpoint = endpoint::bind(&identity, &network.relay, network.bind, &[])
+            let endpoint = endpoint::bind(&identity, &network.relay, network.bind, 0, &[])
                 .await
                 .map_err(|e| CommandError::Message(e.to_string()))?;
             let outcome = async {
-                let connection = dial(&endpoint, &network.rendezvous, &peer_key, XFER_ALPN)
+                let connection = dial(&endpoint, peer_addr, XFER_ALPN)
                     .await
                     .map_err(|e| unreachable_message(&peer_name, &peer_key, e))?;
                 if !self.json {
@@ -208,19 +213,25 @@ fn unreachable_message(
 ) -> CommandError {
     let fingerprint = Fingerprint::of(key).short();
     CommandError::Message(match error {
-        DialError::NotListening => format!(
-            "{peer} ({fingerprint}) is not reachable.\n       \
-             Either {peer} is not running `beam listen`, or {peer}'s key has changed\n       \
-             because it ran `beam init` again. beam never follows a key change by itself.\n\n       \
-             WARNING: if you did not expect {peer} to have a new key, someone could be\n       \
-             impersonating {peer}. Check the new fingerprint with {peer} in person before\n       \
-             you re-pair:\n           \
+        DialError::Unreachable(why) => format!(
+            "{peer} ({fingerprint}) is not reachable ({why}).\n       \
+             Either {peer} is not running `beam listen`, {peer} is somewhere beam was not\n       \
+             told about, or {peer}'s key has changed because it ran `beam init` again.\n       \
+             beam never follows a key change by itself.\n\n       \
+             If {peer} is listening, ask for the invite it shows now and run\n           \
+             beam pair <{peer}'s invite> --name {peer}\n       \
+             That only updates where to find {peer}; it cannot change {peer}'s key.\n\n       \
+             WARNING: if {peer} now has a new key, someone could be impersonating {peer}.\n       \
+             Check the new fingerprint with {peer} in person before you re-pair:\n           \
              beam remove {peer}\n           \
-             beam pair <{peer}'s new Short ID> --name {peer}"
+             beam pair <{peer}'s new invite> --name {peer}"
         ),
-        DialError::Unreachable(why) => {
-            format!("{peer} ({fingerprint}) is listening but could not be reached: {why}")
-        }
+        DialError::NoAddress => format!(
+            "beam does not know where to find {peer} ({fingerprint}): no relay is set in\n       \
+             config.toml and no address was saved for {peer}. Ask for the invite `beam listen`\n       \
+             shows on {peer} and run\n           \
+             beam pair <{peer}'s invite> --name {peer}"
+        ),
         other => other.to_string(),
     })
 }
@@ -238,7 +249,7 @@ fn refused_message(peer: &str, error: TransferError) -> CommandError {
              WARNING: a changed key is exactly what an impersonator would present, so {peer}\n       \
              must not simply accept it. To re-pair, compare fingerprints in person:\n           \
              on {peer}:  beam remove <this device>, then beam listen\n           \
-             here:     beam pair <{peer}'s Short ID> --name {peer}"
+             here:     beam remove {peer}, then beam pair <{peer}'s invite> --name {peer}"
         )),
         TransferError::Rejected(RejectReason::Declined) => {
             CommandError::Message(format!("{peer} declined the transfer"))
@@ -299,12 +310,12 @@ impl Screen {
     ) -> std::io::Result<()> {
         match event {
             ListenEvent::Ready {
-                short_id,
+                invite,
                 fingerprint,
                 code,
                 relay,
             } => {
-                ui::field(out, "Short ID", &short_id.grouped())?;
+                ui::field(out, "Invite", &invite.to_string())?;
                 ui::field(out, "Pairing code", &code.grouped())?;
                 ui::field(out, "Fingerprint", &fingerprint.to_string())?;
                 ui::field(out, "Relay", &relay.to_string())?;
@@ -312,7 +323,7 @@ impl Screen {
                 writeln!(out)?;
                 writeln!(
                     out,
-                    "To pair a new device, run on it:  beam pair {short_id} --name <a name for this one>"
+                    "To pair a new device, send it the invite and run on it:  beam pair <invite> --name <a name for this one>"
                 )?;
                 writeln!(
                     out,
@@ -323,14 +334,11 @@ impl Screen {
                     "Waiting for transfers. Every one has to be accepted by hand. Ctrl+C to stop."
                 )
             }
-            ListenEvent::RegistrationFailed(why) => writeln!(
+            ListenEvent::PortTaken { wanted, got } => writeln!(
                 err,
-                "beam: warning: cannot register with the rendezvous server ({why}); retrying.\n\
-                 beam: warning: until it is back, other devices cannot find this one."
+                "beam: warning: port {wanted} is in use, so this is listening on port {got}.\n\
+                 beam: warning: peers that saved the old address need the new invite, unless the relay reaches them."
             ),
-            ListenEvent::Registered => {
-                writeln!(out, "Registered with the rendezvous server again.")
-            }
             ListenEvent::NewCode { code, reason } => {
                 let why = match reason {
                     NewCodeReason::Start => "",

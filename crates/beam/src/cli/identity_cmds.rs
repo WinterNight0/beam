@@ -70,7 +70,7 @@ impl App {
         writeln!(io.out)?;
         writeln!(
             io.out,
-            "Give your Short ID to a peer so they can pair with you."
+            "To pair with another device, run `beam listen` and give it the invite shown."
         )?;
         self.warn_permissions(io);
         Ok(())
@@ -109,7 +109,7 @@ impl App {
         if peers.is_empty() {
             writeln!(
                 io.out,
-                "No paired peers yet. Use `beam pair <ID> --name <name>` to add one."
+                "No paired peers yet. Use `beam pair <INVITE> --name <name>` to add one."
             )?;
             return Ok(());
         }

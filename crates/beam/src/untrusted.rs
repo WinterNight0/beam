@@ -1,7 +1,7 @@
 //! Making text from the other side safe to put on a terminal.
 //!
 //! A file name, a pairing hint, a cancel reason, an error message quoting what
-//! a peer sent, the rendezvous server's error text: all of it is chosen by
+//! a peer sent, an invite pasted from a chat: all of it is chosen by
 //! someone else, and a terminal interprets some characters as commands. An
 //! ANSI sequence can recolour the screen, move the cursor, rewrite a line the
 //! user already read, or set the window title; a carriage return can print

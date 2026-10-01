@@ -9,14 +9,15 @@
 //!   it holds the private half of, during the TLS handshake. See ADR-0025.
 //! * **No n0 discovery.** The endpoint is built from `presets::Minimal`, which
 //!   installs a crypto provider and nothing else: no pkarr publisher, no DNS
-//!   lookup. Addresses come from beam's own rendezvous server. The relay is set
-//!   explicitly from `config.toml`. See `docs/n0-data.md` and S-17.
+//!   lookup. Addresses travel in invites and are saved in `known_peers`; the
+//!   relay is set explicitly from `config.toml`. See `docs/n0-data.md`, S-17
+//!   and ADR-0036.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
-use iroh::endpoint::{IdleTimeout, QuicTransportConfig, presets};
+use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
 
 use crate::config::Relay;
@@ -61,10 +62,30 @@ pub enum EndpointError {
 }
 
 /// Opens an iroh endpoint that uses this device's identity.
+///
+/// `port` is the UDP port to bind, or 0 for a random one. `listen` asks for a
+/// fixed port so that its invite, and the addresses its peers saved from it,
+/// stay the same from one run to the next. If that port is taken — another
+/// `listen`, or another program — this falls back to a random port rather than
+/// failing; [`bound_port`] says which one it got.
 pub async fn bind(
     identity: &Identity,
     relay: &Relay,
     bind: Bind,
+    port: u16,
+    alpns: &[&[u8]],
+) -> Result<Endpoint, EndpointError> {
+    match bind_on(identity, relay, bind, port, alpns).await {
+        Err(_) if port != 0 => bind_on(identity, relay, bind, 0, alpns).await,
+        result => result,
+    }
+}
+
+async fn bind_on(
+    identity: &Identity,
+    relay: &Relay,
+    bind: Bind,
+    port: u16,
     alpns: &[&[u8]],
 ) -> Result<Endpoint, EndpointError> {
     let secret = SecretKey::from_bytes(&identity.signing_key().to_bytes());
@@ -83,11 +104,28 @@ pub async fn bind(
         .relay_mode(relay_mode)
         .transport_config(transport)
         .alpns(alpns.iter().map(|a| a.to_vec()).collect());
-    if bind == Bind::Loopback {
-        builder = builder
-            .clear_ip_transports()
-            .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .map_err(|e| EndpointError::Bind(e.to_string()))?;
+    let invalid = |e: iroh::endpoint::InvalidSocketAddr| EndpointError::Bind(e.to_string());
+    match (bind, port) {
+        (Bind::Loopback, port) => {
+            builder = builder
+                .clear_ip_transports()
+                .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+                .map_err(invalid)?;
+        }
+        // iroh's own default: both families, random ports.
+        (Bind::Any, 0) => {}
+        (Bind::Any, port) => {
+            // IPv4 is required; IPv6 is welcome but may not exist.
+            builder = builder
+                .clear_ip_transports()
+                .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+                .map_err(invalid)?
+                .bind_addr_with_opts(
+                    SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                    BindOpts::default().set_is_required(false),
+                )
+                .map_err(invalid)?;
+        }
     }
     builder
         .bind()
@@ -95,8 +133,18 @@ pub async fn bind(
         .map_err(|e| EndpointError::Bind(e.to_string()))
 }
 
-/// The address to give the rendezvous server: this endpoint's id, its relay
-/// if one is configured and reachable, and its direct addresses.
+/// The UDP port an endpoint ended up on, for telling the person when the
+/// configured one was taken.
+pub fn bound_port(endpoint: &Endpoint) -> Option<u16> {
+    endpoint
+        .bound_sockets()
+        .into_iter()
+        .find(|s| s.is_ipv4())
+        .map(|s| s.port())
+}
+
+/// The address to put in an invite: this endpoint's id, its relay if one is
+/// configured and reachable, and its direct addresses.
 ///
 /// With a relay configured, this waits briefly for the relay connection so the
 /// relay URL is included. If the relay cannot be reached the address still
@@ -150,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn a_bound_endpoint_uses_the_device_key() {
         let identity = vectors::identity("bravo");
-        let endpoint = bind(&identity, &Relay::Disabled, Bind::Loopback, &[PAIR_ALPN])
+        let endpoint = bind(&identity, &Relay::Disabled, Bind::Loopback, 0, &[PAIR_ALPN])
             .await
             .unwrap();
         assert_eq!(endpoint.id(), endpoint_id(&identity.verifying_key()));
@@ -163,6 +211,55 @@ mod tests {
             "{addr:?} advertises a non-loopback address"
         );
         assert!(addr.ip_addrs().next().is_some(), "{addr:?} is not dialable");
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_taken_port_falls_back_to_a_random_one() {
+        let first = bind(
+            &vectors::identity("alpha"),
+            &Relay::Disabled,
+            Bind::Loopback,
+            0,
+            &[],
+        )
+        .await
+        .unwrap();
+        let taken = bound_port(&first).unwrap();
+
+        let second = bind(
+            &vectors::identity("bravo"),
+            &Relay::Disabled,
+            Bind::Loopback,
+            taken,
+            &[],
+        )
+        .await
+        .expect("a taken port is not fatal");
+        let got = bound_port(&second).unwrap();
+        assert_ne!(got, taken);
+        assert_ne!(got, 0);
+        first.close().await;
+        second.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_free_port_is_the_one_bound() {
+        let free = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let endpoint = bind(
+            &vectors::identity("alpha"),
+            &Relay::Disabled,
+            Bind::Loopback,
+            free,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(bound_port(&endpoint), Some(free));
         endpoint.close().await;
     }
 }
