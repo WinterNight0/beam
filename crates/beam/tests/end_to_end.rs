@@ -551,7 +551,7 @@ mod killed {
     }
 }
 
-/// `beam pair` between two real processes, through a real rendezvous server,
+/// `beam pair` between two real processes, with an invite and no server,
 /// followed by a transfer between the two devices it paired.
 ///
 /// Every prompt is waited for before it is answered, as above. That is what
@@ -565,47 +565,35 @@ mod pairing {
     /// nothing like the Accept prompt's `[y/N]`.
     pub(super) const PAIR_PROMPT: &str = "Type \"yes\" to pair, anything else to refuse";
 
-    /// A rendezvous server on a free loopback port, run on its own runtime
-    /// for as long as the value lives.
-    pub(super) struct Server {
-        pub(super) url: String,
-        _runtime: tokio::runtime::Runtime,
+    /// A UDP port on loopback that is free right now.
+    pub(super) fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|socket| socket.local_addr())
+            .expect("a free UDP port")
+            .port()
     }
 
-    pub(super) fn server() -> Server {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .expect("bind the rendezvous server");
-        let addr = listener.local_addr().expect("local addr");
-        runtime.spawn(beam::rendezvous::serve(
-            listener,
-            beam::rendezvous::ServerConfig::default(),
-        ));
-        Server {
-            url: format!("ws://{addr}/v1"),
-            _runtime: runtime,
-        }
-    }
-
-    /// Points a beam home at the test server, with no relay: this test must
-    /// not touch the internet.
-    pub(super) fn configure(beam_dir: &Path, url: &str) {
+    /// Gives a beam home its own `listen` port and no relay: these tests must
+    /// not touch the internet, and with a fixed port the address in a home's
+    /// invite stays the same from one `listen` to the next (ADR-0036).
+    pub(super) fn configure(beam_dir: &Path) -> u16 {
+        let port = free_port();
         std::fs::write(
             beam_dir.join("config.toml"),
-            format!("rendezvous = \"{url}\"\nrelay = \"none\"\n"),
+            format!("relay = \"none\"\nport = {port}\n"),
         )
         .expect("write config.toml");
+        port
     }
 
-    fn two_homes(server: &Server) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    fn two_homes() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let alice = tmp.path().join("alice");
         let bob = tmp.path().join("bob");
         beam(&alice, &["init"]);
         beam(&bob, &["init"]);
-        configure(&alice, &server.url);
-        configure(&bob, &server.url);
+        configure(&alice);
+        configure(&bob);
         (tmp, alice, bob)
     }
 
@@ -624,19 +612,17 @@ mod pairing {
 
     #[test]
     fn beam_pair_between_two_processes_then_a_transfer() {
-        let server = server();
-        let (tmp, alice, bob) = two_homes(&server);
+        let (tmp, alice, bob) = two_homes();
 
-        // bob waits; alice joins.
+        // bob waits; alice joins with the invite bob shows. No server.
         let mut waiter = Watched::spawn(&bob, &["pair", "--wait", "--name", "alice", "--loopback"]);
         waiter.wait_for("The code works for one attempt only.");
-        let short_id = waiter.field("Short ID");
+        let invite = waiter.field("Invite");
         let code = waiter.field("Pairing code");
-        assert_eq!(short_id.replace(' ', "").len(), 9, "{short_id:?}");
+        assert!(invite.starts_with("beam1"), "{invite:?}");
         assert_eq!(code.replace(' ', "").len(), 6, "{code:?}");
 
-        let mut joiner =
-            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        let mut joiner = Watched::spawn(&alice, &["pair", &invite, "--name", "bob", "--loopback"]);
         joiner.wait_for("Pairing code shown on the other device: ");
         joiner.answer(&code);
 
@@ -668,24 +654,22 @@ mod pairing {
             "{alices_peers}"
         );
 
-        // And the pairing is good for what it is for: a transfer.
+        // alice saved where the invite said bob is, next to bob's key.
+        assert!(alices_peers.contains("addrs=127.0.0.1:"), "{alices_peers}");
+
+        // And the pairing is good for what it is for: a transfer, over iroh,
+        // to the address alice saved — still with no server anywhere.
         let inbox = tmp.path().join("inbox");
         std::fs::create_dir_all(&inbox).expect("create inbox");
         let payload = tmp.path().join("hello.txt");
         std::fs::write(&payload, b"paired, then sent").unwrap();
         let mut listener = Watched::spawn(
             &bob,
-            &[
-                "listen",
-                "--addr",
-                "127.0.0.1:0",
-                "--out",
-                inbox.to_str().unwrap(),
-            ],
+            &["listen", "--loopback", "--out", inbox.to_str().unwrap()],
         );
-        let addr = listener.listening_on();
+        listener.wait_for("Waiting for transfers");
         let sender = Command::new(BEAM)
-            .args(["send", "bob", payload.to_str().unwrap(), "--addr", &addr])
+            .args(["send", "bob", payload.to_str().unwrap(), "--loopback"])
             .env("BEAM_DIR", &alice)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -704,12 +688,11 @@ mod pairing {
 
     #[test]
     fn a_wrong_code_between_two_processes_saves_nothing_on_either_side() {
-        let server = server();
-        let (_tmp, alice, bob) = two_homes(&server);
+        let (_tmp, alice, bob) = two_homes();
 
         let mut waiter = Watched::spawn(&bob, &["pair", "--wait", "--name", "alice", "--loopback"]);
         waiter.wait_for("The code works for one attempt only.");
-        let short_id = waiter.field("Short ID");
+        let invite = waiter.field("Invite");
         let code: u32 = waiter
             .field("Pairing code")
             .replace(' ', "")
@@ -717,8 +700,7 @@ mod pairing {
             .unwrap();
         let wrong = format!("{:06}", (code + 1) % 1_000_000);
 
-        let mut joiner =
-            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        let mut joiner = Watched::spawn(&alice, &["pair", &invite, "--name", "bob", "--loopback"]);
         joiner.wait_for("Pairing code shown on the other device: ");
         joiner.answer(&wrong);
 
@@ -742,16 +724,14 @@ mod pairing {
 
     #[test]
     fn answering_no_to_pairing_saves_nothing_on_either_side() {
-        let server = server();
-        let (_tmp, alice, bob) = two_homes(&server);
+        let (_tmp, alice, bob) = two_homes();
 
         let mut waiter = Watched::spawn(&bob, &["pair", "--wait", "--name", "alice", "--loopback"]);
         waiter.wait_for("The code works for one attempt only.");
-        let short_id = waiter.field("Short ID");
+        let invite = waiter.field("Invite");
         let code = waiter.field("Pairing code");
 
-        let mut joiner =
-            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        let mut joiner = Watched::spawn(&alice, &["pair", &invite, "--name", "bob", "--loopback"]);
         joiner.wait_for("Pairing code shown on the other device: ");
         joiner.answer(&code);
 
@@ -776,18 +756,38 @@ mod pairing {
 }
 
 /// M5: the real transport. `listen` and `send` without `--addr`, over iroh on
-/// loopback, found through a real rendezvous server — every Accept rule and
-/// resume, as real processes, with every prompt waited for before it is
+/// loopback, each peer found at the address saved for it — every Accept rule
+/// and resume, as real processes, with every prompt waited for before it is
 /// answered.
 mod over_iroh {
-    use super::pairing::{PAIR_PROMPT, configure, server};
+    use super::pairing::{PAIR_PROMPT, configure};
     use super::*;
 
-    /// Two homes paired by hand, pointed at `server`, plus a payload.
-    fn setup(payload_len: usize, url: &str) -> Demo {
+    /// Saves, in `beam_dir`'s known_peers, that `name` listens on `port` —
+    /// what `beam pair <invite>` would have saved.
+    fn point_at(beam_dir: &Path, name: &str, port: u16) {
+        let path = beam_dir.join("known_peers");
+        let peers: String = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.starts_with(&format!("{name} ")) {
+                    format!("{line} addrs=127.0.0.1:{port}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&path, peers).unwrap();
+    }
+
+    /// Two homes paired by hand, each with its own port, alice knowing where
+    /// bob listens, plus a payload.
+    fn setup(payload_len: usize) -> Demo {
         let demo = demo(payload_len);
-        configure(&demo.alice, url);
-        configure(&demo.bob, url);
+        configure(&demo.alice);
+        let bobs_port = configure(&demo.bob);
+        point_at(&demo.alice, "bob", bobs_port);
         demo
     }
 
@@ -818,8 +818,7 @@ mod over_iroh {
 
     #[test]
     fn a_transfer_over_iroh_is_accepted_by_hand_and_arrives_intact() {
-        let server = server();
-        let demo = setup(600_000, &server.url);
+        let demo = setup(600_000);
         let mut listener = listen(&demo);
         let mut sender = send(&demo, &[]);
 
@@ -841,8 +840,7 @@ mod over_iroh {
 
     #[test]
     fn answering_no_over_iroh_saves_nothing_and_says_so() {
-        let server = server();
-        let demo = setup(10_000, &server.url);
+        let demo = setup(10_000);
         let mut listener = listen(&demo);
         let mut sender = send(&demo, &[]);
 
@@ -857,8 +855,7 @@ mod over_iroh {
     /// refused with no prompt on bob's screen, and is told why.
     #[test]
     fn an_unpaired_sender_is_refused_without_a_prompt() {
-        let server = server();
-        let demo = setup(10_000, &server.url);
+        let demo = setup(10_000);
         // bob forgets alice; alice still knows bob.
         beam(&demo.bob, &["remove", "alice", "--yes"]);
         let mut listener = listen(&demo);
@@ -878,8 +875,7 @@ mod over_iroh {
     /// run asks again (S-2), says it is a resume, and sends only the rest.
     #[test]
     fn killing_the_sender_over_iroh_then_resuming() {
-        let server = server();
-        let demo = setup(2 * 1024 * 1024, &server.url);
+        let demo = setup(2 * 1024 * 1024);
         let work = demo.bob.join("tmp");
         let mut listener = listen(&demo);
 
@@ -912,12 +908,11 @@ mod over_iroh {
     /// transfer is open is told, in words, to try later.
     #[test]
     fn a_second_sender_is_told_the_receiver_is_busy() {
-        let server = server();
-        let demo = setup(10_000, &server.url);
+        let demo = setup(10_000);
         // carol, also paired with bob.
         let carol = demo._tmp.path().join("carol");
         beam(&carol, &["init"]);
-        configure(&carol, &server.url);
+        configure(&carol);
         let carol_key = public_key_of(&carol);
         let bob_key = public_key_of(&demo.bob);
         let mut bobs = std::fs::read_to_string(demo.bob.join("known_peers")).unwrap();
@@ -925,9 +920,17 @@ mod over_iroh {
             "carol  ed25519 {carol_key}  added=2026-01-01T00:00:00Z\n"
         ));
         std::fs::write(demo.bob.join("known_peers"), bobs).unwrap();
+        let bobs_port: u16 = std::fs::read_to_string(demo.bob.join("config.toml"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("port = "))
+            .and_then(|p| p.trim().parse().ok())
+            .unwrap();
         std::fs::write(
             carol.join("known_peers"),
-            format!("# beam known_peers v1\nbob  ed25519 {bob_key}  added=2026-01-01T00:00:00Z\n"),
+            format!(
+                "# beam known_peers v1\nbob  ed25519 {bob_key}  added=2026-01-01T00:00:00Z addrs=127.0.0.1:{bobs_port}\n"
+            ),
         )
         .unwrap();
 
@@ -952,13 +955,12 @@ mod over_iroh {
     /// follows the new key by itself (rule 3, S-8).
     #[test]
     fn a_receiver_that_re_ran_init_gets_a_re_pair_warning_not_a_transfer() {
-        let server = server();
-        let demo = setup(10_000, &server.url);
+        let demo = setup(10_000);
         beam(&demo.bob, &["init", "--force"]);
         let mut listener = listen(&demo);
         let mut sender = send(&demo, &[]);
 
-        sender.wait_for("beam pair <bob's new Short ID> --name bob");
+        sender.wait_for("beam pair <bob's new invite> --name bob");
         assert!(!sender.exit_status().success());
         for needle in [
             "not reachable",
@@ -985,13 +987,12 @@ mod over_iroh {
     /// warning that a changed key is what an impersonator would present.
     #[test]
     fn a_sender_that_re_ran_init_is_refused_with_a_re_pair_warning() {
-        let server = server();
-        let demo = setup(10_000, &server.url);
+        let demo = setup(10_000);
         beam(&demo.alice, &["init", "--force"]);
         let mut listener = listen(&demo);
         let mut sender = send(&demo, &[]);
 
-        sender.wait_for("here:     beam pair <bob's Short ID> --name bob");
+        sender.wait_for("here:     beam remove bob, then beam pair <bob's invite> --name bob");
         assert!(!sender.exit_status().success());
         for needle in [
             "does not recognise this device's key",
@@ -1013,27 +1014,25 @@ mod over_iroh {
     /// own thing, and `y` does not confirm it.
     #[test]
     fn listen_pairs_but_only_with_yes_in_full() {
-        let server = server();
         let tmp = tempfile::tempdir().unwrap();
         let (alice, bob) = (tmp.path().join("alice"), tmp.path().join("bob"));
         let inbox = tmp.path().join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
         beam(&alice, &["init"]);
         beam(&bob, &["init"]);
-        configure(&alice, &server.url);
-        configure(&bob, &server.url);
+        configure(&alice);
+        configure(&bob);
 
         let mut listener = Watched::spawn(
             &bob,
             &["listen", "--loopback", "--out", inbox.to_str().unwrap()],
         );
         listener.wait_for("Waiting for transfers");
-        let short_id = listener.field("Short ID");
+        let invite = listener.field("Invite");
 
         // First attempt: bob answers `y`, which is not a yes to pairing.
         let code = listener.field("Pairing code");
-        let mut joiner =
-            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        let mut joiner = Watched::spawn(&alice, &["pair", &invite, "--name", "bob", "--loopback"]);
         joiner.wait_for("Pairing code shown on the other device: ");
         joiner.answer(&code);
         listener.wait_for("PAIRING REQUEST - this is permanent");
@@ -1064,8 +1063,7 @@ mod over_iroh {
             .chars()
             .filter(|c| c.is_ascii_digit())
             .collect();
-        let mut joiner =
-            Watched::spawn(&alice, &["pair", &short_id, "--name", "bob", "--loopback"]);
+        let mut joiner = Watched::spawn(&alice, &["pair", &invite, "--name", "bob", "--loopback"]);
         joiner.wait_for("Pairing code shown on the other device: ");
         joiner.answer(&code);
         listener.wait_for_count(PAIR_PROMPT, 2);

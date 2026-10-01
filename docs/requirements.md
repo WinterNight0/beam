@@ -1,5 +1,9 @@
 # Beam — requirements
 
+> **Branch `main-test`:** there is no rendezvous server on this branch;
+> devices meet through invites and are found again by key through the relay
+> (ADR-0036 in `decisions.md`). Requirements that mention the server, its registrations or the Short ID lookup (S-18 to S-22) apply to `main`; on this branch the invite takes their place, and the security properties they protect are covered by the tests named in ADR-0036 and the revised `threat-model.md`.
+
 Beam is a terminal-only tool that sends a file directly from one computer to
 another. A rendezvous server helps two devices find each other; file data never
 passes through it. When a direct connection is impossible, the encrypted

@@ -558,8 +558,11 @@ mod tests {
     #[test]
     fn a_notice_with_no_question_open_is_printed_at_once() {
         let (desk, _typed, screen) = desk();
-        desk.notice("Registered with the rendezvous server again.");
-        screen.wait_for("Registered with the rendezvous server again.", PATIENCE);
+        desk.notice("Port 7820 is in use, so this is listening on port 50123.");
+        screen.wait_for(
+            "Port 7820 is in use, so this is listening on port 50123.",
+            PATIENCE,
+        );
         assert!(!screen.text().contains("Accept"));
     }
 

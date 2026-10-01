@@ -1,5 +1,9 @@
 # Beam — test plan
 
+> **Branch `main-test`:** there is no rendezvous server on this branch;
+> devices meet through invites and are found again by key through the relay
+> (ADR-0036 in `decisions.md`). Rendezvous-server test cases apply to `main`. Here they are replaced by the invite tests (`invite::tests`), `tests/pairing.rs`, and the address tests in `tests/listen.rs` and `tests/cli.rs`.
+
 ## How to run
 
 ```

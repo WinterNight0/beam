@@ -1,15 +1,21 @@
-//! `beam pair --wait` and `beam pair <ID>`.
+//! `beam pair --wait` and `beam pair <INVITE>`.
 //!
 //! Pairing needs one device to wait and one to join:
 //!
 //! ```text
-//! device B:  beam pair --wait --name alice      shows Short ID + code
-//! device A:  beam pair 123456789 --name bob     asks for the code
+//! device B:  beam listen                          shows an invite + code
+//!       (or  beam pair --wait --name alice)
+//! device A:  beam pair beam1… --name bob          asks for the code
 //! ```
 //!
-//! In M4 the waiting side is its own command, because `beam listen` still
-//! receives transfers over the development TCP transport. In M5 both move onto
-//! iroh and the waiting merges into `listen`. See ADR-0028.
+//! The invite carries everything A needs to reach B — B's key, relay and
+//! direct addresses — so no server is involved (ADR-0036). After pairing, A
+//! saves the relay and addresses next to B's key, which is how `beam send`
+//! finds B again.
+//!
+//! Given the invite of a device that is already paired, `beam pair` only
+//! updates where to find it. That never changes a stored key: a device with a
+//! new key is a new pairing (rule 3).
 
 use std::time::Duration;
 
@@ -17,12 +23,13 @@ use super::desk::{DeskPrompt, PromptDesk};
 use super::terminal::Keyboard;
 use super::{App, CommandError, Io};
 use crate::config::Config;
-use crate::identity::{Identity, Peer, ShortId};
+use crate::identity::{Identity, Peer};
+use crate::invite::{self, Invite};
 use crate::pairing::{
     CodeSlot, Event, Network, PairError, Pairing, PairingCode, PairingError, Timeouts, join, wait,
 };
 use crate::transport::endpoint::Bind;
-use crate::ui;
+use crate::{ui, untrusted};
 
 /// How long the joiner has to type the code.
 const CODE_ENTRY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -34,7 +41,7 @@ const CODE_ENTRY_TRIES: usize = 3;
 impl App {
     pub(super) fn pair(
         &self,
-        short_id: Option<&str>,
+        invite: Option<&str>,
         name: &str,
         wait_for_peer: bool,
         loopback: bool,
@@ -45,21 +52,29 @@ impl App {
         let config = Config::load(&self.store.config_path())
             .map_err(|e| CommandError::Message(e.to_string()))?;
         let network = Network {
-            rendezvous: config.rendezvous,
             relay: config.relay,
             bind: if loopback { Bind::Loopback } else { Bind::Any },
+            port: config.port,
         };
         let timeouts = Timeouts::default();
 
-        // Parse the Short ID before anything else, so a typo is caught
+        // Read the invite before anything else, so a damaged one is caught
         // without touching the network.
-        let short_id: Option<ShortId> = match short_id {
+        let invite: Option<Invite> = match invite {
             Some(text) => Some(
                 text.parse()
-                    .map_err(|e| CommandError::Message(format!("{text:?}: {e}")))?,
+                    .map_err(|e: invite::InviteError| CommandError::Message(e.to_string()))?,
             ),
             None => None,
         };
+
+        // An invite from a device that is already paired: only where to find
+        // it changes. No code, no network, and never the key.
+        if let Some(invite) = &invite
+            && known.lookup_key(&invite.key).is_some()
+        {
+            return self.update_location(invite, name, &network, io);
+        }
 
         let keyboard = Keyboard::start();
         let confirm = DeskPrompt::new(PromptDesk::terminal(keyboard.clone()), timeouts.decision);
@@ -73,7 +88,7 @@ impl App {
         };
 
         let result = runtime.block_on(async {
-            match short_id {
+            match &invite {
                 None => {
                     let code = PairingCode::generate()
                         .map_err(|e| PairError::Io(std::io::Error::other(e)))?;
@@ -83,15 +98,14 @@ impl App {
                     })
                     .await
                 }
-                Some(short_id) => {
+                Some(invite) => {
                     let keyboard = keyboard.clone();
                     let read_code = || async move {
                         tokio::task::spawn_blocking(move || read_code(&keyboard))
                             .await
                             .map_err(std::io::Error::other)?
                     };
-                    writeln!(io.out, "Looking up {}...", short_id.grouped())?;
-                    join(&pairing, short_id, read_code, confirm, |event| {
+                    join(&pairing, invite, read_code, confirm, |event| {
                         show_event(io, &identity, &network, event)
                     })
                     .await
@@ -103,7 +117,10 @@ impl App {
 
         // Read the file again: it may have changed while the prompt was up.
         let mut known = self.store.load_known_peers()?;
-        let peer = Peer::new(name, key);
+        let mut peer = Peer::new(name, key);
+        if let Some(invite) = &invite {
+            invite::remember(&mut peer, invite, &network.relay);
+        }
         let fingerprint = peer.fingerprint();
         known.add(peer)?;
         self.store.save_known_peers(&known)?;
@@ -111,6 +128,37 @@ impl App {
         writeln!(io.out)?;
         writeln!(io.out, "Paired with {name}.")?;
         ui::field(io.out, "Fingerprint", &fingerprint.to_string())?;
+        Ok(())
+    }
+
+    /// Saves where an already-paired device can be found now.
+    fn update_location(
+        &self,
+        invite: &Invite,
+        asked_name: &str,
+        network: &Network,
+        io: &mut Io<'_>,
+    ) -> Result<(), CommandError> {
+        let mut known = self.store.load_known_peers()?;
+        let peer = known
+            .lookup_key_mut(&invite.key)
+            .expect("checked by the caller");
+        invite::remember(peer, invite, &network.relay);
+        let name = untrusted::name(&peer.name);
+        let fingerprint = peer.fingerprint();
+        self.store.save_known_peers(&known)?;
+
+        writeln!(
+            io.out,
+            "{name} is already paired. Updated where to find it; its key is unchanged."
+        )?;
+        ui::field(io.out, "Fingerprint", &fingerprint.to_string())?;
+        if !name.eq_ignore_ascii_case(asked_name) {
+            writeln!(
+                io.out,
+                "It is still called {name}; `beam rename {name} {asked_name}` changes that."
+            )?;
+        }
         Ok(())
     }
 }
@@ -121,22 +169,25 @@ fn show_event(io: &mut Io<'_>, identity: &Identity, network: &Network, event: Ev
     let out = &mut *io.out;
     let _ = match event {
         Event::Waiting {
-            short_id,
+            invite,
             code,
             expires_in,
         } => (|| {
             writeln!(out, "Waiting for another device to pair with this one.")?;
             writeln!(out)?;
-            ui::field(out, "Short ID", &short_id.grouped())?;
+            ui::field(out, "Invite", &invite.to_string())?;
             ui::field(out, "Pairing code", &code.grouped())?;
             ui::field(out, "Expires", &format!("in {}", minutes(expires_in)))?;
             ui::field(out, "Fingerprint", &identity.fingerprint().to_string())?;
             ui::field(out, "Relay", &network.relay.to_string())?;
             writeln!(out)?;
-            writeln!(out, "On the other device, run")?;
             writeln!(
                 out,
-                "    beam pair {short_id} --name <a name for this device>"
+                "Send the invite to the other person. On their device, run"
+            )?;
+            writeln!(
+                out,
+                "    beam pair <the invite> --name <a name for this device>"
             )?;
             writeln!(
                 out,
@@ -144,26 +195,12 @@ fn show_event(io: &mut Io<'_>, identity: &Identity, network: &Network, event: Ev
             )?;
             out.flush()
         })(),
-        Event::RefreshFailed(e) => {
-            writeln!(
-                io.err,
-                "beam: warning: could not refresh the registration: {e}"
-            )
-        }
         Event::Attempt { peer } => writeln!(
             out,
             "\nA device is pairing ({}). The code is now used up.",
             peer.short()
         ),
-        Event::Found { count: 1 } => writeln!(out, "Found it."),
-        Event::Found { count } => writeln!(
-            out,
-            "Found {count} devices with that Short ID; the code will tell them apart."
-        ),
         Event::Connecting { peer } => writeln!(out, "Connecting to {}", peer.short()),
-        Event::CandidateFailed { peer, reason } => {
-            writeln!(out, "  {} did not work out: {reason}", peer.short())
-        }
     };
 }
 
@@ -202,8 +239,8 @@ fn not_paired(error: PairError, waited: bool) -> CommandError {
             "\n       The code is used up. Run `beam pair --wait` again for a new one."
         }
         (PairError::Pairing(_), false) => {
-            "\n       The other device's code is now used up; it has to run \
-             `beam pair --wait` again for a new one."
+            "\n       The other device's code is now used up; it shows a new one \
+             (or, with `beam pair --wait`, has to be run again)."
         }
         _ => "",
     };

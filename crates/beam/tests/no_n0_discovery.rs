@@ -2,8 +2,9 @@
 //!
 //! iroh's `presets::N0` publishes the device's endpoint id and relay URL to
 //! n0's pkarr server every five minutes and resolves other devices the same
-//! way. beam replaces that with its own rendezvous server and builds its
-//! endpoint from `presets::Minimal`; `docs/n0-data.md` explains why.
+//! way. beam needs none of it — peers are found by the addresses in their
+//! invites and their relay (ADR-0036) — and builds its endpoint from
+//! `presets::Minimal`; `docs/n0-data.md` explains why.
 //!
 //! iroh does not offer a way to ask a bound endpoint which address lookup
 //! services it has, so this is checked where the decision is made: in the
@@ -35,14 +36,13 @@ fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The source of both crates, without comments: the rule is about what the
+/// The source of the crate, without comments: the rule is about what the
 /// code does, and the doc comments that explain the rule have to name the
 /// things they forbid.
 fn code_lines() -> Vec<(PathBuf, usize, String)> {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     rust_files(&crate_dir.join("src"), &mut files);
-    rust_files(&crate_dir.join("../beam-server/src"), &mut files);
     assert!(files.len() > 10, "found only {} source files", files.len());
 
     let mut lines = Vec::new();

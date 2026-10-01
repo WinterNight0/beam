@@ -1,5 +1,9 @@
 # Deploying the rendezvous server
 
+> **Branch `main-test`:** there is no rendezvous server on this branch;
+> devices meet through invites and are found again by key through the relay
+> (ADR-0036 in `decisions.md`). This page applies to `main` only. The one thing worth deploying here is a self-hosted `iroh-relay`, set with `relay` in `config.toml`.
+
 `beam-server` introduces devices to each other: it maps a Short ID or a public
 key to an iroh endpoint address while a device is listening. It never sees a
 file, a pairing code or a private key, and it keeps nothing on disk
