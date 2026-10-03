@@ -311,7 +311,8 @@ speaks a different version fails the handshake instead of misreading messages.
 | ALPN | Used for |
 |---|---|
 | `beam/pair/1` | pairing (section 4) |
-| `beam/xfer/1` | file transfers (section 7) |
+| `beam/xfer/2` | file transfers, several chunks in flight (section 7) |
+| `beam/xfer/1` | file transfers, one chunk at a time; still accepted, and used with an older beam |
 
 For a transfer, `listen` checks **the key the connection proved** against
 `known_peers`:
@@ -355,6 +356,7 @@ spans about 64 frames.
 Sender (beam send)                                      Receiver (beam listen)
 ──────────────────                                      ──────────────────────
 hashes the whole file (SHA-256)   "Hashing …"
+  and remembers each chunk's hash
 TRANSFER_REQUEST {transfer_id, file_name, size,
                   chunk_size, chunk_count, file_sha256} ──►
                                                         checks: known peer? sane request?
@@ -363,14 +365,17 @@ TRANSFER_REQUEST {transfer_id, file_name, size,
                                           ◄── ACCEPT {transfer_id, have_bitmap}
                                               (or REJECT {reason}: declined, expired,
                                                unknown peer, busy, no space, bad request)
-for each chunk the receiver does not have:
+for each chunk the receiver does not have, up to 4 on the way at once:
+  re-reads it, checks it against the remembered hash
+  (a changed file: CANCEL and stop)
   CHUNK_START {index, len, sha256}                    ──►
   CHUNK_DATA  {index, bytes} × ~64                    ──►
-                                                        hash matches? write it, flush,
-                                                        record it in the bitmap, flush
+                                                        hash matches? write it, record
+                                                        it in the bitmap; every 8
+                                                        chunks: flush to disk
                                           ◄── CHUNK_ACK {index}
-                                              (or CHUNK_NAK → the sender resends,
-                                               up to 3 attempts)
+                                              (or CHUNK_NAK → the sender resends it
+                                               after the others, up to 3 attempts)
 COMPLETE {transfer_id}                                ──►
                                                         re-hashes the whole file
                                           ◄── VERIFYING {done, total} (keep-alives)
@@ -425,7 +430,12 @@ Code: `src/transfer/` (`message.rs`, `frame.rs`, `sender.rs`, `receiver.rs`,
 ## 8. Resuming an interrupted transfer
 
 If a transfer breaks (Wi-Fi drops, a laptop sleeps, someone presses Ctrl+C),
-the chunks already received stay in `~/.beam/tmp/<transfer_id>/`:
+the chunks already received stay in `~/.beam/tmp/<transfer_id>/`. When it was
+Ctrl+C, the other device is told at once: beam closes the connection with its
+own "interrupted" code, and both terminals say which side stopped the transfer
+(ADR-0041).
+
+The partial transfer is kept in these files:
 
 | File | Holds |
 |---|---|
@@ -447,9 +457,14 @@ sender chooses, so nobody can attach to someone else's partial. Then:
    (ADR-0020).
 3. ACCEPT carries the bitmap, and the sender skips the chunks marked present.
 
-**Crash safety:** a chunk's data is flushed to disk *before* its bit is set and
-flushed. After a crash, at worst a chunk that was actually written is fetched
-again. Data is never claimed that is not there (D-10, ADR-0022).
+**Crash safety:** a chunk's data is written *before* its bit is set, and the
+disk is flushed every 8 chunks (32 MiB), after the last chunk, and whenever a
+transfer stops. If beam is killed or crashes, nothing is lost: the operating
+system still writes out what beam gave it. After power loss, the last batch
+may not have reached the disk. That is why the bitmap is only a claim: on
+resume every claimed chunk is re-hashed, and one that did not survive is
+fetched again. A chunk is never trusted without passing its hash (D-10, D-11,
+D-15, ADR-0022, ADR-0039).
 
 Partials are kept after a decline, an expiry or a lost connection, deleted on
 success or when the final hash fails, and expire after seven days.
@@ -489,20 +504,27 @@ speed = min( sender's upload,  receiver's download,  the path,  beam's own limit
 - **The path:** on `[Relay]`, every byte makes a detour through the relay.
   n0's public relay is shared and rate-limited, so large relayed transfers are
   slow whatever the two connections can do.
-- **beam's own limits** (measured from the code, not yet changed):
-  - QUIC's per-stream window is **1.25 MB** (the default of iroh's QUIC
-    library). One stream can only have that much unacknowledged data in
-    flight, so speed ≤ 1.25 MB ÷ round-trip time: about 125 MB/s at 10 ms, but
-    about 12.5 MB/s at 100 ms.
-  - **One chunk at a time.** After each 4 MiB chunk, the sender waits for
-    CHUNK_ACK while the receiver hashes, writes and flushes the chunk twice.
-    The line is idle for one round trip plus that disk time, every 4 MiB.
+- **beam's own limits** (ADR-0039 raised two of them):
+  - **QUIC windows.** One stream may have up to **16 MiB** unacknowledged
+    data in flight, and one connection 32 MiB across all its streams. iroh's
+    QUIC library defaults to 1.25 MB per stream, which allowed only about
+    12.5 MB/s at a 100 ms round trip.
+  - **Four chunks in flight** (ADR-0040). The sender keeps up to four 4 MiB
+    chunks on the way before their CHUNK_ACKs arrive, so the line is not idle
+    while it waits. One at a time cost about two round trips per chunk: 34 MB/s
+    at 50 ms, 17 MB/s at 100 ms. Four in flight measured about 108 MB/s and
+    73 MB/s. With an older beam on the other side (`beam/xfer/1`) it is still
+    one at a time.
+  - **Disk flushes in batches.** Received chunks are recorded at once but
+    flushed to disk every 8 chunks (32 MiB), not after each one.
+    A transfer that stops keeps everything it verified; only a crash of the
+    receiver can lose the last unflushed batch, which resume asks for again.
   - **Two full reads outside the progress bar**: the sender hashes the whole
-    file before asking, and the receiver re-hashes it at the end.
+    file before asking, and the receiver re-hashes it at the end. On an SSD
+    each runs at about 1.5 GB/s, so this matters little.
 
-A larger QUIC window, several chunks in flight, and fewer disk flushes are the
-candidate improvements. They are to be planned and measured before any change,
-because two of them touch the protocol or the crash-safety rules.
+What has been measured, with the benchmark that measures it, is in
+[performance-plan.md](performance-plan.md).
 
 ---
 

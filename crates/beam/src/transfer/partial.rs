@@ -45,6 +45,22 @@ const LOCK_FILE: &str = "lock";
 /// Bytes of hash stored per chunk.
 const HASH_BYTES: u64 = 32;
 
+/// How much received data may wait in the operating system's cache before it
+/// is flushed to disk: this many bytes, or [`FLUSH_EVERY_CHUNKS`] chunks,
+/// whichever comes first. At the default 4 MiB chunk the two agree.
+///
+/// Flushing after every chunk cost three flushes and a rename per chunk. A
+/// chunk is still *recorded* the moment it is written, so if beam itself is
+/// killed or crashes nothing is lost: the operating system keeps writes a
+/// process made, and writes them out later. Only power loss or an operating
+/// system crash can lose the unflushed batch, and then `reverify` notices on
+/// resume and asks for those chunks again. Performance plan, step 4; ADR-0039.
+pub const FLUSH_EVERY: u64 = 32 * 1024 * 1024;
+
+/// See [`FLUSH_EVERY`]. The chunk count keeps batches proportionate when
+/// chunks are small.
+pub const FLUSH_EVERY_CHUNKS: usize = 8;
+
 /// What makes two transfers the same transfer.
 ///
 /// Deliberately *not* the transfer id: that is chosen by the sender, so
@@ -171,6 +187,9 @@ pub struct Partial {
     plan: ChunkPlan,
     part: tokio::fs::File,
     hashes: tokio::fs::File,
+    /// How many recorded chunks, and bytes, are not yet flushed to disk.
+    unflushed: usize,
+    unflushed_bytes: u64,
     /// Whether this session created it, which decides whether an early failure
     /// should tidy it away (ADR-0022).
     created_here: bool,
@@ -211,13 +230,22 @@ impl Partial {
         self.dir.join(PART_FILE)
     }
 
-    /// Stores one verified chunk.
+    /// How many recorded chunks are not yet flushed to disk.
+    pub fn unflushed_chunks(&self) -> usize {
+        self.unflushed
+    }
+
+    /// Stores one verified chunk, and records it.
     ///
-    /// The order here is the whole point of the crash-consistency story: the
-    /// data and its hash are on disk and flushed **before** the bitmap says so.
-    /// A crash in the middle therefore loses the claim rather than the data —
-    /// the chunk is asked for again, which costs bandwidth, instead of being
-    /// treated as present when it is not. See ADR-0022.
+    /// The data and its hash are written first and the bitmap second, so the
+    /// bitmap never names a chunk before the operating system has its bytes.
+    /// That is enough when beam itself is killed: the operating system still
+    /// writes out what it was given. It is not enough after power loss, so the
+    /// bitmap is a claim, never proof: every claimed chunk is re-hashed by
+    /// [`reverify`](Self::reverify) before a resume offers it (D-11), and one
+    /// that did not survive is asked for again. [`flush`](Self::flush), every
+    /// [`FLUSH_EVERY`] bytes, bounds what power loss can cost. See ADR-0022
+    /// and ADR-0039.
     pub async fn store_chunk(
         &mut self,
         index: u32,
@@ -234,10 +262,6 @@ impl Partial {
             .write_all(bytes)
             .await
             .map_err(|e| PartialError::io("write", &part_path, e))?;
-        self.part
-            .sync_all()
-            .await
-            .map_err(|e| PartialError::io("flush", &part_path, e))?;
 
         let mut raw = [0u8; HASH_BYTES as usize];
         hex::decode_into(digest, &mut raw).expect("a hash we just computed is valid hex");
@@ -250,15 +274,42 @@ impl Partial {
             .write_all(&raw)
             .await
             .map_err(|e| PartialError::io("write", &hashes_path, e))?;
+
+        self.bitmap.set(index);
+        self.unflushed += 1;
+        self.unflushed_bytes += bytes.len() as u64;
+        if self.unflushed_bytes >= FLUSH_EVERY || self.unflushed >= FLUSH_EVERY_CHUNKS {
+            self.flush().await
+        } else {
+            // Recorded but not flushed: a rename, no wait for the disk.
+            self.write_state(false).await
+        }
+    }
+
+    /// Makes every recorded chunk durable.
+    ///
+    /// Data and hashes are flushed first, then `state.json` is rewritten and
+    /// flushed too. Does nothing when nothing is waiting. Also called by the
+    /// receiver after the last chunk, before the file is verified and moved
+    /// into place, and when a transfer stops early.
+    pub async fn flush(&mut self) -> Result<(), PartialError> {
+        if self.unflushed == 0 {
+            return Ok(());
+        }
+        let part_path = self.part_path();
+        self.part
+            .sync_all()
+            .await
+            .map_err(|e| PartialError::io("flush", &part_path, e))?;
+        let hashes_path = self.dir.join(HASHES_FILE);
         self.hashes
             .sync_all()
             .await
             .map_err(|e| PartialError::io("flush", &hashes_path, e))?;
 
-        // Only now is the chunk allowed to count.
-        self.bitmap.set(index);
-        self.write_state()?;
-        Ok(())
+        self.unflushed = 0;
+        self.unflushed_bytes = 0;
+        self.write_state(true).await
     }
 
     /// Re-hashes everything the bitmap claims and drops whatever does not match.
@@ -316,16 +367,23 @@ impl Partial {
 
         let _ = (&part_path, &hashes_path);
         if dropped > 0 {
-            self.write_state()?;
+            self.write_state(true).await?;
         }
         Ok(dropped)
     }
 
-    /// Rewrites `state.json` atomically.
-    fn write_state(&mut self) -> Result<(), PartialError> {
+    /// Rewrites `state.json` atomically, and flushes it if `durable`.
+    ///
+    /// The write, flush and rename are blocking file calls, so they run on
+    /// tokio's blocking pool: on the async thread they would hold up the
+    /// connection, and with it the transfer, for as long as the disk takes.
+    async fn write_state(&mut self, durable: bool) -> Result<(), PartialError> {
         self.state.have = self.bitmap.encode();
         self.state.updated = now_rfc3339();
-        write_state_file(&self.dir, &self.state)
+        let (dir, state) = (self.dir.clone(), self.state.clone());
+        tokio::task::spawn_blocking(move || write_state_file(&dir, &state, durable))
+            .await
+            .map_err(|e| PartialError::io("write", self.dir.join(STATE_FILE), e.into()))?
     }
 }
 
@@ -385,7 +443,7 @@ impl PartialStore {
             updated: now,
             have: ChunkBitmap::new(plan.chunk_count()).encode(),
         };
-        write_state_file(&dir, &state)?;
+        write_state_file(&dir, &state, true)?;
 
         self.attach(dir, state, plan, true).await
     }
@@ -451,6 +509,8 @@ impl PartialStore {
             plan,
             part,
             hashes,
+            unflushed: 0,
+            unflushed_bytes: 0,
             created_here,
             _lock: lock,
         })
@@ -576,7 +636,11 @@ impl PartialStore {
     }
 }
 
-fn write_state_file(dir: &Path, state: &PartialState) -> Result<(), PartialError> {
+/// Replaces `state.json` by writing a temporary file and renaming it over the
+/// old one, so a reader sees the old state or the new one, never half of each.
+/// `durable` also flushes it first; without that, power loss can leave the
+/// old state, or none (a partial whose state cannot be read starts over).
+fn write_state_file(dir: &Path, state: &PartialState, durable: bool) -> Result<(), PartialError> {
     let path = dir.join(STATE_FILE);
     let json = serde_json::to_vec_pretty(state).expect("partial state always serialises");
 
@@ -585,9 +649,11 @@ fn write_state_file(dir: &Path, state: &PartialState) -> Result<(), PartialError
         .tempfile_in(dir)
         .map_err(|e| PartialError::io("create a file in", dir, e))?;
     std::io::Write::write_all(&mut temp, &json).map_err(|e| PartialError::io("write", &path, e))?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|e| PartialError::io("flush", &path, e))?;
+    if durable {
+        temp.as_file()
+            .sync_all()
+            .map_err(|e| PartialError::io("flush", &path, e))?;
+    }
     temp.persist(&path)
         .map_err(|e| PartialError::io("replace", &path, e.error))?;
     Ok(())

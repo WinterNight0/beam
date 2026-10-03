@@ -26,8 +26,8 @@ use crate::pairing::{Network, Policy, Timeouts};
 use crate::transfer::{
     DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore, RejectReason, SendOptions, TransferError,
 };
-use crate::transport::dial::{DialError, dial, send_on};
-use crate::transport::endpoint::{self, Bind, XFER_ALPN};
+use crate::transport::dial::{DialError, dial_transfer, interrupt, send_on};
+use crate::transport::endpoint::{self, Bind};
 use crate::{ui, untrusted};
 
 impl App {
@@ -102,7 +102,9 @@ impl App {
         };
 
         let runtime = self.runtime()?;
-        let result = runtime.block_on(crate::listener::run(
+        // Ctrl+C stops `listen` cleanly: a sender mid-transfer is told, what
+        // arrived is kept, and `whoami` stops showing the code (ADR-0041).
+        let result = runtime.block_on(crate::listener::run_until(
             identity,
             self.store.clone(),
             network,
@@ -116,6 +118,7 @@ impl App {
                 }
             },
             move |event| screen.show(event),
+            interrupted(),
         ));
         runtime.shutdown_timeout(Duration::from_secs(1));
         result.map_err(|e| CommandError::Message(e.to_string()))
@@ -164,10 +167,13 @@ impl App {
             let endpoint = endpoint::bind(&identity, &network.relay, network.bind, 0, &[])
                 .await
                 .map_err(|e| CommandError::Message(e.to_string()))?;
+            // The connection, once there is one, so Ctrl+C can tell the peer.
+            let live = std::sync::Mutex::new(None);
             let outcome = async {
-                let connection = dial(&endpoint, peer_addr, XFER_ALPN)
+                let connection = dial_transfer(&endpoint, peer_addr)
                     .await
                     .map_err(|e| unreachable_message(&peer_name, &peer_key, e))?;
+                *live.lock().expect("not poisoned") = Some(connection.clone());
                 if !self.json {
                     writeln!(io.out, "Sending {} to {peer_name}", file.display())?;
                     io.out.flush()?;
@@ -176,8 +182,23 @@ impl App {
                 let sent = send_on(&connection, &mut options, &mut reporter).await;
                 reporter.finish();
                 sent.map_err(|e| refused_message(&peer_name, e))
+            };
+            // Ctrl+C: tell the receiver, so it does not wait for a timeout,
+            // and say so here (ADR-0041).
+            let (outcome, stopped) = tokio::select! {
+                outcome = outcome => (outcome, false),
+                () = interrupted() => {
+                    let connection = live.lock().expect("not poisoned").take();
+                    if let Some(connection) = &connection {
+                        interrupt(connection);
+                    }
+                    (Err(interrupted_message(&peer_name, connection.is_some())), true)
+                }
+            };
+            if stopped && !self.json {
+                // End the progress line before the message.
+                writeln!(io.out)?;
             }
-            .await;
             endpoint.close().await;
             let summary = outcome?;
 
@@ -220,6 +241,33 @@ impl App {
     }
 }
 
+/// Completes when the person presses Ctrl+C (ADR-0041). Once it has, a
+/// second Ctrl+C ends the process at once, in case stopping cleanly hangs. If
+/// Ctrl+C cannot be watched, it never completes, and Ctrl+C does what it
+/// always did.
+async fn interrupted() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(1);
+        }
+    });
+}
+
+/// What `send` says when its own user stopped it.
+fn interrupted_message(peer: &str, told: bool) -> CommandError {
+    CommandError::Message(if told {
+        format!(
+            "cancelled: you stopped beam (Ctrl+C). {peer} was told the transfer was cancelled.\n       \
+             Anything {peer} already received is kept: send the same file again to resume."
+        )
+    } else {
+        format!("cancelled: you stopped beam (Ctrl+C) before {peer} was reached; nothing was sent.")
+    })
+}
+
 /// Why `send` could not reach the peer, in words that say what to do.
 fn unreachable_message(
     peer: &str,
@@ -254,6 +302,10 @@ fn unreachable_message(
 /// A refusal from the peer, said the way a person would say it.
 fn refused_message(peer: &str, error: TransferError) -> CommandError {
     match error {
+        TransferError::PeerInterrupted => CommandError::Message(format!(
+            "{peer} stopped beam on their side (Ctrl+C), so the transfer was cancelled.\n       \
+             Anything {peer} already received is kept: send the same file again later to resume."
+        )),
         TransferError::Rejected(RejectReason::Busy) => {
             CommandError::Message(format!("{peer} is receiving another file; try again later"))
         }
@@ -458,6 +510,27 @@ impl Screen {
                 self.who(&peer),
                 untrusted::text(&error)
             ),
+            ListenEvent::TransferInterrupted { peer } => {
+                let who = self.who(&peer);
+                writeln!(
+                    err,
+                    "beam: {who} stopped beam on their side (Ctrl+C), so the transfer from {who} \
+                     was cancelled.\nbeam: What arrived is kept; it resumes if {who} sends the \
+                     file again."
+                )
+            }
+            ListenEvent::Stopped { cancelled } => {
+                if cancelled.is_empty() {
+                    return writeln!(out, "Stopped listening (Ctrl+C).");
+                }
+                let names: Vec<String> = cancelled.iter().map(|p| self.who(p)).collect();
+                let names = names.join(", ");
+                writeln!(
+                    out,
+                    "Stopped listening (Ctrl+C). Cancelled the transfer from {names}, and told \
+                     {names}.\nWhat arrived is kept; it resumes if {names} sends the file again."
+                )
+            }
         }
     }
 }

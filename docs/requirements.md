@@ -36,6 +36,8 @@ deleted or renumbered.
 | F-19 | After pairing, the joiner saves where the invite said its peer is (`addrs=`, and `relay=` when it differs from its own) on the peer's `known_peers` line. Running `beam pair <INVITE>` for a device that is already paired only updates those attributes — no code, no network, never the key or the name (ADR-0036). | post-M6 |
 | F-21 | `beam listen` prints its invite and pairing code once, at start; a code renewed after ten minutes is not printed. `beam whoami` shows a running `listen`'s invite, current code and its expiry, or why there is no code (in use, paused, off), or that `listen` is not running. A crashed `listen` never leaves a stale code on show (ADR-0037). | post-M6 |
 | F-22 | A joiner whose code did not match is told that the code may have expired, how often codes change, and how to get the current one (ADR-0037). | post-M6 |
+| F-25 | Ctrl+C in `beam send` or `beam listen` stops a transfer cleanly and the other device is told at once. Both terminals say which side stopped it (known from the QUIC close code, not from text) and that what arrived is kept for a resume. `listen` stops normally and removes `listen.json` (ADR-0041). | post-M6 |
+| F-24 | The sender may have up to 4 chunks in flight before their answers; a rejected chunk is re-sent after the others. The transfer protocol version is agreed when connecting (`beam/xfer/2`, falling back to `beam/xfer/1`, one chunk at a time), so old and new versions of beam work together (ADR-0040). | post-M6 |
 | F-23 | `advertise` in `config.toml` lists addresses to put first in this device's invite, for a public address beam cannot discover (a port forwarded by hand, with no relay). With `relay = "none"`, `listen` waits briefly for a router port mapping before showing the invite (ADR-0038). | post-M6 |
 | F-20 | `beam listen` binds a fixed UDP port (`port` in `config.toml`, default 7820) so its invite stays the same between runs. If the port is taken it uses another and warns (ADR-0036). | post-M6 |
 
@@ -76,6 +78,8 @@ convenience loses.
 | S-32 | Updating where a paired device is found (F-19) never changes its stored key; a device with a new key is a new pairing (rule 3, ADR-0036). | post-M6 |
 | S-33 | A relay from an invite or a saved `relay=` is used only if it is `https://` on a public host; anything else is dropped. `config.toml` may name any relay (ADR-0038). | post-M6 |
 | S-34 | An address update that would change a paired device's relay is saved only after the person answers yes to a question showing the old and new relay (ADR-0038). | post-M6 |
+| S-36 | The sender checks every chunk it reads for sending against the hash it took of that chunk before the request. A chunk that still does not match after 3 reads, or a file that got shorter, stops the transfer with CANCEL before that chunk is sent (ADR-0040). | post-M6 |
+| S-37 | The receiver accepts only chunks it is still missing: a chunk outside the transfer, or one that already arrived, ends the transfer. Each chunk gets at most 3 attempts, whatever order the chunks arrive in (ADR-0040). | post-M6 |
 | S-35 | Dependencies are audited against the RustSec database on every push, CI's token is read-only, and CI actions are pinned to commit hashes; the latest manual audit is recorded in `SECURITY.md` (ADR-0038). | post-M6 |
 | S-11 | Transfer IDs are random; replayed or expired IDs are rejected. | M2/M3 |
 | S-14 | A partial transfer is matched by (sender fingerprint, file_sha256, size, chunk_size) and never by a sender-supplied transfer ID, so no peer can attach to another peer's partial. | M3 |
@@ -96,11 +100,12 @@ convenience loses.
 | D-7 | An existing destination file is never silently overwritten. | M2 |
 | D-8 | Received chunks are tracked with a bitmap, not a single resume index. | M3 |
 | D-9 | A transfer may only be resumed when the `file_sha256` and `size` in the new request match the stored transfer. The receiver persists the hashes of the chunks it has already verified, so resumed chunks are checked against the same values as the first attempt. A mismatch starts over as a new transfer. | M3 |
-| D-10 | Chunk data and its hash are written and flushed to disk **before** the bitmap records the chunk as present, so a crash loses the claim rather than the data. | M3 |
+| D-10 | Chunk data and its hash are written **before** the bitmap records the chunk as present, so the record never names a chunk whose bytes were not handed to the operating system. Since ADR-0039 the flush to disk is batched (D-15), and the record is a claim that D-11 checks; until then each chunk was flushed before it was recorded. | M3 |
 | D-11 | On resume, every chunk the bitmap claims is re-hashed against the persisted hash before it is offered to the sender; one that fails is simply re-requested. | M3 |
 | D-12 | A partial is locked while a session uses it; a second session for the same partial is refused with a clear message. | M3 |
 | D-13 | Committing a finished file works when the destination is on a different volume from `~/.beam/tmp`. | M3 |
 | D-14 | A partial survives being declined, expiring, or losing its connection; it is discarded on success, on whole-file hash failure, or when it holds nothing. Partials expire after 7 days, swept when `beam listen` starts. | M3 |
+| D-15 | Received chunks are recorded at once and flushed to disk in batches (every 8 chunks or 32 MiB), after the last chunk, and whenever a transfer stops early. A killed or crashed beam process loses nothing; power loss or an OS crash can lose at most the last batch, which D-11 detects and requests again (ADR-0039). | post-M6 |
 
 ## 4. Non-functional requirements
 
@@ -112,6 +117,7 @@ convenience loses.
 | N-4 | `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` pass before any milestone is called done. |
 | N-5 | Exit codes: 0 success, 1 error, 2 not implemented yet. |
 | N-6 | Nicknames are local labels. There is no global username registry, and a peer is not notified when it is renamed. |
+| N-8 | Throughput is measured with `tests/throughput.rs` (release build) before and after any change meant to affect it, and the numbers are recorded in `docs/performance-plan.md` (ADR-0039). |
 | N-7 | Free space is checked before the Accept prompt, on the volume holding partials and — when it differs — the destination volume, counting only the bytes still missing plus a small margin. Too little space is refused clearly rather than discovered part-way through. |
 
 ## 5. Implementation language
@@ -131,7 +137,9 @@ test on 2026-10-02 — two devices on different home networks about 50 km apart,
 no server, default configuration — paired with an invite and transferred a 5 GB
 file intact. It was slow. Why it was slow, and how often hole punching falls
 back to the relay (for example on Thai mobile CGNAT), is still to be measured;
-throughput work will be planned before any change.
+throughput work will be planned before any change. It ran at about 1 MB/s
+over the relay; the findings and the plan are in
+[performance-plan.md](performance-plan.md).
 
 ## 7. Out of scope
 

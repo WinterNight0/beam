@@ -17,7 +17,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
-use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, presets};
+use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey, Watcher};
 
 use crate::config::Relay;
@@ -32,12 +32,40 @@ pub const PAIR_ALPN: &[u8] = b"beam/pair/1";
 /// QUIC stream. Versioned like the pairing one.
 pub const XFER_ALPN: &[u8] = b"beam/xfer/1";
 
+/// Version 2 of file transfers: the same messages, but the sender may have
+/// several chunks in flight and re-sends a rejected one after the others
+/// (ADR-0040). A receiver that only knows version 1 needs each chunk answered
+/// before the next. The name is agreed in the TLS handshake, before any
+/// message, so the two can never be mixed up: a new sender offers both, and
+/// a listener picks the newest it knows ([`transfer_alpns`]).
+pub const XFER_ALPN_V2: &[u8] = b"beam/xfer/2";
+
+/// The transfer protocols `listen` accepts, newest first. The TLS server picks
+/// the first of its own list that the client offered.
+pub fn transfer_alpns() -> [&'static [u8]; 2] {
+    [XFER_ALPN_V2, XFER_ALPN]
+}
+
 /// How long a connection may go without hearing from the peer before it is
 /// considered gone. iroh sends keep-alives every 5 s, so a live peer is never
 /// idle this long; a crashed one is noticed within 15 s instead of noq's 30 s
 /// default. That matters to `listen`, which holds its one transfer slot until
 /// the sender is known to be gone (ADR-0030).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many bytes of one stream may be in flight, unacknowledged. A stream
+/// can go no faster than this divided by the round-trip time; noq's default of
+/// 1.25 MB allows only about 12.5 MB/s at 100 ms. 16 MiB holds a whole 4 MiB
+/// chunk several times over, so a chunk goes out in one round trip instead of
+/// four (performance plan, step 3).
+pub const STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// How many bytes a peer may have in flight to us across *all* streams of one
+/// connection. noq sets no limit, so without this a peer could open its 100
+/// allowed streams and make us buffer 100 stream windows. 32 MiB bounds the
+/// memory one connection can claim, while leaving a full stream window free
+/// for the transfer stream.
+pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
 
 /// How long to wait for the relay before announcing direct addresses only.
 const RELAY_WAIT: Duration = Duration::from_secs(10);
@@ -64,6 +92,20 @@ pub enum Bind {
 pub enum EndpointError {
     #[error("could not open a network endpoint: {0}")]
     Bind(String),
+}
+
+/// The QUIC settings every beam endpoint uses: the idle timeout and the flow
+/// control windows above. Public so the throughput benchmark can build an
+/// endpoint that behaves like beam's.
+pub fn transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(IDLE_TIMEOUT).expect("15 s is a valid idle timeout"),
+        ))
+        .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
+        .receive_window(VarInt::from_u32(CONNECTION_WINDOW))
+        .send_window(u64::from(CONNECTION_WINDOW))
+        .build()
 }
 
 /// Opens an iroh endpoint that uses this device's identity.
@@ -99,15 +141,10 @@ async fn bind_on(
         Relay::Url(url) => RelayMode::custom([url.clone()]),
     };
 
-    let transport = QuicTransportConfig::builder()
-        .max_idle_timeout(Some(
-            IdleTimeout::try_from(IDLE_TIMEOUT).expect("15 s is a valid idle timeout"),
-        ))
-        .build();
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .relay_mode(relay_mode)
-        .transport_config(transport)
+        .transport_config(transport_config())
         .alpns(alpns.iter().map(|a| a.to_vec()).collect());
     let invalid = |e: iroh::endpoint::InvalidSocketAddr| EndpointError::Bind(e.to_string());
     match (bind, port) {

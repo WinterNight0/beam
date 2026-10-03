@@ -3,7 +3,13 @@
 //! The one rule that shapes this file: no file bytes leave until the peer has
 //! sent ACCEPT (S-3). The state machine is consulted before every chunk rather
 //! than the order of statements being trusted.
+//!
+//! Once accepted, up to [`SendOptions::window`] chunks may be on their way
+//! before their answers arrive (ADR-0040). Every chunk read from disk is
+//! checked against the hash taken of it before the request, so what is sent
+//! is what was promised.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,10 +18,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use crate::transport::{PathKind, Route, RouteTracker, fixed_route};
 
 use super::bitmap::ChunkBitmap;
-use super::chunk::{ChunkPlan, hash_stream, sha256_hex};
+use super::chunk::{ChunkPlan, hash_stream_and_chunks, sha256_hex};
 use super::engine::{
-    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, DEFAULT_STALL_TIMEOUT, Progress, Reporter,
-    TransferError,
+    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, DEFAULT_STALL_TIMEOUT, PIPELINE_WINDOW,
+    Progress, Reporter, SOURCE_READ_ATTEMPTS, TransferError,
 };
 use super::frame::{MAX_CHUNK_DATA, read_message, write_message};
 use super::message::{
@@ -44,6 +50,10 @@ pub struct SendOptions {
     /// How the peers are connected, for the progress line. It can change
     /// during the transfer; see [`Route`].
     pub route: Route,
+    /// How many chunks may be sent before their answers arrive. 1 is the
+    /// original one-at-a-time protocol, which a receiver that only speaks
+    /// `beam/xfer/1` needs; see [`crate::transport::dial::send_on`].
+    pub window: u32,
 }
 
 impl SendOptions {
@@ -57,6 +67,7 @@ impl SendOptions {
             max_chunk_attempts: DEFAULT_CHUNK_ATTEMPTS,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
             route: fixed_route(PathKind::Direct),
+            window: PIPELINE_WINDOW,
         }
     }
 }
@@ -88,9 +99,12 @@ where
     let file_name = local_file_name(&options.path)?;
 
     // Hash the whole file first, so file_sha256 binds this transfer to exact
-    // contents before the peer is asked to agree to anything.
-    let (file_sha256, size) = hash_whole_file(&options.path, reporter).await?;
-    let plan = ChunkPlan::new(size, options.chunk_size.max(1));
+    // contents before the peer is asked to agree to anything. Each chunk's
+    // hash is kept too, to check the chunk against when it is sent.
+    let chunk_size = options.chunk_size.max(1);
+    let (file_sha256, size, chunk_hashes) =
+        hash_whole_file(&options.path, chunk_size, reporter).await?;
+    let plan = ChunkPlan::new(size, chunk_size);
 
     let transfer_id = TransferId::generate().map_err(|e| {
         TransferError::io(
@@ -130,30 +144,88 @@ where
         .await
         .map_err(|e| TransferError::io("open", options.path.display(), e))?;
 
-    let mut sent = 0u64;
     // Only what the receiver said it has not got. On a first attempt that is
-    // every chunk; on a resume it is the gap.
-    for index in have.missing() {
-        let bytes = read_chunk(&mut file, &options.path, plan, index).await?;
-        send_chunk(
-            stream,
-            &mut machine,
-            index,
-            &bytes,
-            options.max_chunk_attempts,
-            options.stall_timeout,
-        )
-        .await?;
-        sent += bytes.len() as u64;
-        let (path, before) = route.poll();
-        if let Some(from) = before {
-            reporter.report(Progress::PathChanged { from, to: path });
+    // every chunk; on a resume it is the gap. A chunk the receiver rejects
+    // goes back to the front of the queue (ADR-0040, option B).
+    let mut queue: VecDeque<u32> = have.missing().collect();
+    let mut in_flight: Vec<u32> = Vec::new();
+    let mut attempts: HashMap<u32, u32> = HashMap::new();
+    let window = options.window.max(1) as usize;
+    let mut sent = 0u64;
+
+    loop {
+        while in_flight.len() < window {
+            let Some(index) = queue.pop_front() else {
+                break;
+            };
+            let expected = &chunk_hashes[index as usize];
+            let bytes =
+                match read_verified_chunk(&mut file, &options.path, plan, index, expected).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if matches!(e, TransferError::SourceChanged { .. }) {
+                            send_cancel(
+                                stream,
+                                transfer_id,
+                                "the file changed while it was being sent",
+                            )
+                            .await;
+                        }
+                        machine.apply(Event::Fail)?;
+                        return Err(e);
+                    }
+                };
+            send_chunk(stream, &mut machine, index, &bytes, expected).await?;
+            *attempts.entry(index).or_insert(0) += 1;
+            in_flight.push(index);
         }
-        reporter.report(Progress::Transferring {
-            done: skipped + sent,
-            total: size,
-            path,
-        });
+        if in_flight.is_empty() {
+            break;
+        }
+
+        let answer = tokio::time::timeout(options.stall_timeout, read_message(stream))
+            .await
+            .map_err(|_| TransferError::Stalled {
+                after: options.stall_timeout,
+                waiting_for: "waiting for a chunk to be acknowledged",
+            })??;
+        match answer {
+            Message::ChunkAck(ack) if in_flight.contains(&ack.index) => {
+                in_flight.retain(|i| *i != ack.index);
+                sent += u64::from(plan.len_of(ack.index));
+                let (path, before) = route.poll();
+                if let Some(from) = before {
+                    reporter.report(Progress::PathChanged { from, to: path });
+                }
+                reporter.report(Progress::Transferring {
+                    done: skipped + sent,
+                    total: size,
+                    path,
+                });
+            }
+            Message::ChunkNak(nak) if in_flight.contains(&nak.index) => {
+                in_flight.retain(|i| *i != nak.index);
+                if attempts[&nak.index] >= options.max_chunk_attempts {
+                    machine.apply(Event::Fail)?;
+                    return Err(TransferError::ChunkFailed {
+                        index: nak.index,
+                        attempts: options.max_chunk_attempts,
+                    });
+                }
+                queue.push_front(nak.index);
+            }
+            Message::Cancel(cancel) => {
+                machine.apply(Event::Cancel)?;
+                return Err(TransferError::Cancelled(cancel.reason));
+            }
+            other => {
+                machine.apply(Event::Fail)?;
+                return Err(TransferError::OutOfOrder {
+                    expected: "CHUNK_ACK or CHUNK_NAK for a chunk that was sent",
+                    got: other.kind_name(),
+                });
+            }
+        }
     }
 
     write_message(
@@ -280,14 +352,14 @@ where
     }
 }
 
-/// Sends one chunk, re-sending it while the receiver reports a bad hash.
+/// Writes one chunk: CHUNK_START, then its data frames. The answer is read by
+/// the caller, which may have other chunks in flight.
 async fn send_chunk<S>(
     stream: &mut S,
     machine: &mut Machine,
     index: u32,
     bytes: &[u8],
-    max_attempts: u32,
-    stall_timeout: Duration,
+    digest: &str,
 ) -> Result<(), TransferError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -302,78 +374,69 @@ where
         });
     }
 
-    let digest = sha256_hex(bytes);
-
-    for attempt in 1..=max_attempts {
+    write_message(
+        stream,
+        &Message::ChunkStart(ChunkStart {
+            index,
+            len: bytes.len() as u32,
+            sha256: digest.to_string(),
+        }),
+    )
+    .await?;
+    for slice in bytes.chunks(MAX_CHUNK_DATA) {
         write_message(
             stream,
-            &Message::ChunkStart(ChunkStart {
+            &Message::ChunkData {
                 index,
-                len: bytes.len() as u32,
-                sha256: digest.clone(),
-            }),
+                bytes: slice.to_vec(),
+            },
         )
         .await?;
+    }
+    // A zero-length chunk still needs one empty data frame, so that the
+    // receiver sees the chunk end the same way every time.
+    if bytes.is_empty() {
+        write_message(
+            stream,
+            &Message::ChunkData {
+                index,
+                bytes: Vec::new(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
 
-        for slice in bytes.chunks(MAX_CHUNK_DATA) {
-            write_message(
-                stream,
-                &Message::ChunkData {
-                    index,
-                    bytes: slice.to_vec(),
-                },
-            )
-            .await?;
-        }
-        // A zero-length chunk still needs one empty data frame, so that the
-        // receiver sees the chunk end the same way every time.
-        if bytes.is_empty() {
-            write_message(
-                stream,
-                &Message::ChunkData {
-                    index,
-                    bytes: Vec::new(),
-                },
-            )
-            .await?;
-        }
-
-        let answer = tokio::time::timeout(stall_timeout, read_message(stream))
-            .await
-            .map_err(|_| TransferError::Stalled {
-                after: stall_timeout,
-                waiting_for: "waiting for a chunk to be acknowledged",
-            })??;
-        match answer {
-            Message::ChunkAck(ack) if ack.index == index => return Ok(()),
-            Message::ChunkNak(nak) if nak.index == index => {
-                if attempt == max_attempts {
-                    machine.apply(Event::Fail)?;
-                    return Err(TransferError::ChunkFailed {
-                        index,
-                        attempts: max_attempts,
-                    });
-                }
+/// Reads chunk `index` and checks it against `expected`, the hash taken of it
+/// before the request was sent.
+///
+/// A mismatch is read again, up to [`SOURCE_READ_ATTEMPTS`] times in all, in
+/// case the disk returned bad data once. If it still does not match, or the
+/// file has become too short, the file is no longer the one that was
+/// promised: [`TransferError::SourceChanged`].
+async fn read_verified_chunk(
+    file: &mut tokio::fs::File,
+    path: &Path,
+    plan: ChunkPlan,
+    index: u32,
+    expected: &str,
+) -> Result<Vec<u8>, TransferError> {
+    for _ in 0..SOURCE_READ_ATTEMPTS {
+        let bytes = match read_chunk(file, path, plan, index).await {
+            Ok(bytes) => bytes,
+            Err(TransferError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                return Err(TransferError::SourceChanged { index });
             }
-            Message::Cancel(cancel) => {
-                machine.apply(Event::Cancel)?;
-                return Err(TransferError::Cancelled(cancel.reason));
-            }
-            other => {
-                machine.apply(Event::Fail)?;
-                return Err(TransferError::OutOfOrder {
-                    expected: "CHUNK_ACK or CHUNK_NAK",
-                    got: other.kind_name(),
-                });
-            }
+            Err(e) => return Err(e),
+        };
+        if sha256_hex(&bytes) == expected {
+            return Ok(bytes);
         }
     }
-
-    machine.apply(Event::Fail)?;
-    Err(TransferError::ChunkFailed {
-        index,
-        attempts: max_attempts,
-    })
+    Err(TransferError::SourceChanged { index })
 }
 
 /// Sends CANCEL, ignoring a stream that has already gone away.
@@ -391,7 +454,12 @@ where
     .await;
 }
 
-async fn hash_whole_file<R>(path: &Path, reporter: &mut R) -> Result<(String, u64), TransferError>
+/// The file's SHA-256, its size, and the SHA-256 of each chunk.
+async fn hash_whole_file<R>(
+    path: &Path,
+    chunk_size: u32,
+    reporter: &mut R,
+) -> Result<(String, u64, Vec<String>), TransferError>
 where
     R: Reporter,
 {
@@ -404,13 +472,11 @@ where
         .await
         .map_err(|e| TransferError::io("open", path.display(), e))?;
 
-    let (digest, size) = hash_stream(&mut file, total, |done, total| {
+    hash_stream_and_chunks(&mut file, total, chunk_size, |done, total| {
         reporter.report(Progress::Hashing { done, total })
     })
     .await
-    .map_err(|e| TransferError::io("read", path.display(), e))?;
-
-    Ok((digest, size))
+    .map_err(|e| TransferError::io("read", path.display(), e))
 }
 
 async fn read_chunk(

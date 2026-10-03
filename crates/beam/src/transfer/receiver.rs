@@ -14,7 +14,7 @@
 //! other (S-2). What the partial changes is which chunks are asked for, and
 //! what survives a failure — see ADR-0021 and ADR-0022.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -323,6 +323,14 @@ where
     )
     .await;
 
+    // A transfer that stopped early keeps every chunk it verified, and they
+    // are already recorded; this makes them durable too, rather than waiting
+    // for the next batch (ADR-0039). Best effort: if the disk refuses,
+    // `reverify` drops whatever did not survive, and it is asked for again.
+    if outcome.is_err() {
+        let _ = partial.flush().await;
+    }
+
     // The retention rules (ADR-0022), in one place so they cannot drift apart:
     //
     // * a finished transfer has become a file, so the partial has served its
@@ -618,19 +626,27 @@ where
     let mut received_now = 0u64;
 
     // Only the chunks that are actually missing. The sender is told the same
-    // thing through the have-bitmap in ACCEPT, so the two agree; a sender that
-    // sends something else anyway is caught by the out-of-order check.
-    let wanted: Vec<u32> = partial.bitmap().missing().collect();
-    for index in wanted {
-        let (bytes, digest) = receive_chunk(
+    // thing through the have-bitmap in ACCEPT, so the two agree. They may
+    // arrive in any order: a sender with several chunks in flight re-sends a
+    // rejected one after the others (ADR-0040). Anything not in `missing` —
+    // a chunk not asked for, or one that already arrived — is refused.
+    let mut missing: BTreeSet<u32> = partial.bitmap().missing().collect();
+    let mut rejected: HashMap<u32, u32> = HashMap::new();
+    while !missing.is_empty() {
+        let Some((index, bytes, digest)) = receive_chunk(
             incoming,
             writer,
             plan,
-            index,
+            &missing,
+            &mut rejected,
             options.max_chunk_attempts,
             options.stall_timeout,
         )
-        .await?;
+        .await?
+        else {
+            continue;
+        };
+        missing.remove(&index);
 
         partial
             .store_chunk(index, &bytes, &digest)
@@ -651,6 +667,12 @@ where
 
         write_message(writer, &Message::ChunkAck(ChunkAck { index })).await?;
     }
+
+    // Every chunk durable before the file is checked and moved into place.
+    partial
+        .flush()
+        .await
+        .map_err(|e| TransferError::Partial(Box::new(e)))?;
 
     let part_path = partial.part_path();
 
@@ -712,96 +734,98 @@ where
 
 /// Collects one chunk, verifying it before it is handed back to be written.
 ///
-/// Returns the bytes and the hash they were checked against, which the partial
-/// stores so a later session can check them again.
+/// The chunk may be any of `missing`. Returns its index, its bytes and the
+/// hash they were checked against, which the partial stores so a later
+/// session can check them again. A chunk that fails its hash is answered with
+/// CHUNK_NAK and `None` is returned; the sender sends it again, possibly after
+/// others. `rejected` counts the failures per chunk, and the
+/// `max_attempts`-th ends the transfer.
 async fn receive_chunk<W>(
     incoming: &mut Incoming,
     writer: &mut W,
     plan: ChunkPlan,
-    index: u32,
+    missing: &BTreeSet<u32>,
+    rejected: &mut HashMap<u32, u32>,
     max_attempts: u32,
     stall: Duration,
-) -> Result<(Vec<u8>, String), TransferError>
+) -> Result<Option<(u32, Vec<u8>, String)>, TransferError>
 where
     W: AsyncWrite + Unpin,
 {
-    let expected_len = plan.len_of(index);
+    let start = match incoming.within(stall, "waiting for the next chunk").await? {
+        Message::ChunkStart(start) => start,
+        Message::Cancel(cancel) => return Err(TransferError::Cancelled(cancel.reason)),
+        other => {
+            return Err(TransferError::OutOfOrder {
+                expected: "CHUNK_START",
+                got: other.kind_name(),
+            });
+        }
+    };
+    let index = start.index;
 
-    for attempt in 1..=max_attempts {
-        let start = match incoming.within(stall, "waiting for the next chunk").await? {
-            Message::ChunkStart(start) => start,
+    if !missing.contains(&index) {
+        return Err(TransferError::BadRequest(format!(
+            "the peer sent chunk {index}, which was not asked for or has already arrived"
+        )));
+    }
+    // Bounds the buffer below: a peer cannot make us reserve more than the
+    // size it already committed to in the request.
+    let expected_len = plan.len_of(index);
+    if start.len != expected_len {
+        return Err(TransferError::BadRequest(format!(
+            "chunk {index} was announced as {} bytes, but the request implies {expected_len}",
+            start.len
+        )));
+    }
+
+    // A chunk's data frames follow its CHUNK_START without anything between
+    // them, whatever else is in flight.
+    let mut buffer = Vec::with_capacity(expected_len as usize);
+    loop {
+        match incoming.within(stall, "receiving a chunk").await? {
+            Message::ChunkData { index: got, bytes } if got == index => {
+                buffer.extend_from_slice(&bytes);
+            }
             Message::Cancel(cancel) => return Err(TransferError::Cancelled(cancel.reason)),
             other => {
                 return Err(TransferError::OutOfOrder {
-                    expected: "CHUNK_START",
+                    expected: "CHUNK_DATA",
                     got: other.kind_name(),
                 });
             }
-        };
-
-        if start.index != index {
-            return Err(TransferError::BadRequest(format!(
-                "expected chunk {index} next, but the peer sent chunk {}",
-                start.index
-            )));
         }
-        // Bounds the buffer below: a peer cannot make us reserve more than the
-        // size it already committed to in the request.
-        if start.len != expected_len {
-            return Err(TransferError::BadRequest(format!(
-                "chunk {index} was announced as {} bytes, but the request implies {expected_len}",
-                start.len
-            )));
-        }
-
-        let mut buffer = Vec::with_capacity(expected_len as usize);
-        loop {
-            match incoming.within(stall, "receiving a chunk").await? {
-                Message::ChunkData { index: got, bytes } if got == index => {
-                    buffer.extend_from_slice(&bytes);
-                }
-                Message::Cancel(cancel) => return Err(TransferError::Cancelled(cancel.reason)),
-                other => {
-                    return Err(TransferError::OutOfOrder {
-                        expected: "CHUNK_DATA",
-                        got: other.kind_name(),
-                    });
-                }
-            }
-            // At least one frame is always read, so a zero-length chunk ends
-            // the same way every other chunk does.
-            if buffer.len() >= expected_len as usize {
-                break;
-            }
-        }
-
-        let reason = if buffer.len() != expected_len as usize {
-            Some(NakReason::LengthMismatch)
-        } else if sha256_hex(&buffer) != start.sha256 {
-            Some(NakReason::HashMismatch)
-        } else {
-            None
-        };
-
-        match reason {
-            // Verified before it is written, which is the whole point (S-12).
-            None => return Ok((buffer, start.sha256)),
-            Some(reason) => {
-                write_message(writer, &Message::ChunkNak(ChunkNak { index, reason })).await?;
-                if attempt == max_attempts {
-                    return Err(TransferError::ChunkFailed {
-                        index,
-                        attempts: max_attempts,
-                    });
-                }
-            }
+        // At least one frame is always read, so a zero-length chunk ends
+        // the same way every other chunk does.
+        if buffer.len() >= expected_len as usize {
+            break;
         }
     }
 
-    Err(TransferError::ChunkFailed {
-        index,
-        attempts: max_attempts,
-    })
+    let reason = if buffer.len() != expected_len as usize {
+        Some(NakReason::LengthMismatch)
+    } else if sha256_hex(&buffer) != start.sha256 {
+        Some(NakReason::HashMismatch)
+    } else {
+        None
+    };
+
+    match reason {
+        // Verified before it is written, which is the whole point (S-12).
+        None => Ok(Some((index, buffer, start.sha256))),
+        Some(reason) => {
+            write_message(writer, &Message::ChunkNak(ChunkNak { index, reason })).await?;
+            let failures = rejected.entry(index).or_insert(0);
+            *failures += 1;
+            if *failures >= max_attempts {
+                return Err(TransferError::ChunkFailed {
+                    index,
+                    attempts: max_attempts,
+                });
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// Hashes the assembled file and compares it with what the sender promised.

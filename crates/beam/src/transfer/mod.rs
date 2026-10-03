@@ -19,8 +19,8 @@ pub mod storage;
 pub use bitmap::{BitmapError, ChunkBitmap};
 pub use chunk::{ChunkPlan, PlanError, sha256_hex};
 pub use engine::{
-    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, Progress, Reporter, SilentReporter,
-    TransferError,
+    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_CHUNK_ATTEMPTS, PIPELINE_WINDOW, Progress, Reporter,
+    SOURCE_READ_ATTEMPTS, SilentReporter, TransferError,
 };
 pub use frame::{FrameError, MAX_CHUNK_DATA, MAX_FRAME_PAYLOAD};
 pub use message::{
@@ -28,7 +28,8 @@ pub use message::{
     Reject, RejectReason, TransferId, TransferRequest,
 };
 pub use partial::{
-    DEFAULT_MAX_AGE, Partial, PartialError, PartialKey, PartialState, PartialStore, PartialSummary,
+    DEFAULT_MAX_AGE, FLUSH_EVERY, FLUSH_EVERY_CHUNKS, Partial, PartialError, PartialKey,
+    PartialState, PartialStore, PartialSummary,
 };
 pub use paths::{NameError, reserve_destination, sanitize_file_name};
 pub use receiver::{

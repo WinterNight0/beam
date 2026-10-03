@@ -1824,3 +1824,299 @@ The rule for fixing: patch now only what does not make beam harder to use.
   - `tests/cli.rs::an_invite_that_changes_a_peers_relay_needs_a_yes`
   - `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted`
   - `tests/pairing.rs::advertised_addresses_lead_the_invite`
+
+## ADR-0039 — Throughput, steps 1–4: a benchmark, larger QUIC windows, batched flushes
+
+**Status:** accepted (post-M6, branch `main-QoL`). Follows
+`docs/performance-plan.md`; amends ADR-0022 (when a chunk counts).
+
+**Context.** The first cross-network transfer (5.5 GB, 2026-10-02) took about
+1.5 hours, at about 1 MB/s, entirely over n0's relay. The same file on one
+Wi-Fi network went direct at about 18 MB/s, close to what Wi-Fi allows
+between two devices. So the relay path, not beam, limited that test. Reading
+the code still found limits of beam's own that a faster path will hit:
+
+* QUIC's default stream window, 1.25 MB, caps one stream at 1.25 MB per round
+  trip;
+* every 4 MiB chunk was flushed three times (data, hashes, `state.json`) and
+  renamed into place, and the `state.json` write was blocking file I/O on the
+  async thread;
+* nothing measured any of it.
+
+The rule for this work: the user notices nothing except the speed. No new
+command, flag, prompt or setting, and no rule in `CLAUDE.md` changes.
+
+### Decision
+
+* **Step 1, a benchmark.** `tests/throughput.rs`, ignored by default:
+  `cargo test --release --test throughput -- --ignored --nocapture`. A real
+  `listen` and sender over iroh on loopback, timed phase by phase.
+  `BEAM_BENCH_RTT_MS` adds a round trip with a delaying UDP proxy. The proxy
+  faces the sender on IPv6 and the listener on IPv4, because otherwise iroh's
+  hole punching finds the direct loopback path at once and bypasses it. It
+  runs on plain threads that poll the clock: async timers released packets in
+  bursts, and the first versions of the proxy limited the very thing being
+  measured.
+* **Step 2, build.** A debug build is about 7× slower (mostly hashing), so
+  real transfers must use `--release`. Adding `lto = "fat"` and
+  `codegen-units = 1` was measured and made no difference, so it was **not
+  adopted**: it would only slow builds.
+* **Step 3, QUIC windows** (`transport::endpoint::transport_config`): stream
+  window 16 MiB (`STREAM_WINDOW`), and connection receive and send windows
+  32 MiB (`CONNECTION_WINDOW`). noq sets *no* connection limit by default,
+  so a peer could open its 100 allowed streams and make us buffer 100 stream
+  windows (125 MB at the old default). The explicit connection window now
+  bounds that at 32 MiB, which is tighter than before. Only configuration, so
+  old and new copies of beam still work together.
+* **Step 4, batched flushes** (`transfer::partial`). Each chunk is written
+  (data, then hash) and **recorded at once** in the bitmap and `state.json`
+  (a rename, without waiting for the disk). The disk flush is batched. A flush
+  of data, hashes and `state.json` happens:
+  - every 8 chunks or 32 MiB, whichever comes first (`FLUSH_EVERY_CHUNKS`,
+    `FLUSH_EVERY`);
+  - after the last chunk, before the whole-file check and the move into
+    place;
+  - when a transfer stops early for any reason.
+
+  The `state.json` write runs on tokio's blocking pool.
+
+  **This amends ADR-0022's rule (D-10)**, which flushed each chunk before
+  recording it. The record is now a claim, not proof. That is safe because
+  the proof already existed: on every resume, `reverify` re-hashes every
+  claimed chunk against its stored hash before offering it (D-11), and the
+  whole file is checked before it is kept. Two cases:
+  - **beam killed or crashed:** the operating system still holds what the
+    process wrote and writes it out, so the data and the record are both
+    there. Nothing is lost.
+  - **Power loss or an OS crash:** the last unflushed batch may be missing or
+    stale. Any claimed chunk whose bytes did not survive fails `reverify`, is
+    dropped, and is asked for again. A `state.json` lost the same way makes
+    the partial unreadable, and it starts over.
+
+  The first version recorded a chunk only after its batch was flushed. That
+  made a killed receiver lose up to a batch for no reason, since a process
+  kill does not lose written data. It was replaced before review.
+
+### Consequences
+
+* **Measured** (loopback, this machine, release build; full numbers in
+  `docs/performance-plan.md`):
+
+  | | Before | After |
+  |---|---|---|
+  | No added delay (beam's own costs) | 136–141 MB/s | 165–178 MB/s (step 4) |
+  | 50 ms round trip | 18 MB/s | 34 MB/s (step 3) |
+  | 100 ms round trip | 9.2 MB/s | 16.8 MB/s (step 3) |
+
+  At 50 and 100 ms the result is now close to the limit of one chunk in
+  flight: each 4 MiB chunk costs about two round trips (send, then wait for
+  CHUNK_ACK). Only step 5 (pipelining) moves that.
+* None of this speeds up a transfer limited by n0's relay or by a slow
+  upload. The path is what limits that.
+* **Crash cost.** A transfer that stops (connection lost, sender killed,
+  cancel, stall) keeps every verified chunk, and so does a receiver whose beam
+  process is killed or crashes. Only power loss or an OS crash on the receiver
+  can cost anything: at most the last batch (32 MiB), found by `reverify` and
+  asked for again. Resuming still needs a new Accept.
+* Recording each chunk costs a `state.json` rename per chunk: about 165 MB/s
+  instead of about 175 MB/s with no added delay, and no difference with
+  delay.
+* CHUNK_ACK now means "verified and written", not "flushed". The sender
+  never relied on more: what the receiver has is decided by its own bitmap,
+  sent in ACCEPT.
+* Peak memory per connection can reach about 32 MiB of in-flight data.
+* Tests:
+  - `tests/resume.rs::a_killed_receiver_keeps_chunks_it_had_not_flushed`
+  - `tests/resume.rs::chunks_lost_to_power_failure_are_dropped_not_trusted`
+  - `tests/resume.rs::a_full_batch_of_chunks_is_flushed_without_being_asked`
+  - `tests/resume.rs::a_full_batch_of_bytes_is_flushed_without_being_asked`
+  - The existing interruption tests still pass unchanged: in-process
+    hang-ups in `tests/resume.rs`, and killed processes in
+    `tests/end_to_end.rs`. They now also prove that a transfer that stops
+    keeps what it verified. Batching by chunk count, not only by bytes, is
+    what lets the kill tests still see progress part-way through a 2 MiB
+    file; with bytes alone, a small file was not flushed until it had all
+    arrived, and the tests stopped interrupting anything.
+
+## ADR-0040 — Throughput step 5: several chunks in flight (`beam/xfer/2`), and the sender checks what it reads
+
+**Status:** accepted (post-M6, branch `main-QoL`). Follows ADR-0039 and
+`docs/performance-plan.md`. Amends ADR-0016 (chunks no longer strictly one
+at a time or in order).
+
+**Context.** After ADR-0039, the last limit inside beam was B-1: the sender
+waited for each chunk's CHUNK_ACK before sending the next, so every 4 MiB
+chunk cost about two round trips. The benchmark showed exactly that: 34 MB/s
+at a 50 ms round trip and 17 MB/s at 100 ms. Reviewing the integrity story
+for this change also found a weakness that predates it. The sender reads its
+file twice, once to compute `file_sha256` and again to send each chunk, and
+each chunk's hash came from the second read. So a file edited during a send,
+or a disk returning bad data, passed every chunk check. It was caught only by
+the receiver's whole-file check at the very end: safe, since nothing was
+saved, but the whole transfer was wasted.
+
+### Decision
+
+* **Several chunks in flight.** After ACCEPT, the sender keeps up to
+  `PIPELINE_WINDOW` = 4 chunks sent but unanswered. Four 4 MiB chunks fill
+  the 16 MiB QUIC stream window (ADR-0039), so no memory bound changes. A
+  chunk's frames are still written together: CHUNK_START, then its data.
+* **A rejected chunk is re-sent after the others (option B).** On
+  CHUNK_NAK, the sender puts the chunk back at the front of its queue, and
+  the chunks already in flight carry on. The receiver accepts **any chunk
+  still missing, in any order**. It refuses, as a protocol error, a chunk not
+  asked for, one outside the transfer, or one that already arrived. Each
+  chunk still gets at most 3 attempts.
+
+  Option A was rejected: after a NAK, the receiver would discard everything
+  until the retry, and the sender would resend from the rejected chunk on.
+  It wastes up to three chunks per NAK and adds a "discarding" state. B fits
+  the design that already exists: a bitmap, and a partial file written by
+  position.
+* **A new protocol name, `beam/xfer/2`.** TRANSFER_REQUEST and ACCEPT reject
+  unknown fields, so a capability field would make an old peer refuse the
+  transfer. Instead, the version is agreed in the TLS handshake:
+  - `beam send` offers `beam/xfer/2` and `beam/xfer/1`;
+  - `listen` lists `/2` first, and the TLS server picks the first of its own
+    list that the client offered;
+  - the window follows the result: 4 for `/2`, 1 for `/1`.
+
+  The new receiver serves both, because one chunk at a time, in order, is a
+  special case of "any missing chunk". So an old sender works with a new
+  `listen`, and a new sender works with an old one.
+* **The sender checks what it sends.** Its first read now also keeps each
+  chunk's SHA-256 (`hash_stream_and_chunks`: 32 bytes per chunk, about 44 KB
+  for 5.5 GB). Every chunk read for sending is checked against that hash
+  first. A mismatch is read again, up to 3 times in all, in case a read
+  failed once. If it still does not match, or the file got shorter, the
+  sender sends CANCEL ("the file changed while it was being sent") and stops
+  with `SourceChanged`. The receiver keeps its partial, and a later send of
+  the changed file starts over, because its `file_sha256` differs.
+  CHUNK_START now carries the hash from before the request.
+
+### What guarantees integrity
+
+Unchanged, and independent of chunk order:
+
+1. QUIC/TLS: nothing on the wire can be altered or inserted.
+2. Each chunk is checked against its hash in memory before it is written.
+3. The receiver re-reads the assembled file and checks it against
+   `file_sha256`, which was committed before Accept. Only then is it moved
+   into place. Otherwise nothing is saved.
+
+Check 3 makes any mistake in between harmless: a damaged chunk, a chunk
+written in the wrong place by a bug, a bad disk read on the receiver. The
+result is the promised file or no file. The new sender check adds that a
+problem at the source is caught at its first chunk, with a clear message,
+instead of at the end.
+
+**What no software check can cover:** damage after the final check (faulty
+RAM, a disk that corrupts a stored file later), or damage that the operating
+system's file cache hides from the read-back. This is recorded in
+`SECURITY.md`.
+
+### Consequences
+
+* **Measured** (loopback with a delaying proxy, release build):
+
+  | Added round trip | One chunk at a time (after ADR-0039) | 4 in flight |
+  |---|---|---|
+  | 0 | about 175 MB/s | about 175 MB/s |
+  | 50 ms | 34 MB/s | 107–110 MB/s |
+  | 100 ms | 17 MB/s | 72–74 MB/s |
+  | 200 ms | 8.4 MB/s | 40 MB/s |
+
+  Now it is the network, QUIC's congestion control and the relay that limit a
+  long link, not beam's waiting. A relay-limited or Wi-Fi-limited transfer is
+  unchanged.
+* A chunk that keeps failing still ends the transfer after 3 attempts. A
+  duplicate or unrequested chunk ends it at once.
+* The receiver cannot see how many chunks the sender has in flight, and does
+  not need to: what it buffers is bounded by the QUIC connection window
+  (32 MiB) and one chunk being assembled.
+* Progress counts **acknowledged** chunks, so 100% still means received.
+* A changed source file is reported at once instead of after the whole
+  transfer.
+* Tests:
+  - `tests/transfer.rs::the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_one`
+  - `tests/transfer.rs::the_receiver_takes_missing_chunks_in_any_order`
+  - `tests/transfer.rs::a_duplicate_or_unknown_chunk_is_refused`
+  - `tests/transfer.rs::a_file_changed_while_being_sent_is_caught_before_it_is_sent`
+    (changed and cut short)
+  - `tests/listen.rs::the_transfer_protocol_version_is_agreed_and_sets_the_window`
+    (new to new picks `/2`; new to a `/1`-only receiver picks `/1`)
+  - `transfer::chunk::chunk_hashes_from_the_first_read_match_each_chunk`
+  - The existing suites now run pipelined: the CLI and `listen` tests over
+    `/2`, and the TCP test transport with a window of 4. That includes every
+    kill-and-resume test, with chunks in flight when the process dies. Old
+    senders are covered by the `listen` tests that dial `beam/xfer/1`.
+
+## ADR-0041 — Ctrl+C on either side: both terminals say who stopped the transfer
+
+**Status:** accepted (post-M6, branch `main-QoL`).
+
+**Context.** beam did not handle Ctrl+C: the process just died. The other
+side saw nothing until QUIC's idle timeout (15 s), then a generic "transfer
+failed: timed out" or "connection lost", with no hint that a person had
+stopped it, or who. A stopped `listen` also left `listen.json` behind, which
+`whoami` only knew to distrust because of the lock (ADR-0037).
+
+### Decision
+
+* **beam send and beam listen catch Ctrl+C** (tokio's `signal` feature; the
+  crate behind it was already in `Cargo.lock` through iroh, so no new
+  dependency). A second Ctrl+C ends the process at once, in case stopping
+  cleanly hangs.
+* **The other side is told through the QUIC close, with a beam code.** The
+  stopping side closes the connection with application code
+  `CLOSE_INTERRUPTED` = 2 (0 is a normal end, 1 an error). The peer gets the
+  CONNECTION_CLOSE frame at once. A close that QUIC reports as made *by the
+  peer* (`ApplicationClosed`, never `LocallyClosed`) with that code becomes
+  `TransferError::PeerInterrupted` on the sender, or
+  `ListenEvent::TransferInterrupted` in `listen`. Which side stopped is
+  therefore known from the connection, not from text.
+  - A CANCEL message was rejected: it needs the stream, mid-chunk, and
+    would not reach a sender that has not opened its stream yet.
+  - At worst, a peer could falsely claim its user interrupted, which only
+    changes the wording of a failure it could cause anyway.
+* **`listen` stops cleanly** (`listener::run_until`):
+  - every transfer in progress is closed with the code, counted from the
+    moment it holds the transfer slot, which includes a sender still hashing
+    its file;
+  - each handler gets up to 3 s to save what arrived;
+  - one `Stopped { cancelled }` event names those transfers, with no
+    separate failure messages;
+  - the endpoint is closed, `listen` exits normally, and `listen.json` is
+    removed.
+* **`send` races the transfer against the connection closing**, so a
+  receiver that stops is noticed at once, even while the sender is still
+  hashing a large file.
+* **What each terminal says:**
+
+  | | The side that pressed Ctrl+C | The other side |
+  |---|---|---|
+  | Sender stopped | `cancelled: you stopped beam (Ctrl+C). bob was told …` | `alice stopped beam on their side (Ctrl+C), so the transfer from alice was cancelled.` |
+  | Receiver stopped | `Stopped listening (Ctrl+C). Cancelled the transfer from alice, and told alice.` | `bob stopped beam on their side (Ctrl+C), so the transfer was cancelled.` |
+
+  Both sides add that what arrived is kept, and that sending the same file
+  again resumes it.
+
+### Consequences
+
+* Nothing about Accept, resume or integrity changes. An interrupted transfer
+  ends like any failed one: the partial is kept, and a resume needs a new
+  Accept.
+* `beam send` exits 1 after Ctrl+C, and `beam listen` exits 0: stopping it is
+  its normal end.
+* The hidden `--addr` TCP test transport does not catch Ctrl+C.
+* Tests:
+  - `tests/listen.rs::stopping_listen_mid_transfer_tells_the_sender_and_keeps_what_arrived`
+  - `tests/listen.rs::a_sender_stopped_mid_transfer_is_reported_as_such_by_listen`
+    (and within 5 s, not after the idle timeout)
+  - `tests/listen.rs::stopping_listen_while_the_sender_is_still_hashing_tells_it_at_once`.
+    This was found by the manual check below. In that window `listen` had not
+    counted the sender, so it got a generic "connection lost", and `listen`
+    printed a stray failure after "Stopped".
+  - Manual, on real processes: a genuine Ctrl+C sent to a `beam send` and to
+    a `beam listen` console mid-transfer (`test-plan.md`). Both terminals
+    showed the messages above.

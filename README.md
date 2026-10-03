@@ -37,6 +37,23 @@ On Windows without `make`:
 powershell -ExecutionPolicy Bypass -File scripts\check.ps1
 ```
 
+### Installing on Windows, so `beam` works without `.\beam.exe`
+
+Double-click `scripts\install.bat`, or run it from a terminal. It builds beam
+in release mode and copies it to `%LOCALAPPDATA%\Programs\beam`, then adds
+that folder to your user PATH (no administrator rights needed). Open a new
+terminal afterwards and type `beam`. Run it again after pulling changes to
+update. `scripts\install.bat -Uninstall` removes it. Neither touches
+`~/.beam`, where your key and paired peers live.
+
+To give beam to someone without Rust, put `beam.exe` (from
+`target\release`) in a folder with `install.bat` and `install.ps1`.
+The script then installs that `beam.exe` instead of building one.
+
+(A `.bat` wrapper alone would not help: Windows finds a command without a
+path only in the folders on PATH, and PowerShell never looks in the current
+folder. So the real fix is putting beam's folder on PATH.)
+
 ## Use
 
 ```
@@ -354,9 +371,9 @@ when it can, by a copy when the destination is on another drive.
 
 Inside a `tmp/<id>/` directory, `state.json` records which chunks have arrived
 and `hashes` records what each one should be. The bitmap in `state.json` is
-always written **after** the chunk data has been flushed, so a crash loses the
-claim rather than the data: the chunk is fetched again instead of being trusted
-when it should not be.
+always written **after** the chunk data, and the disk is flushed every 8 chunks.
+The bitmap is a claim, not proof: on resume every claimed chunk is re-hashed,
+so one lost to a power cut is fetched again instead of being trusted.
 
 `known_peers` is plain text and safe to read:
 
@@ -413,6 +430,9 @@ crates/beam/
   tests/               command, integration and two-process tests
 docs/                  requirements, design decisions, test plan
 ```
+
+Transfer speed, what has been measured and the plan to improve it:
+[docs/performance-plan.md](docs/performance-plan.md).
 
 The project was originally written in Go; see ADR-0010 in
 [docs/decisions.md](docs/decisions.md) for why it moved to Rust and what that

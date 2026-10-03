@@ -29,15 +29,18 @@ S-1 to S-34, `threat-model.md`).
 | **A device cannot pretend to be another.** | Each connection is QUIC/TLS 1.3 keyed by the devices' Ed25519 keys, so a connection proves who is at each end. beam trusts that proof, never a key written in a message. |
 | **A changed key is never followed.** | If a peer's key changes, it shows up as "not reachable" or "unknown key", with an SSH-style warning. Re-pairing is a deliberate act. |
 | **Pairing cannot be hijacked without the code and both people agreeing.** | SPAKE2 proves both sides know the six-digit code without sending it, and the confirmation binds both keys. Then both people compare fingerprints and type `yes`. A code works once; three wrong codes switch pairing off. |
-| **Files arrive exactly as sent, or not at all.** | Every 4 MiB chunk is hashed before it is written, and the whole file before it is kept. It is built in a private temp folder, then moved into place. Nothing is overwritten. |
+| **Files arrive exactly as sent, or not at all.** | Every 4 MiB chunk is hashed before it is written, and the whole file before it is kept, against a hash the sender committed to before you accepted. It is built in a private temp folder, then moved into place. Nothing is overwritten. The sender also checks each chunk it reads against the hash it took before asking, so a file changed mid-send is stopped at once (ADR-0040). Chunk order, retries and crashes cannot change the outcome. |
 | **A file name cannot escape the folder or trick the screen.** | Only the base name is used; `..`, separators, reserved names and right-to-left tricks are refused; terminal escape sequences are removed from everything printed. |
-| **A paired but misbehaving peer cannot exhaust your machine.** | Caps on chunk size and count, frame size checked before allocating, free space checked first, and stall timeouts. |
+| **A paired but misbehaving peer cannot exhaust your machine.** | Caps on chunk size and count, frame size checked before allocating, at most 32 MiB of data in flight per connection (ADR-0039), free space checked first, and stall timeouts. |
 | **No cryptography of our own.** | Only established, maintained libraries are used (section 3). |
 
 ## 2. What beam does *not* protect against
 
 - **A compromised computer.** Malware that can read `~/.beam` has your
   private key, and with it your identity to every peer.
+- **Damage after the final check.** beam checks the file as the operating
+  system hands it back. Faulty RAM, or a disk that later damages a stored
+  file, is beyond what any transfer tool can check.
 - **A person who says yes without looking.** Pairing and Accept are only as
   good as the person checking the fingerprint and the file name.
 - **Traffic analysis by the relay.** A relay sees which keys talk, when, and

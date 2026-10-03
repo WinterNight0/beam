@@ -140,6 +140,59 @@ where
     Ok((hex::encode(&hasher.finalize()), read_so_far))
 }
 
+/// Like [`hash_stream`], and also hashes each `chunk_size` piece on the way.
+///
+/// The sender keeps these chunk hashes from its first read of the file and
+/// checks every chunk against them when it reads the chunk again to send it.
+/// A file changed mid-transfer, or a disk that returns different bytes, is
+/// then caught at that chunk, before anything is sent, instead of only by
+/// the receiver's whole-file check at the very end (ADR-0040).
+pub async fn hash_stream_and_chunks<R, F>(
+    reader: &mut R,
+    total: u64,
+    chunk_size: u32,
+    mut progress: F,
+) -> std::io::Result<(String, u64, Vec<String>)>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(u64, u64),
+{
+    assert!(chunk_size > 0, "chunk size must be positive");
+    let mut file = Sha256::new();
+    let mut chunk = Sha256::new();
+    let mut in_chunk = 0u64;
+    let mut chunks = Vec::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut read_so_far = 0u64;
+
+    loop {
+        let n = reader.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        file.update(&buffer[..n]);
+        let mut rest = &buffer[..n];
+        while !rest.is_empty() {
+            let room = (u64::from(chunk_size) - in_chunk) as usize;
+            let take = room.min(rest.len());
+            chunk.update(&rest[..take]);
+            in_chunk += take as u64;
+            rest = &rest[take..];
+            if in_chunk == u64::from(chunk_size) {
+                chunks.push(hex::encode(&std::mem::take(&mut chunk).finalize()));
+                in_chunk = 0;
+            }
+        }
+        read_so_far += n as u64;
+        progress(read_so_far, total);
+    }
+    if in_chunk > 0 {
+        chunks.push(hex::encode(&chunk.finalize()));
+    }
+
+    Ok((hex::encode(&file.finalize()), read_so_far, chunks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +362,35 @@ mod tests {
         let (digest, len) = hash_stream(&mut reader, 0, |_, _| {}).await.expect("hash");
         assert_eq!(digest, sha256_hex(b""));
         assert_eq!(len, 0);
+    }
+
+    #[tokio::test]
+    async fn chunk_hashes_from_the_first_read_match_each_chunk() {
+        let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        for chunk_size in [1u32, 7, 256, 999, 1000, 1001, 300_000] {
+            let mut reader = bytes.as_slice();
+            let (file, size, chunks) =
+                hash_stream_and_chunks(&mut reader, bytes.len() as u64, chunk_size, |_, _| {})
+                    .await
+                    .unwrap();
+            assert_eq!(file, sha256_hex(&bytes));
+            assert_eq!(size, bytes.len() as u64);
+            let plan = ChunkPlan::new(size, chunk_size);
+            assert_eq!(chunks.len() as u32, plan.chunk_count());
+            for (index, hash) in chunks.iter().enumerate() {
+                let start = plan.offset_of(index as u32) as usize;
+                let end = start + plan.len_of(index as u32) as usize;
+                assert_eq!(
+                    hash,
+                    &sha256_hex(&bytes[start..end]),
+                    "chunk {index} of {chunk_size}"
+                );
+            }
+        }
+        let mut empty: &[u8] = &[];
+        let (_, size, chunks) = hash_stream_and_chunks(&mut empty, 0, 4, |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!((size, chunks.len()), (0, 0));
     }
 }

@@ -518,11 +518,63 @@ invite by chat and the code by another channel; the other runs `beam pair
 | F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
 | S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
 
+## Implemented (post-M6): Ctrl+C on either side (ADR-0041)
+
+| Requirement | Test |
+|---|---|
+| F-25 receiver stops mid-transfer: sender told at once, `Stopped` names it, data kept | `tests/listen.rs::stopping_listen_mid_transfer_tells_the_sender_and_keeps_what_arrived` |
+| F-25 sender stops mid-transfer: `listen` reports it as the sender's doing, within 5 s, data kept | `tests/listen.rs::a_sender_stopped_mid_transfer_is_reported_as_such_by_listen` |
+| F-25 receiver stops while the sender is still hashing: told at once, one `Stopped`, nothing after | `tests/listen.rs::stopping_listen_while_the_sender_is_still_hashing_tells_it_at_once` |
+
+### Manual: a real Ctrl+C on each side
+
+Two terminals, a large file (hundreds of MiB), paired devices.
+
+1. `beam listen` on one, `beam send <peer> <file>` on the other, accept, and
+   press Ctrl+C in the **sender** while the progress line moves. Expected:
+   - the sender prints `cancelled: you stopped beam (Ctrl+C). <peer> was told …`;
+   - `listen` prints `<sender> stopped beam on their side (Ctrl+C) …` at once,
+     not after 15 s, and keeps listening.
+2. Repeat, pressing Ctrl+C in **`listen`**. Expected:
+   - `listen` prints `Stopped listening (Ctrl+C). Cancelled the transfer from …`
+     and exits;
+   - the sender prints `<peer> stopped beam on their side (Ctrl+C) …`;
+   - `beam whoami` on the receiver says `listen` is not running.
+3. Send the same file again: it resumes, after a new Accept.
+
+Run on 2026-10-04 with a genuine console Ctrl+C on each side. Both terminals
+showed the expected text. The first run found the still-hashing gap, now
+covered by the test above.
+
 ### Manual: direct P2P across the internet with no relay
 
 Follow "No relay at all: testing real direct P2P" in `deploy.md`. Record each
 side's situation (UPnP, manual forward with `advertise`, or CGNAT), whether it
 connected, and the time for the same file with and without the relay.
+
+## Implemented (post-M6): throughput, steps 1–4 (ADR-0039)
+
+| Requirement | Test |
+|---|---|
+| N-8 throughput is measured | `tests/throughput.rs::throughput_over_loopback_iroh` (ignored; `cargo test --release --test throughput -- --ignored --nocapture`, with `BEAM_BENCH_MIB` and `BEAM_BENCH_RTT_MS`) |
+| D-15 a killed receiver keeps chunks it had not flushed | `tests/resume.rs::a_killed_receiver_keeps_chunks_it_had_not_flushed` |
+| D-15 chunks lost to power failure are dropped, re-fetched, and the file is still right | `tests/resume.rs::chunks_lost_to_power_failure_are_dropped_not_trusted` (simulated by truncating the data file after the chunks were recorded) |
+| D-15 a batch flushes by itself | `tests/resume.rs::a_full_batch_of_chunks_is_flushed_without_being_asked`, `a_full_batch_of_bytes_is_flushed_without_being_asked` |
+| D-15 a transfer that stops keeps what it verified | the existing hang-up tests in `tests/resume.rs` (`partial_session`), and the kill tests in `tests/end_to_end.rs` (`killed::*`, `over_iroh::killing_the_sender_over_iroh_then_resuming`) |
+| D-10 data before record; D-11 re-hash on resume | `tests/resume.rs::a_corrupted_stored_chunk_is_re_fetched_rather_than_trusted` |
+
+## Implemented (post-M6): throughput step 5 and the sender's own check (ADR-0040)
+
+| Requirement | Test |
+|---|---|
+| F-24 at most 4 chunks in flight; a rejected chunk re-sent after the others | `tests/transfer.rs::the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_one` |
+| F-24 the version is agreed and sets the window; a `beam/xfer/1`-only receiver gets one at a time | `tests/listen.rs::the_transfer_protocol_version_is_agreed_and_sets_the_window`; old senders: every `tests/listen.rs` test that dials `XFER_ALPN` |
+| S-37 chunks in any order, NAK then retry later | `tests/transfer.rs::the_receiver_takes_missing_chunks_in_any_order` |
+| S-37 a duplicate or out-of-range chunk ends the transfer, nothing saved | `tests/transfer.rs::a_duplicate_or_unknown_chunk_is_refused` |
+| S-36 a file changed or cut short mid-send is stopped before that chunk is sent, and the receiver is told | `tests/transfer.rs::a_file_changed_while_being_sent_is_caught_before_it_is_sent` |
+| Chunk hashes from the first read | `transfer::chunk::chunk_hashes_from_the_first_read_match_each_chunk` |
+| Kill and resume with chunks in flight | the existing `tests/end_to_end.rs` kill tests, now pipelined |
+| Throughput | `tests/throughput.rs` with `BEAM_BENCH_RTT_MS=50/100/200` |
 
 ## Manual test steps
 

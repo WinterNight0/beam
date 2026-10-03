@@ -161,9 +161,23 @@ own workspace crates only if compile times demand it.
   relays must be `https://` on public hosts; CI read-only, actions pinned, `cargo audit`;
   `advertise` config for direct testing. Open: R-8 (scannable `listen`), to be planned.
   `SECURITY.md` holds the audit results and must be updated with each new check.
-- **Next (to be planned before coding):** throughput. Known limits: QUIC stream window
-  1.25 MB (noq default), one 4 MiB chunk in flight at a time, two fsyncs per chunk,
-  n0's public relay being rate-limited.
+- **Post-M6 (ADR-0039)** Throughput steps 1-4: `tests/throughput.rs` benchmark (ignored;
+  run in release, `BEAM_BENCH_RTT_MS` adds delay), QUIC stream window 16 MiB and
+  connection window 32 MiB; each chunk recorded at once, disk flushed in batches (8 chunks
+  / 32 MiB, and when a transfer stops); `reverify` on resume is what makes an unflushed
+  record safe. Measure any speed change with the benchmark.
+- **Post-M6 (ADR-0040)** Throughput step 5: up to 4 chunks in flight on ALPN
+  `beam/xfer/2` (sender offers `/2` and `/1`; `listen` prefers `/2`; `/1` = one at a time).
+  A NAK'd chunk is re-sent after the others; the receiver takes any *missing* chunk in any
+  order and refuses duplicates or unknown indices. The sender checks each chunk it reads
+  against the hash from its first pass and CANCELs on mismatch (`SourceChanged`).
+  The whole-file hash before commit remains the integrity anchor.
+- **Post-M6 (ADR-0041)** Ctrl+C in `send`/`listen` closes the connection with QUIC
+  application code 2 (`CLOSE_INTERRUPTED`); the peer reports "<name> stopped beam on their
+  side". `listener::run_until` stops `listen` cleanly (tells senders, keeps partials, one
+  `Stopped` event, removes `listen.json`).
+- **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
+  (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.
 
 ## Testing expectations
