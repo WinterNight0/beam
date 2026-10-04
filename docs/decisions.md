@@ -2120,3 +2120,76 @@ stopped it, or who. A stopped `listen` also left `listen.json` behind, which
   - Manual, on real processes: a genuine Ctrl+C sent to a `beam send` and to
     a `beam listen` console mid-transfer (`test-plan.md`). Both terminals
     showed the messages above.
+
+## ADR-0042 — Background agent: receive without `beam listen`, accept in `beam inbox`
+
+**Status:** accepted (post-M6, branch `main-QoL`). Full description,
+security analysis and limits: `docs/background-services.md`.
+
+**Context.** Receiving needed `beam listen` open in a terminal. The goal: a
+paired device can send at any time, and the person is notified and decides.
+The constraint is rule 1. A Windows service or system daemon has no terminal
+to ask in, and running as SYSTEM or root would be dangerous.
+
+**Decisions taken with the team (2026-10-04):**
+- notifications with built-in OS tools (no new dependency);
+- requests wait 5 minutes;
+- a command to set the receive folder, defaulting to the real Downloads
+  folder on Windows (even if moved) and to the terminal's folder on Linux;
+- router port mapping in the agent is a toggle, off by default, that warns
+  and asks y/N before turning on.
+
+### Decision
+
+* **A per-user agent plus a terminal inbox.**
+  - `beam agent` runs the listener with no terminal: `listener::run_until`
+    with pairing off, port mapping as configured, and a 5-minute Accept
+    window. Its prompt hands each request to `beam inbox` and shows a
+    notification.
+  - `beam inbox` shows the same prompt, through the same prompt desk, as
+    `beam listen`.
+  - An answer there is the Accept, and silence is a no.
+* **The agent does not pair.** The pairing protocol is not offered in the
+  handshake (`ListenOptions::allow_pairing`), so an agent that is always
+  reachable gives nobody codes to try (R-8).
+* **Local link: loopback TCP plus a token.**
+  - `beam inbox` connects to `127.0.0.1`.
+  - The agent says nothing until the client presents the 32-byte token from
+    `agent.json` (private, compared in constant time).
+  - There is a 5 s limit for the first message, 64 KiB lines and 8 clients.
+  - Chosen over Unix sockets and named pipes for one code path and no
+    `unsafe`.
+* **Per-user start, never a system service.**
+  - Windows: an `HKCU\…\Run` value runs `beam service start`, which
+    launches the agent through `Start-Process` with its window hidden.
+    Spawning it directly would let it inherit the caller's handles; found in
+    the manual test.
+  - Linux: a `systemd --user` unit.
+  - Both carry `--beam-dir`.
+* **Notifications:** Windows PowerShell toast, `notify-send`, or `osascript`.
+  The text travels in environment variables and is XML-escaped on Windows. At
+  most one notification every 10 s.
+* **Settings:** `receive_dir` (also used by `beam listen` without `--out`)
+  and `agent_port_mapping`, edited one key at a time, keeping the rest of
+  `config.toml`.
+* **`beam send` waits 5 min 15 s** for an answer. Each receiver ends its own
+  question first: `listen` after 60 s, the agent after 5 minutes.
+* **`listen` and the agent exclude each other** in one beam home.
+
+### Consequences
+
+* No new remote attack path. The surfaces are handled as follows:
+  - a longer exposure window: pairing off, port mapping off by default;
+  - one local link: same user only;
+  - accepted risk **R-9**: the relay can see the device's online presence
+    while the agent runs.
+* New commands: `agent`, `inbox`, `service enable|disable|start|stop|status|port-mapping`,
+  `receive-dir`.
+* Limitations: a console flashes briefly at Windows login; no macOS login
+  start; no notification on a Linux server without a desktop; an older
+  `beam send` waits only 60 s. The Linux paths were checked by CI and review,
+  not run on a real Linux machine.
+* Tests: `tests/agent.rs` (9: accept, decline, expiry, first answer wins, no
+  token learns nothing, no pairing, strangers refused, stop, one per home);
+  unit tests in `agent::{status, ipc, notify, service}` and `config`; a
+  manual real-process run on Windows (`background-services.md` §5).

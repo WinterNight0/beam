@@ -470,6 +470,23 @@ Partials are kept after a decline, an expiry or a lost connection, deleted on
 success or when the final hash fails, and expire after seven days.
 `beam transfers` lists them, and `beam transfers --clear` deletes them.
 
+### Receiving without `beam listen`: the background agent
+
+`beam service enable` starts an optional **background agent** at login. It
+runs the same listener as `beam listen`, with three differences:
+
+* it does not pair;
+* router port mapping is off unless turned on;
+* a request waits up to 5 minutes.
+
+When a paired device sends something, the agent shows a desktop notification.
+The person answers in a terminal with `beam inbox`, which shows the same
+Accept prompt. `beam inbox` reaches the agent over `127.0.0.1` and must
+present the token from the private `~/.beam/agent.json` before the agent tells
+it anything. The agent runs as the user, never as a system service. Details,
+the security analysis and the limits: [background-services.md](background-services.md)
+(ADR-0042).
+
 ---
 
 ## 9. Who sees what

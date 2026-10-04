@@ -17,7 +17,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
-use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, VarInt, presets};
+use iroh::endpoint::{
+    BindOpts, IdleTimeout, PortmapperConfig, QuicTransportConfig, VarInt, presets,
+};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey, Watcher};
 
 use crate::config::Relay;
@@ -122,8 +124,23 @@ pub async fn bind(
     port: u16,
     alpns: &[&[u8]],
 ) -> Result<Endpoint, EndpointError> {
-    match bind_on(identity, relay, bind, port, alpns).await {
-        Err(_) if port != 0 => bind_on(identity, relay, bind, 0, alpns).await,
+    bind_with(identity, relay, bind, port, alpns, true).await
+}
+
+/// [`bind`], choosing whether iroh may ask the router to forward the port
+/// (UPnP, NAT-PMP, PCP). The background agent leaves it off unless the person
+/// turned it on (ADR-0042): with it, a fixed port becomes reachable from the
+/// internet for as long as the agent runs.
+pub async fn bind_with(
+    identity: &Identity,
+    relay: &Relay,
+    bind: Bind,
+    port: u16,
+    alpns: &[&[u8]],
+    port_mapping: bool,
+) -> Result<Endpoint, EndpointError> {
+    match bind_on(identity, relay, bind, port, alpns, port_mapping).await {
+        Err(_) if port != 0 => bind_on(identity, relay, bind, 0, alpns, port_mapping).await,
         result => result,
     }
 }
@@ -134,6 +151,7 @@ async fn bind_on(
     bind: Bind,
     port: u16,
     alpns: &[&[u8]],
+    port_mapping: bool,
 ) -> Result<Endpoint, EndpointError> {
     let secret = SecretKey::from_bytes(&identity.signing_key().to_bytes());
     let relay_mode = match relay {
@@ -146,6 +164,9 @@ async fn bind_on(
         .relay_mode(relay_mode)
         .transport_config(transport_config())
         .alpns(alpns.iter().map(|a| a.to_vec()).collect());
+    if !port_mapping {
+        builder = builder.portmapper_config(PortmapperConfig::Disabled);
+    }
     let invalid = |e: iroh::endpoint::InvalidSocketAddr| EndpointError::Bind(e.to_string());
     match (bind, port) {
         (Bind::Loopback, port) => {

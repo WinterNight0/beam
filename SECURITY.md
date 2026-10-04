@@ -76,7 +76,9 @@ across the workspace (`unsafe_code = "forbid"`).
 | `known_peers` | paired devices: names, public keys, saved addresses | Private (0600). The trust root for receiving; anyone who can edit it can add a trusted device. |
 | `listen.json` | while `listen` runs: its invite and the live pairing code | Private (0600). Single-use code, at most ten minutes old (ADR-0037). |
 | `listen.lock` | nothing; held locked while `listen` runs | Not sensitive. |
-| `config.toml` | relay, port, advertised addresses | Not secret. |
+| `agent.json` | while the background agent runs: its local port and **the token** that lets `beam inbox` answer requests | **Private** (0600). Believed only while `agent.lock` is held; removed on a clean stop (ADR-0042). |
+| `agent.log` | what the background agent did: requests, answers, results | Names peers and files. |
+| `config.toml` | relay, port, advertised addresses, receive folder, agent port mapping | Not secret. |
 | `tmp/<id>/` | partly received files | As sensitive as the files themselves. |
 
 ### On the network
@@ -107,7 +109,11 @@ across the workspace (`unsafe_code = "forbid"`).
    and the size. Say no to anything unexpected.
 6. **Stop `listen` when you do not need it.** While it runs it is reachable,
    and its pairing code is live.
-7. **For maximum privacy**, use `relay = "none"`, or a relay you run. Without
+7. **The background agent is optional.** Turn it on only if you want to
+   receive without `beam listen` open. It never accepts by itself: answer in
+   `beam inbox`. Leave its router port mapping off unless you need it. See
+   [docs/background-services.md](docs/background-services.md).
+8. **For maximum privacy**, use `relay = "none"`, or a relay you run. Without
    a relay, only direct connections work; the testing guide in
    [docs/deploy.md](docs/deploy.md) shows how.
 
@@ -125,6 +131,7 @@ These are accepted on purpose, with their reasons, in
 | R-5 | The hidden TCP test transport is unencrypted and does not prove keys. |
 | R-6 | A crashed or silent sender can hold `listen`'s single transfer slot for 15–60 s. |
 | R-7 | Notices can print while a question is open (it is redrawn). |
+| R-9 | The optional background agent keeps the device reachable all day: the relay sees when it is online, and with port mapping turned on its port can be found. It does not pair, and only paired keys may ask (`docs/background-services.md`). |
 | **R-8** | **Open.** With a fixed port and router port mapping, a running `listen` can be found by scanning, and anyone can use up its pairing codes or learn its public key. Fixing it trades away usability or connectivity, so it is planned rather than patched (ADR-0038). |
 
 ## 7. Vulnerability status

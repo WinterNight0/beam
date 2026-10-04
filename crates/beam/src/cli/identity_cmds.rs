@@ -22,6 +22,17 @@ struct SelfJson {
     /// `whoami` fills it in.
     #[serde(skip_serializing_if = "Option::is_none")]
     listening: Option<ListeningJson>,
+    /// Whether the background agent runs, and where it saves (ADR-0042).
+    /// Never its token. Only `whoami` fills it in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentJson>,
+}
+
+#[derive(serde::Serialize)]
+struct AgentJson {
+    running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receive_dir: Option<String>,
 }
 
 /// The `--json` shape of a running `listen`, as `whoami` sees it.
@@ -55,6 +66,7 @@ impl App {
             comment: identity.comment().to_string(),
             dir: self.store.dir().display().to_string(),
             listening: None,
+            agent: None,
         }
     }
 
@@ -95,6 +107,7 @@ impl App {
     pub(super) fn whoami(&self, io: &mut Io<'_>) -> Result<(), CommandError> {
         let identity = self.store.load_identity()?;
         let listening = listen_status::read(&self.store);
+        let agent = crate::agent::status::read(&self.store);
 
         if self.json {
             let mut json = self.self_json(&identity);
@@ -102,6 +115,20 @@ impl App {
                 Listening::Yes(status) => ListeningJson::Status(status),
                 Listening::Unreadable => ListeningJson::Unreadable { unreadable: true },
                 Listening::No => ListeningJson::No(()),
+            });
+            json.agent = Some(match agent {
+                crate::agent::status::Running::Yes(status) => AgentJson {
+                    running: true,
+                    receive_dir: Some(status.receive_dir),
+                },
+                crate::agent::status::Running::Unreadable => AgentJson {
+                    running: true,
+                    receive_dir: None,
+                },
+                crate::agent::status::Running::No => AgentJson {
+                    running: false,
+                    receive_dir: None,
+                },
             });
             return write_json(io, &json);
         }
@@ -118,6 +145,14 @@ impl App {
         ui::field(io.out, "Directory", &self.store.dir().display().to_string())?;
         writeln!(io.out)?;
         show_listening(io, &listening)?;
+        if let crate::agent::status::Running::Yes(status) = agent {
+            writeln!(
+                io.out,
+                "The background agent is running: paired devices can send files, which you \
+                 answer with `beam inbox`.\nIt saves them to {}.",
+                crate::untrusted::name(&status.receive_dir)
+            )?;
+        }
         self.warn_permissions(io);
         Ok(())
     }

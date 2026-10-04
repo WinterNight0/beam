@@ -70,7 +70,17 @@ beam transfers --clear         # discard them
 
 beam pair <INVITE> --name bob  # pair with a listening device, typing its code
 beam pair --wait --name alice  # pair without also receiving files
+
+beam service enable            # optional: receive in the background, from login
+beam inbox                     # accept or decline what the background agent holds
+beam service status|stop       # see or stop the background agent
+beam receive-dir <folder>      # where received files go
 ```
+
+The background agent is optional. With it on, paired devices can send while
+`beam listen` is closed: you get a notification and answer in `beam inbox`.
+It never accepts anything by itself, and it does not pair. See
+[docs/background-services.md](docs/background-services.md).
 
 `listen` saves into the current directory unless given `--out <dir>`. Its
 pairing code works once and changes every ten minutes. It is shown once, when

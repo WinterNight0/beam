@@ -52,10 +52,26 @@ impl App {
         // Read once up front so a broken file is reported now, not at the
         // first transfer.
         self.store.load_known_peers()?;
+        // Two receivers on one identity would split the peers between them.
+        if !matches!(
+            crate::agent::status::read(&self.store),
+            crate::agent::status::Running::No
+        ) {
+            return Err(CommandError::Message(
+                "the background agent is running and already receives files (answer them with \
+                 `beam inbox`). To pair a new device, use `beam pair --wait --name <name>`. To \
+                 use `beam listen` instead, run `beam service stop` first"
+                    .into(),
+            ));
+        }
         let network = self.network(loopback)?;
-        let out_dir = match out_dir {
-            Some(dir) => dir,
-            None => std::env::current_dir().map_err(CommandError::Io)?,
+        let configured = Config::load(&self.store.config_path())
+            .map_err(|e| CommandError::Message(e.to_string()))?
+            .receive_dir;
+        let out_dir = match (out_dir, configured) {
+            (Some(dir), _) => dir,
+            (None, Some(dir)) => dir,
+            (None, None) => std::env::current_dir().map_err(CommandError::Io)?,
         };
         std::fs::create_dir_all(&out_dir).map_err(CommandError::Io)?;
 
@@ -91,6 +107,8 @@ impl App {
             stall_timeout: crate::transfer::engine::DEFAULT_STALL_TIMEOUT,
             pairing: policy,
             timeouts: Timeouts::default(),
+            allow_pairing: true,
+            port_mapping: true,
         };
         let json = self.json;
         let screen = Screen {
@@ -148,7 +166,11 @@ impl App {
             )));
         }
         let mut options = SendOptions::new(file, encode_public_key(&identity.verifying_key()));
-        options.accept_timeout = DEFAULT_ACCEPT_TIMEOUT;
+        // The receiver decides how long its question stays open: 60 s at
+        // `beam listen`, five minutes at a background agent, whose user first
+        // has to notice a notification (ADR-0042). Each answers "expired"
+        // itself, so the sender only needs to outlast the longest.
+        options.accept_timeout = crate::agent::AGENT_ACCEPT_TIMEOUT + Duration::from_secs(15);
         if let Some(chunk_size) = chunk_size {
             if chunk_size == 0 {
                 return Err(CommandError::Message(
@@ -245,7 +267,7 @@ impl App {
 /// second Ctrl+C ends the process at once, in case stopping cleanly hangs. If
 /// Ctrl+C cannot be watched, it never completes, and Ctrl+C does what it
 /// always did.
-async fn interrupted() {
+pub(super) async fn interrupted() {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
     }

@@ -518,6 +518,23 @@ invite by chat and the code by another channel; the other runs `beam pair
 | F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
 | S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
 
+## Implemented (post-M6): background agent (ADR-0042)
+
+The full list, and the manual steps, are in
+[background-services.md §5](background-services.md).
+
+| Requirement | Test |
+|---|---|
+| F-26 accept in the inbox, saved to the receive folder; decline; expiry | `tests/agent.rs::a_request_is_accepted_in_the_inbox_and_saved_to_the_receive_folder`, `declining_in_the_inbox_saves_nothing`, `an_unanswered_request_expires_and_saves_nothing` |
+| S-39 no token, no information, no answer; one answer per request | `tests/agent.rs::a_client_without_the_token_learns_nothing_and_cannot_answer`, `the_first_answer_decides_and_a_second_is_too_late`, `agent::ipc::*` |
+| S-38 the agent does not pair | `tests/agent.rs::the_agent_does_not_pair` |
+| S-7 at the agent | `tests/agent.rs::an_unpaired_device_is_refused_without_a_request` |
+| `service stop`, one agent per home, status file | `tests/agent.rs::a_stop_request_stops_the_agent_and_takes_its_token_off_disk`, `a_second_agent_in_the_same_home_is_refused`, `agent::status::*` |
+| S-41 notification text is data | `agent::notify::the_text_travels_as_data_not_as_code` |
+| F-27 receive folder setting | `config::receive_dir_and_agent_port_mapping_are_read`, `set_value_changes_one_key_and_keeps_the_rest` |
+| F-28 login entry and unit | `agent::service::*` |
+| S-40, manual run on Windows | `background-services.md` §5, run 2026-10-04 |
+
 ## Implemented (post-M6): Ctrl+C on either side (ADR-0041)
 
 | Requirement | Test |

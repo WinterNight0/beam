@@ -33,7 +33,7 @@ pub use partial::{
 };
 pub use paths::{NameError, reserve_destination, sanitize_file_name};
 pub use receiver::{
-    Prompt, PromptRequest, ReceiveOptions, ReceiveSummary, receive_file, turn_away,
+    Prompt, PromptRequest, ReceiveOptions, ReceiveSummary, ResumeInfo, receive_file, turn_away,
 };
 pub use sender::{SendOptions, SendSummary, send_file};
 pub use state::{Event, IllegalTransition, Machine, State};

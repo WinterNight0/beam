@@ -25,6 +25,14 @@ pub const CONFIG_NAME: &str = "config.toml";
 pub const LISTEN_STATUS_NAME: &str = "listen.json";
 /// Held locked by a running `beam listen`; `listen.json` counts only while it is.
 pub const LISTEN_LOCK_NAME: &str = "listen.lock";
+/// What a running background agent offers `beam inbox`: its local port and
+/// the token that proves a client is this user (ADR-0042). Private.
+pub const AGENT_STATUS_NAME: &str = "agent.json";
+/// Held locked by a running background agent; `agent.json` counts only while
+/// it is.
+pub const AGENT_LOCK_NAME: &str = "agent.lock";
+/// What the background agent did, for when nobody was watching.
+pub const AGENT_LOG_NAME: &str = "agent.log";
 
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -153,6 +161,32 @@ impl Store {
         self.ensure_dirs()?;
         write_atomic(
             &self.listen_status_path(),
+            json.as_bytes(),
+            Visibility::Private,
+        )
+    }
+
+    /// Where a running background agent publishes how to reach it.
+    pub fn agent_status_path(&self) -> PathBuf {
+        self.dir.join(AGENT_STATUS_NAME)
+    }
+
+    /// The lock a running background agent holds.
+    pub fn agent_lock_path(&self) -> PathBuf {
+        self.dir.join(AGENT_LOCK_NAME)
+    }
+
+    /// The background agent's log.
+    pub fn agent_log_path(&self) -> PathBuf {
+        self.dir.join(AGENT_LOG_NAME)
+    }
+
+    /// Writes `agent.json` atomically. Private: it holds the token that lets
+    /// a local client answer transfer requests (ADR-0042).
+    pub fn save_agent_status(&self, json: &str) -> Result<(), StoreError> {
+        self.ensure_dirs()?;
+        write_atomic(
+            &self.agent_status_path(),
             json.as_bytes(),
             Visibility::Private,
         )

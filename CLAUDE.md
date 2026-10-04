@@ -22,6 +22,9 @@ beam peers                     # list paired peers + fingerprints
 beam rename alice ali
 beam remove alice
 beam whoami                    # show own ID + fingerprint
+beam service enable            # optional background agent (ADR-0042)
+beam inbox                     # accept/decline what the agent holds
+beam receive-dir <folder>      # where received files go
 ```
 
 ## Non-negotiable rules
@@ -176,6 +179,15 @@ own workspace crates only if compile times demand it.
   application code 2 (`CLOSE_INTERRUPTED`); the peer reports "<name> stopped beam on their
   side". `listener::run_until` stops `listen` cleanly (tells senders, keeps partials, one
   `Stopped` event, removes `listen.json`).
+- **Post-M6 (ADR-0042)** Background agent (`src/agent/`): `beam agent` runs
+  `listener::run_until` with pairing off, port mapping per `agent_port_mapping`
+  (default off; `beam service port-mapping on` warns + y/N), 5 min Accept window;
+  its Prompt hands requests to `beam inbox` over loopback TCP gated by the token
+  in private `agent.json` and shows an OS notification (PowerShell toast /
+  notify-send / osascript, text via env vars). Per-user only: HKCU Run entry or
+  `systemd --user`; never a system service. `beam receive-dir` sets `receive_dir`
+  (Windows default: real Downloads folder; Linux: start folder). `listen` and the
+  agent exclude each other. See `docs/background-services.md`.
 - **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.

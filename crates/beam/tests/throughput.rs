@@ -241,6 +241,8 @@ async fn throughput_over_loopback_iroh() {
             message: Duration::from_secs(30),
             decision: Duration::from_secs(30),
         },
+        allow_pairing: true,
+        port_mapping: true,
     };
     let network = Network {
         relay: Relay::Disabled,

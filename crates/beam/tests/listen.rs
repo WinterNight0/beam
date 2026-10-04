@@ -202,6 +202,8 @@ fn options(home: &Home, policy: Policy) -> ListenOptions {
             message: Duration::from_secs(10),
             decision: Duration::from_secs(10),
         },
+        allow_pairing: true,
+        port_mapping: true,
     }
 }
 

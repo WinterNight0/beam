@@ -3,6 +3,7 @@
 //! Commands live here rather than in the binary so they can be exercised by
 //! tests with in-memory streams and a temporary home directory; see ADR-0002.
 
+mod agent_cmds;
 pub mod desk;
 mod identity_cmds;
 mod net_cmds;
@@ -218,8 +219,70 @@ enum Command {
         yes: bool,
     },
 
+    /// Run the background agent in this terminal
+    ///
+    /// The agent receives files from paired devices without `beam listen`
+    /// open: it shows a notification, and you accept or decline in
+    /// `beam inbox`. It does not pair. Normally `beam service start` runs it
+    /// in the background; this runs it here, until Ctrl+C.
+    Agent {
+        /// Advertise only 127.0.0.1. Development and tests only.
+        #[arg(long, hide = true)]
+        loopback: bool,
+    },
+
+    /// Accept or decline what paired devices send to the background agent
+    ///
+    /// Shows each request with the same prompt as `beam listen`: who, their
+    /// fingerprint, the file and its size. Requests wait up to five minutes;
+    /// unanswered is declined. Ctrl+C leaves the inbox, not the agent.
+    Inbox,
+
+    /// Control the background agent
+    ///
+    /// enable: start it at every login, and now. disable: stop that, and stop
+    /// it now. start / stop: now only. status: what it is doing. The agent
+    /// runs as you, never as a system service, and does not pair.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
+
+    /// Show or change where received files are saved
+    ///
+    /// Used by the background agent, and by `beam listen` when it is given no
+    /// --out. By default the agent saves to your Downloads folder on Windows,
+    /// and on Linux to the folder `beam service start` was run in.
+    ReceiveDir {
+        /// The folder to save received files in
+        #[arg(value_name = "FOLDER", conflicts_with = "default")]
+        path: Option<PathBuf>,
+        /// Go back to the default
+        #[arg(long)]
+        default: bool,
+    },
+
     /// Show the beam version
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Start the agent at every login, and start it now
+    Enable,
+    /// Stop starting it at login, and stop it now
+    Disable,
+    /// Start the agent now, in the background
+    Start,
+    /// Stop the running agent cleanly
+    Stop,
+    /// Show whether the agent runs, where it saves, and its settings
+    Status,
+    /// Let the agent ask the router to forward its port (asks first; off by default)
+    PortMapping {
+        #[arg(value_enum)]
+        state: agent_cmds::Switch,
+    },
 }
 
 /// The state shared by every command.
@@ -336,6 +399,17 @@ impl App {
                 None => self.send(&peer, &file, chunk_size, loopback, io),
             },
             Command::Transfers { clear, id, yes } => self.transfers(clear, id.as_deref(), yes, io),
+            Command::Agent { loopback } => self.agent(loopback, io),
+            Command::Inbox => self.inbox(io),
+            Command::Service { action } => match action {
+                ServiceCommand::Enable => self.service(agent_cmds::ServiceAction::Enable, io),
+                ServiceCommand::Disable => self.service(agent_cmds::ServiceAction::Disable, io),
+                ServiceCommand::Start => self.service(agent_cmds::ServiceAction::Start, io),
+                ServiceCommand::Stop => self.service(agent_cmds::ServiceAction::Stop, io),
+                ServiceCommand::Status => self.service(agent_cmds::ServiceAction::Status, io),
+                ServiceCommand::PortMapping { state } => self.port_mapping(state, io),
+            },
+            Command::ReceiveDir { path, default } => self.receive_dir(path, default, io),
             Command::Version => stubs::version(io),
         }
     }

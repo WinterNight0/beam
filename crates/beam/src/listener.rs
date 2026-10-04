@@ -67,6 +67,14 @@ pub struct ListenOptions {
     pub pairing: Policy,
     /// Pairing message and decision timeouts.
     pub timeouts: Timeouts,
+    /// Whether this listener pairs at all. The background agent does not: it
+    /// takes transfers from paired devices only, so nobody who finds it can
+    /// try pairing codes (ADR-0042). Off means the pairing protocol is not
+    /// even offered in the handshake.
+    pub allow_pairing: bool,
+    /// Whether iroh may ask the router to forward the port (UPnP, NAT-PMP,
+    /// PCP). `beam listen` does; the agent only if turned on (ADR-0042).
+    pub port_mapping: bool,
 }
 
 /// Something worth telling the person watching `listen`.
@@ -228,14 +236,20 @@ where
     Q: Prompt + Confirm + Clone + Send + Sync + 'static,
     R: Reporter + Send + 'static,
 {
-    let endpoint = endpoint::bind(
+    // Newest transfer protocol first: the TLS server picks the first of these
+    // that the sender offers (ADR-0040).
+    let alpns: &[&[u8]] = if options.allow_pairing {
+        &[PAIR_ALPN, XFER_ALPN_V2, XFER_ALPN]
+    } else {
+        &[XFER_ALPN_V2, XFER_ALPN]
+    };
+    let endpoint = endpoint::bind_with(
         &identity,
         &network.relay,
         network.bind,
         network.port,
-        // Newest transfer protocol first: the TLS server picks the first of
-        // these that the sender offers (ADR-0040).
-        &[PAIR_ALPN, XFER_ALPN_V2, XFER_ALPN],
+        alpns,
+        options.port_mapping,
     )
     .await?;
     let got = endpoint::bound_port(&endpoint).unwrap_or(0);
