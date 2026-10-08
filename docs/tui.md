@@ -96,7 +96,9 @@ agent started in another terminal shows up without a key press.
 | `o` | Receiving on/off: let friends send while beam is open (section 4.2a) |
 | `r` | rename the selected friend |
 | `x`, Delete | remove the selected friend |
-| **Ctrl+C** | **copy** the fingerprint shown (or the invite, or a command's output) |
+| **Ctrl+C** | **copy** the fingerprint shown (or the invite, or a command's output); Ctrl+Insert too |
+| **Ctrl+V**, Shift+Insert | **paste** into the box you are typing in |
+| `m` | mouse clicks on/off; off gives the mouse back to the terminal for selecting text |
 | Esc | close a pop-up; in the Add friend form, give the keys back to the page |
 | **Ctrl+Q** | **leave beam**, from anywhere (`q` too, when not typing) |
 | `?` | the key list |
@@ -108,7 +110,23 @@ a "stop" signal. To leave, press **Ctrl+Q**.
 **The mouse.** Clicks pick tabs, friends, requests, palette lines and
 buttons, and put the cursor where you click in a text box. While beam has the
 mouse, the terminal's own drag-to-select is off; **hold Shift while dragging**
-to select text anyway.
+to select text anyway (Windows Terminal and most others), or press **`m`** to
+give the mouse back to the terminal and `m` again to take it.
+
+**The classic Windows console.** If Windows opens beam in the old *Windows
+Console Host* (a plain black window, not Windows Terminal), beam notices and
+adapts (ADR-0047):
+
+* it **starts with mouse clicks off**, so you can select text with the mouse
+  as usual there (that console has no Shift+drag); the status bar says so,
+  and `m` turns clicks on;
+* **Ctrl+V and Shift+Insert paste**: that console does not paste into
+  full-screen programs by itself, so beam reads the clipboard and pastes it
+  where you are typing;
+* **Ctrl+C copies** as everywhere (through `clip.exe`), and Ctrl+Insert too.
+
+Windows Terminal is still the nicer place to run beam: make it the default in
+Windows Settings → System → For developers → Terminal.
 
 **Text boxes** (palette, rename, invite, name, code, browser filter) take typing,
 ← →, Home/End, Ctrl+← → by word, Backspace, Delete, Ctrl+Backspace or Ctrl+W
@@ -425,9 +443,12 @@ deliberate as typing `y` at the command line.
 * **No "online" status,** by design (section 4.6).
 * **Palette history lasts until you leave beam.**
 * **Mouse capture turns off normal text selection;** Shift+drag still works.
-* **The old Windows console** (`conhost`, not Windows Terminal) may show the
-  colours less faithfully. Copying uses `clip.exe` on Windows, so it works
-  there too.
+* **The classic Windows console** (`conhost`, not Windows Terminal) may show
+  the colours less faithfully, and starts with mouse clicks off (section 3).
+  Copy and paste work there (beam does both itself). It is recognised by the
+  absence of the variables modern terminals set (`WT_SESSION`,
+  `TERM_PROGRAM`, …); a terminal that sets none of them is treated as
+  classic, which only means clicks start off.
 * **On a Linux server with no clipboard tool,** copy falls back to the
   terminal (OSC 52). Most modern terminals honour it, including over SSH;
   some do not.
@@ -493,6 +514,14 @@ next to be checked by hand; its end-to-end path is an automated test):
 
 **Can I get the old behaviour back?** `beam ui cli`. Plain `beam` then prints
 the help, and nothing else changes.
+
+**Ctrl+V does nothing in my console.** Fixed for the classic Windows console:
+beam pastes by itself (Ctrl+V or Shift+Insert) into whatever box you are
+typing in. With no box open there is nothing to paste into, and the status
+bar says so.
+
+**I can't select text with the mouse.** Press `m`: beam lets go of the mouse
+and the terminal's own selection works. Press `m` again for clicks.
 
 **Why doesn't Ctrl+C quit?** In the view it copies, as in editors. Ctrl+Q
 quits. On the command line (`beam send`, `beam listen`), Ctrl+C still stops

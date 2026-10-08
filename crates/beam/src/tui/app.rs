@@ -74,6 +74,9 @@ pub enum Key {
     Quit,
     /// Ctrl+P: open (or close) the command palette, like `:`.
     Palette,
+    /// Ctrl+V or Shift+Insert reached beam: the terminal did not paste by
+    /// itself (the classic Windows console), so beam reads the clipboard.
+    Paste,
     PageUp,
     PageDown,
     Char(char),
@@ -155,6 +158,11 @@ pub enum Effect {
     StopReceiving,
     /// First run: make this device's identity, as `beam init` does.
     CreateIdentity,
+    /// Read the clipboard and paste it where the person is typing.
+    ReadClipboard,
+    /// Take the mouse for clicks, or give it back to the terminal so text
+    /// can be selected.
+    SetMouse(bool),
 }
 
 /// How an [`Effect`] turned out.
@@ -507,6 +515,9 @@ pub struct App {
     pub switch: Switch,
     /// The first-run card's highlighted button: starts on "Create it".
     pub setup_focus: Choice,
+    /// Whether beam has the mouse (clicks) or the terminal does (selecting
+    /// text). Off at the start in the classic Windows console.
+    pub mouse: bool,
     pub quit: bool,
 }
 
@@ -537,6 +548,7 @@ impl App {
             sending: None,
             switch: Switch::Off,
             setup_focus: Choice::Yes,
+            mouse: true,
             quit: false,
         }
     }
@@ -697,6 +709,24 @@ impl App {
             return None;
         }
         self.flash = None;
+        if key == Key::Paste {
+            if self.has_text_box() {
+                return Some(Effect::ReadClipboard);
+            }
+            self.flash = Some("Nothing here to paste into.".to_string());
+            return None;
+        }
+        let typing = self.has_text_box();
+        if key == Key::Char('m') && !typing && self.modal.is_none() {
+            self.mouse = !self.mouse;
+            self.flash = Some(if self.mouse {
+                "Mouse clicks are on. Press m to select text with the mouse instead.".to_string()
+            } else {
+                "Mouse clicks are off: select text with the mouse. Press m to turn them on."
+                    .to_string()
+            });
+            return Some(Effect::SetMouse(self.mouse));
+        }
         if let Some(palette) = self.palette.take() {
             return self.on_palette_key(palette, key);
         }
@@ -734,6 +764,16 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Whether something is being typed into: where a paste goes.
+    pub fn has_text_box(&self) -> bool {
+        self.palette.is_some()
+            || matches!(
+                self.modal,
+                Some(Modal::Rename { .. } | Modal::EnterCode { .. } | Modal::Browse(_))
+            )
+            || (self.modal.is_none() && self.form_has_keys())
     }
 
     pub(super) fn open_palette(&mut self) {
@@ -1875,6 +1915,34 @@ mod tests {
         assert_eq!(app.setup_focus, Choice::No);
         assert_eq!(app.on_key(Key::Enter), None);
         assert!(app.quit);
+    }
+
+    #[test]
+    fn ctrl_v_reads_the_clipboard_only_where_something_is_typed() {
+        let mut app = three();
+        assert_eq!(app.on_key(Key::Paste), None);
+        assert_eq!(app.flash.as_deref(), Some("Nothing here to paste into."));
+        app.on_key(Key::Char(':'));
+        assert_eq!(app.on_key(Key::Paste), Some(Effect::ReadClipboard));
+        app.on_key(Key::Esc);
+        app.on_key(Key::Char('r'));
+        assert_eq!(
+            app.on_key(Key::Paste),
+            Some(Effect::ReadClipboard),
+            "the rename box"
+        );
+    }
+
+    #[test]
+    fn m_gives_the_mouse_to_the_terminal_and_back_but_is_a_letter_when_typing() {
+        let mut app = three();
+        assert_eq!(app.on_key(Key::Char('m')), Some(Effect::SetMouse(false)));
+        assert!(!app.mouse);
+        assert_eq!(app.on_key(Key::Char('m')), Some(Effect::SetMouse(true)));
+
+        app.on_key(Key::Char(':'));
+        assert_eq!(app.on_key(Key::Char('m')), None, "typed into the palette");
+        assert_eq!(app.palette.as_ref().unwrap().input.text(), "m");
     }
 
     #[test]

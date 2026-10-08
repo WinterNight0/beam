@@ -2492,3 +2492,44 @@ been failing after the QoL merge.
 * "Linux" in beam's docs means Arch until other distributions are tested.
 * Supersedes the Ubuntu runner choice in ADR-0014; the rest of ADR-0014
   stands.
+
+## ADR-0047 — The classic Windows console: paste, copy and the mouse
+
+**Status:** accepted (2026-10-08). User-facing: `docs/tui.md` §3.
+
+**Context.** People whose Windows opens console programs in the classic
+*Windows Console Host* (`conhost`) rather than Windows Terminal could not
+paste into the view, nor select text with the mouse. The view relied on the
+terminal for both: Windows Terminal pastes on Ctrl+V and hands beam the text
+in one piece (bracketed paste), and lets Shift+drag select while a program
+has the mouse. `conhost` does neither: Ctrl+V arrives as a key, and with the
+mouse captured its own selection is off.
+
+### Decision
+
+* **beam pastes by itself** on Ctrl+V and Shift+Insert: it reads the clipboard
+  with the OS's own tool (PowerShell `Get-Clipboard` on Windows, about 0.3 s;
+  `wl-paste`, `xclip` or `xsel` on Linux; `pbpaste` on macOS), cuts it to 64
+  KiB, and passes it on as a paste to whatever box is being typed in. No box
+  open: nothing is read, and the status bar says so. Terminals that paste by
+  themselves never send these keys, so nothing changes there.
+* **More copy keys:** Ctrl+Insert and Ctrl+Shift+C copy, as Ctrl+C does.
+* **The mouse can be handed back:** `m` (not while typing) turns mouse
+  capture off and on. In the classic console the view **starts with it off**,
+  so its normal mouse selection works, and says how to turn clicks on. The
+  classic console is recognised on Windows by the absence of the variables
+  modern terminals set (`WT_SESSION`, `TERM_PROGRAM`, `ConEmuANSI`,
+  `ALACRITTY_WINDOW_ID`, `WEZTERM_PANE`); getting it wrong only changes
+  whether clicks start on. A command stepped out to the terminal returns to
+  the same mouse setting.
+* No new dependency; the clipboard text is read as data and only ever goes
+  through the same cleaning as any paste (one line, no control characters).
+
+### Consequences
+
+* Copy and paste work in every terminal beam runs in.
+* Tests: `tui::tests::the_classic_console_keys_paste_and_copy`,
+  `the_classic_console_is_told_apart_from_modern_terminals`,
+  `tui::app::tests::ctrl_v_reads_the_clipboard_only_where_something_is_typed`,
+  `m_gives_the_mouse_to_the_terminal_and_back_but_is_a_letter_when_typing`; the
+  clipboard read was run once on Windows (exit 0, about 0.3 s).

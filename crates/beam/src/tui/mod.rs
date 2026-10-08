@@ -66,8 +66,18 @@ pub fn run(store: &Store) -> io::Result<()> {
         let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         previous(info);
     }));
-    let result = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)
-        .and_then(|()| event_loop(&mut terminal, store));
+    // The classic Windows console cannot select text while beam has the
+    // mouse, and has no Shift+drag: start with clicks off there (ADR-0047).
+    let mouse = !classic_console(|name| std::env::var_os(name).is_some());
+    let result = execute!(io::stdout(), EnableBracketedPaste)
+        .and_then(|()| {
+            if mouse {
+                execute!(io::stdout(), EnableMouseCapture)
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|()| event_loop(&mut terminal, store, mouse));
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
@@ -77,8 +87,35 @@ pub fn run(store: &Store) -> io::Result<()> {
 /// redraw its countdown.
 const PAIRING_TICK: Duration = Duration::from_millis(100);
 
-fn event_loop(terminal: &mut ratatui::DefaultTerminal, store: &Store) -> io::Result<()> {
+/// Whether this is the classic Windows console (`conhost`) rather than
+/// Windows Terminal or another modern terminal, judged by the variables
+/// those set. `is_set` looks a variable up; tests pass their own.
+fn classic_console(is_set: impl Fn(&str) -> bool) -> bool {
+    cfg!(windows)
+        && ![
+            "WT_SESSION",
+            "TERM_PROGRAM",
+            "ConEmuANSI",
+            "ALACRITTY_WINDOW_ID",
+            "WEZTERM_PANE",
+        ]
+        .iter()
+        .any(|name| is_set(name))
+}
+
+fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    store: &Store,
+    mouse: bool,
+) -> io::Result<()> {
     let mut app = App::new(Snapshot::load(store));
+    app.mouse = mouse;
+    if !mouse {
+        app.flash = Some(
+            "Classic console: mouse clicks are off so you can select text. Press m to turn them on."
+                .to_string(),
+        );
+    }
     let mut loaded = Instant::now();
     let mut flash_since: Option<Instant> = None;
     let mut worker: Option<pairing::Worker> = None;
@@ -152,7 +189,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, store: &Store) -> io::Res
                 Effect::Run {
                     args,
                     place: Place::Terminal,
-                } => run_in_terminal(terminal, store, &args)?,
+                } => run_in_terminal(terminal, store, &args, app.mouse)?,
                 Effect::Run { args, .. } => {
                     // Some commands take a few seconds (`service start`
                     // waits for the agent): say so before the screen stops.
@@ -217,6 +254,22 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, store: &Store) -> io::Res
                             Some(sending::Outgoing::start(store.clone(), peer.clone(), path));
                         Done::SendStarted { peer, file }
                     }
+                }
+                Effect::ReadClipboard => match clipboard::paste() {
+                    Some(text) if !text.is_empty() => {
+                        app.on_event(Event::Paste(text));
+                        Done::Nothing
+                    }
+                    Some(_) => Done::Message("The clipboard is empty.".to_string()),
+                    None => Done::Failed("Could not read the clipboard.".to_string()),
+                },
+                Effect::SetMouse(on) => {
+                    if on {
+                        execute!(io::stdout(), EnableMouseCapture)?;
+                    } else {
+                        execute!(io::stdout(), DisableMouseCapture)?;
+                    }
+                    Done::Nothing
                 }
                 Effect::StartReceiving => {
                     if receiver.is_none() {
@@ -322,7 +375,9 @@ fn carry_out(store: &Store, effect: Effect) -> Done {
         | Effect::StartSend { .. }
         | Effect::CancelSend
         | Effect::StartReceiving
-        | Effect::StopReceiving => {
+        | Effect::StopReceiving
+        | Effect::ReadClipboard
+        | Effect::SetMouse(_) => {
             return Done::Nothing;
         }
     };
@@ -500,6 +555,7 @@ fn run_in_terminal(
     terminal: &mut ratatui::DefaultTerminal,
     store: &Store,
     args: &[String],
+    mouse: bool,
 ) -> io::Result<Done> {
     let mut stdout = io::stdout();
     execute!(
@@ -528,12 +584,10 @@ fn run_in_terminal(
     };
 
     enable_raw_mode()?;
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    if mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     terminal.clear()?;
     Ok(match status {
         Ok(status) if status.success() => Done::Message(format!("beam {line}: finished.")),
@@ -611,6 +665,10 @@ fn translate_key(key: KeyEvent) -> Option<Key> {
     if ctrl || alt {
         return match key.code {
             KeyCode::Char('c' | 'C') if ctrl => Some(Key::Copy),
+            // The classic Windows console delivers these as keys; Windows
+            // Terminal pastes by itself and never sends them.
+            KeyCode::Char('v' | 'V') if ctrl => Some(Key::Paste),
+            KeyCode::Insert if ctrl => Some(Key::Copy),
             KeyCode::Char('q' | 'Q') if ctrl => Some(Key::Quit),
             KeyCode::Char('p' | 'P') if ctrl => Some(Key::Palette),
             KeyCode::Char('w' | 'W') if ctrl => Some(Key::DeleteWord),
@@ -619,6 +677,9 @@ fn translate_key(key: KeyEvent) -> Option<Key> {
             KeyCode::Right => Some(Key::WordRight),
             _ => None,
         };
+    }
+    if key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::SHIFT) {
+        return Some(Key::Paste);
     }
     Some(match key.code {
         KeyCode::Up => Key::Up,
@@ -673,6 +734,34 @@ mod tests {
             translate_key(press(KeyCode::Char('C'), KeyModifiers::SHIFT)),
             Some(Key::Char('C'))
         );
+    }
+
+    #[test]
+    fn the_classic_console_keys_paste_and_copy() {
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(
+            translate_key(press(KeyCode::Char('v'), ctrl)),
+            Some(Key::Paste)
+        );
+        assert_eq!(
+            translate_key(press(KeyCode::Insert, KeyModifiers::SHIFT)),
+            Some(Key::Paste)
+        );
+        assert_eq!(translate_key(press(KeyCode::Insert, ctrl)), Some(Key::Copy));
+        assert_eq!(
+            translate_key(press(KeyCode::Char('C'), ctrl | KeyModifiers::SHIFT)),
+            Some(Key::Copy)
+        );
+    }
+
+    #[test]
+    fn the_classic_console_is_told_apart_from_modern_terminals() {
+        let none = |_: &str| false;
+        let windows_terminal = |name: &str| name == "WT_SESSION";
+        let vs_code = |name: &str| name == "TERM_PROGRAM";
+        assert_eq!(classic_console(none), cfg!(windows));
+        assert!(!classic_console(windows_terminal));
+        assert!(!classic_console(vs_code));
     }
 
     #[test]

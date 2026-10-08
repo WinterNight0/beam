@@ -2032,6 +2032,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("r", "rename the selected friend"),
         ("x  Delete", "remove the selected friend"),
         ("Ctrl+C", "copy the fingerprint shown"),
+        ("Ctrl+V  Shift+Ins", "paste into the box you are typing in"),
+        ("m", "mouse clicks on/off (off: select text with the mouse)"),
         ("Shift + drag", "select text with the mouse"),
         ("Esc", "close a pop-up"),
         ("Ctrl+Q  (or q)", "leave beam"),

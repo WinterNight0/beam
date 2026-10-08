@@ -221,6 +221,10 @@ own workspace crates only if compile times demand it.
   "Create it now?", Create it = `beam init`, never replaces); `s` opens a file
   browser (`tui::browse`: places + every drive, natural sort, filter, typed or
   dragged paths, `Fs` injectable for tests).
+- **Post-M6 (ADR-0047)** Classic Windows console (`conhost`): beam pastes by
+  itself on Ctrl+V / Shift+Insert (`clipboard::paste`, PowerShell
+  `Get-Clipboard`), Ctrl+Insert copies, `m` toggles mouse capture; detected by
+  no `WT_SESSION`/`TERM_PROGRAM`/… → starts with clicks off.
 - **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): bandwidth limit, folder transfer. (The TUI and
