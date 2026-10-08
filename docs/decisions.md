@@ -344,7 +344,8 @@ in M2 when incoming file names have to be sanitised.
 
 **Decision.** A GitHub Actions workflow at `.github/workflows/ci.yml` runs
 `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` and
-`cargo test` on both `ubuntu-latest` and `windows-latest`, on every push to the
+`cargo test` on both `ubuntu-latest` and `windows-latest` *(Linux is Arch since
+ADR-0046)*, on every push to the
 default branch and on every pull request. `fail-fast` is off so that a failure
 on one platform does not hide the other platform's result.
 
@@ -2459,3 +2460,35 @@ view itself.
   (sorting, hidden files, filter, enter/up, places, typed paths, unreadable
   folders, fallback start, the real disk), `tui::send` (open, send, Esc and
   reopen where left, places), `tui::view` (the browser drawn).
+
+## ADR-0046 — Arch Linux is the first supported Linux; CI tests it
+
+**Status:** accepted (2026-10-08).
+
+**Context.** CI's Linux job ran on `ubuntu-latest` (ADR-0014). The team
+develops on Arch Linux, so Arch is the Linux beam should support first; other
+distributions can follow once beam is stable. Separately, the Linux job had
+been failing after the QoL merge.
+
+### Decision
+
+* **CI tests Windows and Arch Linux.** GitHub offers no Arch runner, so the
+  Arch job runs in the official `archlinux:base-devel` image on a GitHub
+  Linux machine, installs `git` and `rustup` with `pacman`, and runs the same
+  `fmt`, `clippy -D warnings` and `test` as the Windows job. The image is
+  rolling on purpose: it tests what an up-to-date Arch has.
+* The two platforms are separate jobs; one failing never hides the other.
+* The dependency audit stays on GitHub's standard Linux image: it reads only
+  `Cargo.lock`, so it is not a platform test.
+* Container jobs run as **root**, which ignores file permissions: no test may
+  depend on a permission being enforced (none does; the private-file tests
+  check the mode bits beam sets, which still holds).
+* Fixed while reviewing Linux-only behaviour: the file browser (ADR-0045)
+  treated `D:` as a drive letter on every platform, and its test expected
+  that; drive letters are now Windows-only.
+
+### Consequences
+
+* "Linux" in beam's docs means Arch until other distributions are tested.
+* Supersedes the Ubuntu runner choice in ADR-0014; the rest of ADR-0014
+  stands.

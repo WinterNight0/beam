@@ -125,12 +125,12 @@ impl Browser {
     }
 
     /// What is typed, as a path to go to, when it looks like one: it has a
-    /// slash, or it is a drive (`D:`), or it starts with `~`.
+    /// slash, or it starts with `~`, or (on Windows) it is a drive (`D:`).
     pub fn typed_path(&self) -> Option<PathBuf> {
         let text = super::send::unquote(self.filter.text());
-        let looks = text.contains(['/', '\\'])
-            || text.starts_with('~')
-            || (text.len() == 2 && text.ends_with(':'));
+        // Drive letters are a Windows thing; elsewhere `D:` is a name.
+        let drive = cfg!(windows) && text.len() == 2 && text.ends_with(':');
+        let looks = text.contains(['/', '\\']) || text.starts_with('~') || drive;
         if !looks {
             return None;
         }
@@ -138,7 +138,7 @@ impl Browser {
             Some(rest) => dirs::home_dir()
                 .unwrap_or_default()
                 .join(rest.trim_start_matches(['/', '\\'])),
-            None if text.len() == 2 => PathBuf::from(format!("{text}\\")),
+            None if drive => PathBuf::from(format!("{text}\\")),
             None => PathBuf::from(&text),
         };
         Some(if path.is_absolute() {
@@ -576,7 +576,11 @@ pub(super) mod tests {
         assert_eq!(b.typed_path(), None, "a plain word filters");
         b.filter = Input::new(MAX_LINE);
         b.filter.paste("D:");
-        assert_eq!(b.typed_path(), Some(PathBuf::from("D:\\")));
+        if cfg!(windows) {
+            assert_eq!(b.typed_path(), Some(PathBuf::from("D:\\")));
+        } else {
+            assert_eq!(b.typed_path(), None, "only Windows has drive letters");
+        }
     }
 
     #[test]

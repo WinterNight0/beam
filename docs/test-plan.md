@@ -13,8 +13,9 @@ cargo test --test end_to_end                # two real processes
 ```
 
 `make check` is the gate: a milestone is not done until it passes. CI runs the
-same three commands on `ubuntu-latest` and `windows-latest` for every push and
-pull request (ADR-0014), so the gate is enforced rather than remembered.
+same three commands on Windows (`windows-latest`) and on **Arch Linux** (the
+official `archlinux:base-devel` image) for every push and pull request
+(ADR-0014, ADR-0046), so the gate is enforced rather than remembered.
 
 ## Test levels
 

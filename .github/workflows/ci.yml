@@ -23,17 +23,51 @@ env:
 # be moved to different code, a commit cannot. The comment says which release
 # the hash is. To update, resolve the new tag with `git ls-remote` and replace
 # both.
+#
+# Platforms (ADR-0046): Windows, and Arch Linux as the first Linux. Other
+# distributions are added once beam is stable. Each platform is its own job,
+# and one failing does not cancel the other: several of beam's rules (file
+# permissions, path handling) differ by platform.
 jobs:
-  check:
-    name: check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      # Report every platform's result, not just the first failure: several of
-      # beam's rules (file permissions, path handling) differ by platform.
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  # GitHub has no Arch runner, so this runs in the official Arch image on a
+  # GitHub Linux machine. The image is rolling on purpose: it tests what an
+  # up-to-date Arch has. `base-devel` brings the C compiler `ring` needs.
+  # Jobs in a container run as root, so no test may rely on file permissions
+  # being enforced.
+  arch:
+    name: check (Arch Linux)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install packages
+        run: pacman -Syu --noconfirm --needed git rustup
 
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+  windows:
+    name: check (Windows)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -60,7 +94,8 @@ jobs:
   # Every dependency in Cargo.lock against the RustSec advisory database, on
   # every push, so a newly published vulnerability shows up without anyone
   # remembering to look. Unmaintained-crate notices are reported as warnings;
-  # a vulnerability fails the job. See SECURITY.md.
+  # a vulnerability fails the job. See SECURITY.md. It reads only Cargo.lock,
+  # so it is not a platform test and runs on GitHub's standard Linux image.
   audit:
     name: dependency audit
     runs-on: ubuntu-latest

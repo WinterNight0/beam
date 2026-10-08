@@ -25,6 +25,12 @@ not, how to use it safely and how to report a problem are in
 Requires Rust 1.91 or newer (edition 2024). On Windows you also need the MSVC
 build tools, which `rustup` will point you at.
 
+**Supported platforms:** Windows, and **Arch Linux** as the first Linux; CI
+builds and tests both on every push. Other Linux distributions are expected
+to work but are not tested yet; they will be added once beam is stable
+(ADR-0046). On Arch: `sudo pacman -S --needed base-devel rustup`, then
+`rustup default stable`.
+
 ```
 cargo build --release      # binaries in ./target/release
 cargo run -p beam -- --help

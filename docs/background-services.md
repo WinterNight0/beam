@@ -193,7 +193,7 @@ to the same user.
   itself has no visible window.
 * **Linux was not run on a real Linux machine during development.** The
   Linux code paths (the systemd unit, `systemctl`, SIGTERM handling,
-  `notify-send`) are compiled and unit-tested by CI on Ubuntu, and were
+  `notify-send`) are compiled and unit-tested by CI on Arch Linux, and were
   reviewed. Run section 5 on Linux before relying on it.
 * **Linux without a desktop** (a server): no notifications. The request is in
   `agent.log`, and `beam inbox` shows it. Under `systemd --user`,

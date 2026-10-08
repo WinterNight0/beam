@@ -435,8 +435,8 @@ deliberate as typing `y` at the command line.
   saves that address, so later sends find you through the relay until you
   give them an invite from `beam listen`; nothing breaks, it is only less
   direct at first.
-* **Linux was checked by CI and review,** not run by hand on a Linux desktop,
-  as for the background agent.
+* **Linux was checked by CI (Arch Linux) and review,** not run by hand on a
+  Linux desktop, as for the background agent.
 
 ---
 

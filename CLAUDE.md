@@ -54,6 +54,10 @@ beam history                   # what came and went (ADR-0043)
   `a1ae4ec`.
 - Build: cargo workspace; `make check` = `cargo fmt --check` + `cargo clippy -D warnings`
   + `cargo test`. `unsafe_code = "forbid"` workspace-wide.
+- Platforms (ADR-0046): Windows and **Arch Linux** (the first Linux; others once
+  stable). CI: a Windows job and an Arch job (`archlinux:base-devel` container,
+  runs as root, so no test may rely on permissions being enforced). Keep
+  `cfg(windows)`-only helpers out of Linux builds: CI has `-D warnings`.
 - CLI: `clap` (derive).
 - Full-screen view: `ratatui` 0.30 with its `crossterm` backend (through ratatui's
   re-export), approved for ADR-0043. Plain `beam` on a terminal opens it.
