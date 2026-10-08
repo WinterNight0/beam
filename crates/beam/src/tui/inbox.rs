@@ -276,6 +276,7 @@ pub(super) mod tests {
                 port_mapping: false,
                 notify: false,
                 echo: false,
+                in_view: false,
             };
             let (identity, store) = (home.identity.clone(), home.store.clone());
             tokio::spawn(async move {

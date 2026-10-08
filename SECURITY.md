@@ -76,7 +76,7 @@ across the workspace (`unsafe_code = "forbid"`).
 | `known_peers` | paired devices: names, public keys, saved addresses | Private (0600). The trust root for receiving; anyone who can edit it can add a trusted device. |
 | `listen.json` | while `listen` runs: its invite and the live pairing code | Private (0600). Single-use code, at most ten minutes old (ADR-0037). |
 | `listen.lock` | nothing; held locked while `listen` runs | Not sensitive. |
-| `agent.json` | while the background agent runs: its local port and **the token** that lets `beam inbox` answer requests | **Private** (0600). Believed only while `agent.lock` is held; removed on a clean stop (ADR-0042). |
+| `agent.json` | while the background agent (or the view's Receiving switch, marked `in_view`) runs: its local port and **the token** that lets `beam inbox` answer requests | **Private** (0600). Believed only while `agent.lock` is held; removed on a clean stop (ADR-0042, ADR-0044). |
 | `agent.log` | what the background agent did: requests, answers, results | Names peers and files. |
 | `history.jsonl` | one line per transfer that reached a person: when, which way, the peer's nickname and fingerprint, file name, size, how it ended (ADR-0043) | **Private** (0600): names peers and files. Newest 1000 kept; `beam history --clear` deletes it. A request refused before any prompt (a stranger, a busy listener) is not written, so nobody outside `known_peers` can fill it. |
 | `history.lock` | nothing; held while `history.jsonl` is rewritten | Not sensitive. |

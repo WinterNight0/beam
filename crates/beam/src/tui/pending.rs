@@ -13,8 +13,9 @@
 
 use std::time::Instant;
 
-use super::app::{App, Choice, Effect, Key, Modal, Tab, Target};
+use super::app::{Agent, App, Choice, Effect, Key, Modal, Tab, Target};
 use super::inbox::{InboxUpdate, RequestView};
+use super::receiving::RecvUpdate;
 
 /// A request waiting for an answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +33,41 @@ pub struct Receiving {
     pub relay: bool,
 }
 
+/// Who runs the receiver the Pending tab talks to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Owner {
+    /// The background agent (`beam service start`).
+    #[default]
+    Background,
+    /// This view's Receiving switch.
+    ThisView,
+    /// Another beam view's switch, in another terminal.
+    OtherView,
+}
+
+/// The Receiving switch (ADR-0044).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Switch {
+    #[default]
+    Off,
+    Starting,
+    On,
+    Stopping,
+    /// It stopped by itself, or could not start: why.
+    Failed(String),
+}
+
+/// What turning the switch on would collide with, if anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// The background agent already receives.
+    Agent,
+    /// Another beam view's switch is on.
+    OtherView,
+    /// `beam listen` runs in another terminal.
+    Listen,
+}
+
 /// How the view stands with the agent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Link {
@@ -45,6 +81,93 @@ pub enum Link {
 }
 
 impl App {
+    /// Who else receives for this beam home, which makes the switch moot.
+    pub fn receiving_elsewhere(&self) -> Option<Taken> {
+        let mine = matches!(
+            self.switch,
+            Switch::Starting | Switch::On | Switch::Stopping
+        );
+        match (&self.snapshot.agent, self.snapshot.owner) {
+            (Agent::Running { .. } | Agent::Unreadable, Owner::Background) if !mine => {
+                Some(Taken::Agent)
+            }
+            (Agent::Running { .. }, Owner::OtherView) => Some(Taken::OtherView),
+            _ if self.snapshot.listen_elsewhere => Some(Taken::Listen),
+            _ => None,
+        }
+    }
+
+    /// `o`, or a click on the switch.
+    pub(super) fn toggle_receiving(&mut self) -> Option<Effect> {
+        match self.switch {
+            Switch::On if self.receiving.is_some() => {
+                self.modal = Some(Modal::ConfirmStop { focus: Choice::No });
+                None
+            }
+            Switch::On => {
+                self.switch = Switch::Stopping;
+                Some(Effect::StopReceiving)
+            }
+            Switch::Starting | Switch::Stopping => None,
+            Switch::Off | Switch::Failed(_) => {
+                if let Some(taken) = self.receiving_elsewhere() {
+                    self.flash = Some(
+                        match taken {
+                            Taken::Agent => {
+                                "The background agent already receives for you. \
+                                 `:service stop` first to receive in this view instead."
+                            }
+                            Taken::OtherView => "Another beam window is already receiving.",
+                            Taken::Listen => {
+                                "`beam listen` is receiving in another terminal. \
+                                 Stop it (Ctrl+C) to receive here."
+                            }
+                        }
+                        .to_string(),
+                    );
+                    return None;
+                }
+                self.switch = Switch::Starting;
+                Some(Effect::StartReceiving)
+            }
+        }
+    }
+
+    /// The receiver thread moved on.
+    pub fn on_switch(&mut self, update: RecvUpdate) {
+        match update {
+            RecvUpdate::Started { receive_dir } => {
+                self.switch = Switch::On;
+                self.flash = Some(format!(
+                    "Receiving. Friends can send you files while beam is open; they go to {receive_dir}."
+                ));
+            }
+            RecvUpdate::Stopped(None) => {
+                self.switch = Switch::Off;
+                self.flash = Some("Receiving is off.".to_string());
+            }
+            RecvUpdate::Stopped(Some(why)) => self.switch = Switch::Failed(why),
+        }
+    }
+
+    pub(super) fn on_confirm_stop_key(&mut self, focus: Choice, key: Key) -> Option<Effect> {
+        let focus = match key {
+            Key::Esc => return None,
+            Key::Enter if focus == Choice::Yes => {
+                self.switch = Switch::Stopping;
+                return Some(Effect::StopReceiving);
+            }
+            Key::Enter => return None,
+            Key::Left | Key::Right | Key::Tab | Key::BackTab => match focus {
+                Choice::Yes => Choice::No,
+                Choice::No => Choice::Yes,
+            },
+            _ => focus,
+        };
+        self.modal = Some(Modal::ConfirmStop { focus });
+        None
+    }
+
     /// What the agent said.
     pub fn on_inbox(&mut self, update: InboxUpdate) {
         match update {
@@ -239,6 +362,8 @@ mod tests {
             friends: Vec::new(),
             agent: Agent::Stopped,
             history: Vec::new(),
+            owner: Owner::Background,
+            listen_elsewhere: false,
             problem: None,
         })
     }
@@ -363,6 +488,86 @@ mod tests {
         });
         assert!(app.pending.is_empty());
         assert_eq!(app.link, Link::Lost("stopped".into()));
+    }
+
+    #[test]
+    fn the_switch_turns_on_and_off_and_says_so() {
+        let mut app = app();
+        assert_eq!(app.on_key(Key::Char('o')), Some(Effect::StartReceiving));
+        assert_eq!(app.switch, Switch::Starting);
+        assert_eq!(app.on_key(Key::Char('o')), None, "nothing while starting");
+        app.on_switch(RecvUpdate::Started {
+            receive_dir: "D:/Downloads".into(),
+        });
+        assert_eq!(app.switch, Switch::On);
+        assert!(app.flash.as_deref().unwrap().contains("D:/Downloads"));
+        assert_eq!(app.on_key(Key::Char('o')), Some(Effect::StopReceiving));
+        app.on_switch(RecvUpdate::Stopped(None));
+        assert_eq!(app.switch, Switch::Off);
+    }
+
+    #[test]
+    fn turning_off_mid_transfer_asks_first_and_no_is_the_default() {
+        let mut app = app();
+        app.switch = Switch::On;
+        app.receiving = Some(Receiving {
+            done: 1,
+            total: 2,
+            relay: false,
+        });
+        assert_eq!(app.on_key(Key::Char('o')), None);
+        assert_eq!(app.modal, Some(Modal::ConfirmStop { focus: Choice::No }));
+        assert_eq!(app.on_key(Key::Enter), None, "Enter alone keeps receiving");
+        assert_eq!(app.switch, Switch::On);
+        app.on_key(Key::Char('o'));
+        app.on_key(Key::Left);
+        assert_eq!(app.on_key(Key::Enter), Some(Effect::StopReceiving));
+    }
+
+    #[test]
+    fn the_switch_will_not_fight_the_agent_or_listen() {
+        let mut app = app();
+        app.snapshot.agent = Agent::Running {
+            receive_dir: "x".into(),
+        };
+        assert_eq!(app.on_key(Key::Char('o')), None);
+        assert!(app.flash.as_deref().unwrap().contains("background agent"));
+
+        let mut app = app_fn();
+        app.snapshot.listen_elsewhere = true;
+        assert_eq!(app.on_key(Key::Char('o')), None);
+        assert!(app.flash.as_deref().unwrap().contains("beam listen"));
+    }
+
+    fn app_fn() -> App {
+        app()
+    }
+
+    #[test]
+    fn leaving_while_a_file_arrives_asks_first() {
+        let mut app = app();
+        app.switch = Switch::On;
+        app.receiving = Some(Receiving {
+            done: 1,
+            total: 2,
+            relay: false,
+        });
+        app.on_key(Key::Quit);
+        assert!(!app.quit);
+        assert_eq!(app.modal, Some(Modal::ConfirmQuit { focus: Choice::No }));
+    }
+
+    #[test]
+    fn a_receiver_that_could_not_start_says_why() {
+        let mut app = app();
+        app.on_key(Key::Char('o'));
+        app.on_switch(RecvUpdate::Stopped(Some("port in use".into())));
+        assert_eq!(app.switch, Switch::Failed("port in use".into()));
+        assert_eq!(
+            app.on_key(Key::Char('o')),
+            Some(Effect::StartReceiving),
+            "try again"
+        );
     }
 
     #[test]

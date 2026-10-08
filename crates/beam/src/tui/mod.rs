@@ -28,6 +28,7 @@ pub mod input;
 mod pairing;
 pub mod palette;
 mod pending;
+mod receiving;
 mod send;
 mod sending;
 mod view;
@@ -82,11 +83,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, store: &Store) -> io::Res
     let mut worker: Option<pairing::Worker> = None;
     let mut link: Option<inbox::InboxLink> = None;
     let mut outgoing: Option<sending::Outgoing> = None;
+    let mut receiver: Option<receiving::InView> = None;
     connect_inbox(store, &mut link, &mut app);
     while !app.quit {
         terminal.draw(|frame| view::draw(frame, &mut app))?;
         let mut wait = REFRESH.saturating_sub(loaded.elapsed()).min(FLASH);
-        if worker.is_some() || outgoing.is_some() {
+        if worker.is_some() || outgoing.is_some() || receiver.is_some() {
             wait = wait.min(PAIRING_TICK);
         }
         if let Some(open) = &link {
@@ -100,6 +102,23 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, store: &Store) -> io::Res
             }
         }
         app.prune_pending(Instant::now());
+        if let Some(on) = &receiver {
+            let mut changed = false;
+            let mut stopped = false;
+            while let Ok(update) = on.updates.try_recv() {
+                changed = true;
+                stopped |= matches!(update, receiving::RecvUpdate::Stopped(_));
+                app.on_switch(update);
+            }
+            if stopped {
+                receiver = None;
+            }
+            if changed {
+                app.refresh(Snapshot::load(store));
+                loaded = Instant::now();
+                connect_inbox(store, &mut link, &mut app);
+            }
+        }
         if let Some(running) = &outgoing {
             let mut finished = false;
             while let Ok(update) = running.updates.try_recv() {
@@ -198,6 +217,18 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, store: &Store) -> io::Res
                         Done::SendStarted { peer, file }
                     }
                 }
+                Effect::StartReceiving => {
+                    if receiver.is_none() {
+                        receiver = Some(receiving::InView::start(store.clone()));
+                    }
+                    Done::Nothing
+                }
+                Effect::StopReceiving => {
+                    if let Some(on) = &mut receiver {
+                        on.stop();
+                    }
+                    Done::Nothing
+                }
                 Effect::CancelSend => {
                     if let Some(running) = &mut outgoing {
                         running.cancel();
@@ -232,6 +263,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, store: &Store) -> io::Res
     // Leaving mid-send (after saying yes to that): tell the receiver.
     if let Some(running) = outgoing {
         running.cancel_and_wait(Duration::from_secs(3));
+    }
+    // The switch never outlives the view: stop, telling any sender.
+    if let Some(on) = receiver {
+        on.stop_and_wait(Duration::from_secs(5));
     }
     Ok(())
 }
@@ -283,7 +318,9 @@ fn carry_out(store: &Store, effect: Effect) -> Done {
         | Effect::CancelPair
         | Effect::AnswerTransfer { .. }
         | Effect::StartSend { .. }
-        | Effect::CancelSend => {
+        | Effect::CancelSend
+        | Effect::StartReceiving
+        | Effect::StopReceiving => {
             return Done::Nothing;
         }
     };

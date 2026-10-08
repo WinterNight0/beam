@@ -80,6 +80,7 @@ impl App {
             port_mapping: config.agent_port_mapping,
             notify: true,
             echo: true,
+            in_view: false,
         };
         let _ = io;
         let runtime = self.runtime()?;
@@ -302,11 +303,15 @@ impl App {
         let config = self.config()?;
         match status::read(&self.store) {
             Running::Yes(status) => {
-                ui::field(
-                    io.out,
-                    "Agent",
-                    &format!("running (process {})", status.pid),
-                )?;
+                let what = if status.in_view {
+                    format!(
+                        "receiving in beam's full-screen view (process {}); it stops when that                          view closes or its Receiving switch is turned off",
+                        status.pid
+                    )
+                } else {
+                    format!("running (process {})", status.pid)
+                };
+                ui::field(io.out, "Agent", &what)?;
                 ui::field(io.out, "Saving to", &untrusted::name(&status.receive_dir))?;
                 ui::field(
                     io.out,

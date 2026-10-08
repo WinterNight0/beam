@@ -206,6 +206,11 @@ own workspace crates only if compile times demand it.
   last seen = newest answered line), 7 send (`tui::sending` = `beam send` on a
   thread, shared messages/history; one at a time; hide/cancel; quit asks),
   8 docs (`docs/tui.md`) (done). No online dots.
+- **Post-M6 (ADR-0044)** Receiving switch at the top of the view's Pending tab
+  (`o` or click; amber OFF / green ON): runs `agent::run` inside the view
+  (`tui::receiving`, `in_view` in `agent.json`): pairing off, 5 min, agent port
+  mapping, notifications; agent lock so listen/agent refuse; off at every start,
+  stops with the view; asks before stopping a transfer.
 - **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.

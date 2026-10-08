@@ -95,6 +95,10 @@ pub struct AgentOptions {
     pub notify: bool,
     /// Also print what happens to stdout, for `beam agent` run in a terminal.
     pub echo: bool,
+    /// Run by the full-screen view's Receiving switch rather than as the
+    /// background agent: same rules, but it lives only while the view is
+    /// open (ADR-0044).
+    pub in_view: bool,
 }
 
 /// Why the agent could not run.
@@ -330,6 +334,7 @@ pub async fn run(
         port_mapping: options.port_mapping,
         started: crate::listen_status::unix(SystemTime::now()),
         invite: None,
+        in_view: options.in_view,
     };
     let state = Arc::new(State {
         store: store.clone(),

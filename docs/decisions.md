@@ -2364,3 +2364,53 @@ Full description, security analysis (V-1..V-12) and limits: `docs/tui.md`.
   (friends page, narrow terminal, no identity, pending, help, tiny terminal),
   `tui` (key translation), `config` (`ui`), `tests/cli.rs` (`beam ui`, and
   arguments never open the view).
+
+## ADR-0044 — The Receiving switch: listen inside the full-screen view
+
+**Status:** accepted (post-M6, branch `main-QoL`). User-facing description and
+security rows V-13..V-15: `docs/tui.md` §4.2a and §6.
+
+**Context.** Testing the view showed a gap: to receive at all, a person had
+to start the background agent or run `beam listen` in a second terminal.
+Someone who does not want an always-on agent had no way to receive from the
+view itself.
+
+**Decisions taken with the team (2026-10-08), all as recommended:**
+- pairing stays off while receiving this way (pairing is Add friend's job);
+- a request waits five minutes, as at the agent (requests never pop up by
+  themselves, so noticing one can take a moment);
+- router port mapping follows the agent's setting (off unless
+  `beam service port-mapping on`);
+- a desktop notification per request;
+- the switch is off at every start and never remembered.
+
+### Decision
+
+* **A switch at the top of the Pending tab**, above a rule: amber `○ OFF`
+  while nothing receives, green `● ON` while this view does. `o` (any tab) or
+  a click toggles it; the header's "○ not receiving" leads to it. When the
+  agent, another view or `beam listen` already receives, the strip says
+  which, and there is nothing to toggle.
+* **It runs `agent::run` inside the view's process** (`tui::receiving`) with
+  a new `in_view` option. That brings every agent rule unchanged (all four
+  choices above are the agent's own), its lock (so `listen`, a second agent
+  and a second switch refuse), and its token-protected local link, which the
+  Pending tab already uses. `agent.json` records `in_view`, so `beam service
+  status` and `beam whoami` say the view is receiving, until it closes.
+* **It never outlives the view.** Turning it off or leaving beam stops it the
+  `listen` way (ADR-0041): a sender mid-transfer is told, and the partial is
+  kept. Doing either while a file is arriving asks first, starting on Keep;
+  on leaving, the view waits up to 5 s for the stop.
+* Rejected: starting the background agent from the switch (the person asked
+  for something that does not stay running), and a third, separate listener
+  in the view (it would duplicate the agent's prompt, link and rules).
+
+### Consequences
+
+* Receiving without a second terminal or an always-on agent.
+* While on, the device is reachable as with the agent (R-9), but only while
+  beam is open and only after a deliberate switch.
+* Tests: `tui::receiving` (starts, shuts out a second receiver and `listen`,
+  stops cleanly; a friend sends and the view accepts end to end),
+  `tui::pending` (toggle, confirmations, refusing to fight the agent or
+  `listen`), `tui::view` (the strip, its states, the header badge).

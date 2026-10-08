@@ -35,6 +35,10 @@ pub struct AgentStatus {
     /// is listening. Paired peers already know where to find it.
     #[serde(default)]
     pub invite: Option<String>,
+    /// Started by the full-screen view's Receiving switch; it stops when the
+    /// view closes (ADR-0044).
+    #[serde(default)]
+    pub in_view: bool,
 }
 
 /// What a look at the agent finds.
@@ -134,6 +138,7 @@ mod tests {
             port_mapping: false,
             started: 1,
             invite: None,
+            in_view: false,
         }
     }
 

@@ -146,10 +146,15 @@ impl App {
         writeln!(io.out)?;
         show_listening(io, &listening)?;
         if let crate::agent::status::Running::Yes(status) = agent {
+            let who = if status.in_view {
+                "beam's full-screen view is receiving (until it closes)"
+            } else {
+                "The background agent is running"
+            };
             writeln!(
                 io.out,
-                "The background agent is running: paired devices can send files, which you \
-                 answer with `beam inbox`.\nIt saves them to {}.",
+                "{who}: paired devices can send files, which you answer in the view's Pending \
+                 tab or with `beam inbox`.\nIt saves them to {}.",
                 crate::untrusted::name(&status.receive_dir)
             )?;
         }

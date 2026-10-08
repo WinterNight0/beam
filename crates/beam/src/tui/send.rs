@@ -306,7 +306,8 @@ impl App {
     /// Ctrl+Q, `q` or `:quit`: leaves, unless a file is still going out,
     /// which asks first.
     pub(super) fn request_quit(&mut self) {
-        if self.sending.as_ref().is_some_and(Sending::running) {
+        let arriving = self.switch == super::pending::Switch::On && self.receiving.is_some();
+        if self.sending.as_ref().is_some_and(Sending::running) || arriving {
             self.palette = None;
             self.modal = Some(Modal::ConfirmQuit { focus: Choice::No });
         } else {
@@ -348,6 +349,7 @@ pub fn unquote(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::tui::app::{Agent, Event, Friend, Snapshot};
+    use crate::tui::pending::Owner;
 
     fn app() -> App {
         let mut app = App::new(Snapshot {
@@ -361,6 +363,8 @@ mod tests {
             }],
             agent: Agent::Stopped,
             history: Vec::new(),
+            owner: Owner::Background,
+            listen_elsewhere: false,
             problem: None,
         });
         app.paths = |partial, _| {

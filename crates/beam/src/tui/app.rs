@@ -13,7 +13,7 @@ use super::add::{self, AddForm, Field};
 use super::inbox::RequestView;
 use super::input::{Edit, Input};
 use super::palette::{self, Palette, Place, Suggestion};
-use super::pending::{Link, Pending, Receiving};
+use super::pending::{Link, Owner, Pending, Receiving, Switch};
 use super::send::Sending;
 use crate::agent::status::Running;
 use crate::identity::{MAX_NAME_LEN, Store, StoreError};
@@ -148,6 +148,10 @@ pub enum Effect {
     },
     /// Stop the send in progress; the receiver is told (ADR-0041).
     CancelSend,
+    /// Turn the Receiving switch on: listen inside the view (ADR-0044).
+    StartReceiving,
+    /// Turn it off; a sender mid-transfer is told (ADR-0041).
+    StopReceiving,
 }
 
 /// How an [`Effect`] turned out.
@@ -221,6 +225,10 @@ pub struct Snapshot {
     pub agent: Agent,
     /// What came and went, oldest first, its strings cleaned for drawing.
     pub history: Vec<crate::history::Entry>,
+    /// Who runs the agent's receiver, when one runs.
+    pub owner: Owner,
+    /// Whether `beam listen` runs in this beam home.
+    pub listen_elsewhere: bool,
     /// Why something could not be read, shown in the status line.
     pub problem: Option<String>,
 }
@@ -282,18 +290,34 @@ impl Snapshot {
                 Vec::new()
             }
         };
+        let mut owner = Owner::Background;
         let agent = match crate::agent::status::read(store) {
-            Running::Yes(status) => Agent::Running {
-                receive_dir: untrusted::name(&status.receive_dir),
-            },
+            Running::Yes(status) => {
+                if status.in_view {
+                    owner = if status.pid == std::process::id() {
+                        Owner::ThisView
+                    } else {
+                        Owner::OtherView
+                    };
+                }
+                Agent::Running {
+                    receive_dir: untrusted::name(&status.receive_dir),
+                }
+            }
             Running::Unreadable => Agent::Unreadable,
             Running::No => Agent::Stopped,
         };
+        let listen_elsewhere = !matches!(
+            crate::listen_status::read(store),
+            crate::listen_status::Listening::No
+        );
         Self {
             me,
             friends,
             agent,
             history,
+            owner,
+            listen_elsewhere,
             problem,
         }
     }
@@ -363,8 +387,12 @@ pub enum Modal {
     },
     /// How the send in [`App::sending`] is going.
     SendStatus,
-    /// A file is still going out: leave anyway? Starts on `No`.
+    /// A file is still going out or coming in: leave anyway? Starts on `No`.
     ConfirmQuit {
+        focus: Choice,
+    },
+    /// A file is arriving: turn Receiving off anyway? Starts on `No`.
+    ConfirmStop {
         focus: Choice,
     },
     /// May this friend send this file? Starts on `No` (Decline).
@@ -402,6 +430,8 @@ pub enum Target {
     Field(Field),
     /// A waiting request in the Pending tab, by index.
     Request(usize),
+    /// The Receiving switch at the top of Pending.
+    ReceiveSwitch,
 }
 
 /// Where the clickable things are on screen, as of the last frame.
@@ -461,6 +491,8 @@ pub struct App {
     pub link: Link,
     /// The file going out now, or the one that just ended.
     pub sending: Option<Sending>,
+    /// The Receiving switch (ADR-0044).
+    pub switch: Switch,
     pub quit: bool,
 }
 
@@ -487,6 +519,7 @@ impl App {
             receiving: None,
             link: Link::Off,
             sending: None,
+            switch: Switch::Off,
             quit: false,
         }
     }
@@ -649,6 +682,7 @@ impl App {
                 self.on_confirm_quit_key(focus, key);
                 None
             }
+            Some(Modal::ConfirmStop { focus }) => self.on_confirm_stop_key(focus, key),
             Some(modal) if add::is_pairing(&modal) => self.on_pair_modal_key(modal, key),
             Some(modal) => self.on_modal_key(modal, key),
             None if self.form_has_keys() => self.on_form_key(key),
@@ -796,6 +830,7 @@ impl App {
         match key {
             Key::Char('q') => self.request_quit(),
             Key::Char('s') if self.tab == Tab::Friends => self.open_send(),
+            Key::Char('o') => return self.toggle_receiving(),
             Key::Char('?') => self.modal = Some(Modal::Help),
             Key::Char(':') | Key::Palette => self.open_palette(),
             Key::Copy => return self.copy(),
@@ -1046,6 +1081,12 @@ impl App {
                     (None, Some((area, Target::Field(field)))) => {
                         return self.click_field(field, column.saturating_sub(area.x), area.width);
                     }
+                    (None, Some((_, Target::ReceiveSwitch))) => return self.toggle_receiving(),
+                    (Some(Modal::ConfirmStop { .. }), Some((_, Target::Button(answer)))) => {
+                        if answer == Choice::Yes {
+                            return Some(Effect::StopReceiving);
+                        }
+                    }
                     (None, Some((_, Target::Request(index)))) => {
                         self.pending_selected = index;
                         self.open_accept(index);
@@ -1145,6 +1186,8 @@ mod tests {
             friends,
             agent: Agent::Stopped,
             history: Vec::new(),
+            owner: Owner::Background,
+            listen_elsewhere: false,
             problem: None,
         }
     }

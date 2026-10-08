@@ -160,11 +160,38 @@ Accepting takes a deliberate ← then Enter, or a click on **Accept**. **Esc**
 means "later": the request keeps waiting, and if nobody answers it expires as
 a no. A resumed transfer shows what is already here, and needs a yes again.
 
-Requests reach the view through the **background agent**
-([background-services.md](background-services.md)). If it is not running,
-Pending says so and how to start it (`:service start`). Once it runs, the
-view connects by itself within about two seconds. If you run `beam listen`
-instead, its requests are answered in that terminal, not in the view.
+### 4.2a Receiving: the switch at the top of Pending
+
+Nobody can send you a file unless something on your device is receiving.
+The top of the Pending tab is a switch for that:
+
+```
+╭ Pending ─────────────────────────────────────────────────────────────╮
+│  RECEIVING   ○  OFF   Turn on so friends can send you files          │
+│              press o, or click · pairing stays in Add friend         │
+│ ──────────────────────────────────────────────────────────────────── │
+│ Nothing can arrive while Receiving is off.                           │
+```
+
+* **`o`** (from any tab) or a click turns it on. While it is **off**, it is
+  drawn in amber so it is noticed; the header's **○ not receiving** is
+  clickable and leads here.
+* **On** (green): friends can send you files **while beam is open**. Requests
+  come into this tab and the same Accept pop-up, files go to your receive
+  folder (`beam receive-dir`), and a desktop notification says when a request
+  arrives, in case beam is behind another window.
+* It **stops when you turn it off or leave beam**, and it is off every time
+  beam starts: your device is never reachable without you choosing it that
+  day. Turning it off, or leaving, while a file is arriving asks first
+  (starting on Keep); the sender is told and keeps what arrived (ADR-0041).
+* **Pairing stays in Add friend**: the switch does not show a pairing code.
+* If the **background agent** already receives (`beam service enable`), the
+  strip says so and there is nothing to switch; it keeps receiving when beam
+  is closed. If `beam listen` runs in another terminal, the strip says that
+  too, and its requests are answered there.
+
+Under the hood the switch runs the background agent's receiver inside the
+view for as long as it is on, with the same rules (section 6, ADR-0044).
 
 ### 4.3 Pairing with someone new
 
@@ -252,7 +279,8 @@ crates/beam/src/tui/
   palette.rs    splitting, checking, listing and placing palette commands
   add.rs        the Add friend form and the pairing pop-ups
   pairing.rs    pairing::join / wait on a background thread
-  pending.rs    the Pending tab and the Accept pop-up
+  pending.rs    the Pending tab, the Accept pop-up and the Receiving switch
+  receiving.rs  the agent's receiver, run while the switch is on
   inbox.rs      the link to the background agent, as `beam inbox` has it
   send.rs       the file box and the send pop-up
   sending.rs    `beam send` on a background thread
@@ -334,6 +362,9 @@ deliberate as typing `y` at the command line.
 | V-10 | **The history file as a leak or a target:** it names files and peers, and a stranger could try to fill it. | Private (owner-only). Not written for anything refused before a prompt. Newest 1000 only. Cleaned before it is shown. `beam history --clear` deletes it. | `history::tests::*`, `send_to_a_peer_that_is_not_listening_says_how_to_re_pair` (`tests/cli.rs`) |
 | V-11 | **Copying through a command line** where other programs could see it. | The text goes to the OS clipboard tool on its **standard input**, never as an argument. `clip.exe` gets UTF-16 so nothing is garbled. Only an explicit Ctrl+C copies. | `clip_exe_gets_utf16_with_a_byte_order_mark` |
 | V-12 | **A broken terminal** after a crash: raw mode, mouse codes on screen. | A panic hook turns mouse capture and paste mode off, then ratatui's restores the screen. | by construction (`tui::run`) |
+| V-13 | **The Receiving switch makes the device reachable** without the person realising, or longer than meant. | Off at every start, never remembered; on only by `o` or a click; drawn in amber while off and green while on; stops when beam closes. It runs the agent's receiver: pairing off, router port mapping only if turned on for the agent, five-minute answer window, Accept starting on Decline (ADR-0044). | `the_switch_turns_on_and_off_and_says_so`, `with_the_switch_on_a_friend_sends_and_the_view_accepts` |
+| V-14 | **Two receivers on one identity** (the switch, the agent, `beam listen`) splitting requests between them. | The switch takes the agent's lock: a second switch or agent is refused, and `beam listen` refuses while it is on; the switch will not start beside either. | `the_switch_starts_a_receiver_that_shuts_out_listen_and_stops_cleanly`, `it_will_not_start_beside_a_running_listen`, `the_switch_will_not_fight_the_agent_or_listen` |
+| V-15 | **Losing a file by switching off** mid-transfer. | Turning off or leaving while one arrives asks first, starting on Keep; the sender is told, and the partial is kept for a resume. | `turning_off_mid_transfer_asks_first_and_no_is_the_default`, `leaving_while_a_file_arrives_asks_first` |
 
 ### What remains (accepted risks)
 
@@ -350,8 +381,9 @@ deliberate as typing `y` at the command line.
 ## 7. Limitations
 
 * **One file at a time, and no folders.** Zip a folder first.
-* **Requests arrive in the view only through the background agent.** With
-  `beam listen` running instead, answer in that terminal.
+* **The Receiving switch lasts only while beam is open.** To receive when it
+  is closed, use the background agent (`beam service enable`). With
+  `beam listen` running instead, its requests are answered in that terminal.
 * **No "online" status,** by design (section 4.6).
 * **Palette history lasts until you leave beam.**
 * **Mouse capture turns off normal text selection;** Shift+drag still works.
@@ -398,9 +430,9 @@ Run them with `cargo test`, or one area with `cargo test -p beam --lib tui`.
 
 ### Manual (two terminals, throwaway beam homes)
 
-On Windows 11 with Windows Terminal. Steps 1–6 were each checked by the team
-in a real terminal before the next was built; step 7 is still to be run by
-hand (its logic and three real sends are covered by the automated tests):
+On Windows 11 with Windows Terminal. Each step was checked by the team in a
+real terminal before the next was built (step 8, the Receiving switch, is
+next to be checked by hand; its end-to-end path is an automated test):
 
 1. `beam` opens the view; `beam | more` prints help; `beam ui cli` / `tui`.
 2. Mouse, Ctrl+C copy (paste it elsewhere), Ctrl+Q, rename, remove.
@@ -412,6 +444,10 @@ hand (its logic and three real sends are covered by the automated tests):
    appears, is answered from Pending, and progress shows.
 6. History and last seen after those transfers; `:history`.
 7. `s`, drag a file in, Hide and `s` again, Cancel send, quit mid-send.
+8. Receiving: with no agent, press `o` in one home (amber OFF turns green ON),
+   send from the other, answer in Pending; `o` mid-transfer asks first;
+   Ctrl+Q while on stops it (`beam service status` says not running);
+   `beam listen` in a third terminal refuses while it is on.
 
 ---
 

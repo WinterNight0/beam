@@ -20,11 +20,13 @@ use super::app::{Agent, App, Areas, Choice, Friend, Modal, Tab, Target};
 use super::inbox::RequestView;
 use super::input::Input;
 use super::palette::{Place, Suggestion};
-use super::pending::Link;
+use super::pending::{Link, Switch, Taken};
 use super::send::{FILE_ROWS, Sending, Stage};
 
 /// Discord's blurple, for the selection and the active tab.
 const ACCENT: Color = Color::Rgb(88, 101, 242);
+/// Amber, for the Receiving switch while it is off: it should be noticed.
+const NOTICE: Color = Color::Rgb(240, 178, 50);
 /// Discord's "online" green.
 const GOOD: Color = Color::Rgb(35, 165, 90);
 const DANGER: Color = Color::Rgb(237, 66, 69);
@@ -153,10 +155,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let peer = app
                 .sending
                 .as_ref()
-                .map(|s| s.peer.clone())
-                .unwrap_or_default();
-            draw_confirm_quit(frame, area, &mut app.areas, &peer, focus);
+                .filter(|s| s.running())
+                .map(|s| s.peer.clone());
+            draw_confirm_quit(frame, area, &mut app.areas, peer.as_deref(), focus);
         }
+        Some(Modal::ConfirmStop { focus }) => draw_confirm_stop(frame, area, &mut app.areas, focus),
         Some(Modal::RelayChange {
             name,
             fingerprint,
@@ -368,7 +371,7 @@ fn draw_output(
     scroll
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut left = vec![Span::styled(
         " ◆ beam ",
         Style::new().bg(ACCENT).fg(Color::White).bold(),
@@ -421,6 +424,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ));
         right.push(Span::raw(" "));
     }
+    let badge_width = agent.width() as u16;
     right.push(agent);
     let right = Line::from(right);
     let right_width = right.width() as u16;
@@ -428,6 +432,13 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).areas(area);
     frame.render_widget(Line::from(left), l);
     frame.render_widget(right, r);
+    // "○ not receiving" leads to the switch.
+    let badge = Rect {
+        x: r.right().saturating_sub(badge_width),
+        width: badge_width.min(r.width),
+        ..r
+    };
+    app.areas.add(badge, Target::Tab(Tab::Pending));
 }
 
 /// Tabs as chips, each recorded so a click can pick it.
@@ -739,19 +750,32 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Not reachable: say why, and how to start receiving.
+    // The Receiving switch, and under it a line, before anything else.
+    let [strip, rule, inner] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    draw_switch(frame, strip, app);
+    frame.render_widget(Line::from("─".repeat(rule.width as usize).fg(BORDER)), rule);
+
+    let receiving_here = matches!(app.switch, Switch::On);
     let notice: Option<Vec<Line>> = match (&app.snapshot.agent, &app.link) {
+        _ if app.snapshot.listen_elsewhere && !receiving_here => Some(vec![Line::from(
+            "Requests to `beam listen` are answered in its own terminal.".fg(MUTED),
+        )]),
         (Agent::Stopped, _) => Some(vec![
-            Line::from("Nobody can send you files right now.".bold()),
+            Line::from("Nothing can arrive while Receiving is off.".bold()),
             Line::from(""),
             Line::from(vec![
-                Span::raw("Start the background agent: "),
-                Span::styled(":service start", Style::new().fg(ACCENT)),
-                Span::raw(" (or "),
+                Span::styled(
+                    "To receive even when beam is closed: ",
+                    Style::new().fg(MUTED),
+                ),
                 Span::styled(":service enable", Style::new().fg(ACCENT)),
-                Span::raw(" to start it at every login)."),
+                Span::styled(" (the background agent).", Style::new().fg(MUTED)),
             ]),
-            Line::from("Requests then appear here, and you answer them in this view.".fg(MUTED)),
         ]),
         (Agent::Unreadable, _) => Some(vec![
             Line::from("The background agent is running, but its status could not be read."),
@@ -763,13 +787,13 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
             ]),
         ]),
         (Agent::Running { .. }, Link::Lost(reason)) => Some(vec![
-            Line::from("Not connected to the background agent.".bold()),
+            Line::from("Not connected to the receiver.".bold()),
             Line::from(reason.clone().fg(MUTED)),
             Line::from("Trying again…".fg(MUTED)),
         ]),
-        (Agent::Running { .. }, Link::Off | Link::Connecting) => Some(vec![Line::from(
-            "Connecting to the background agent…".fg(MUTED),
-        )]),
+        (Agent::Running { .. }, Link::Off | Link::Connecting) => {
+            Some(vec![Line::from("Connecting…".fg(MUTED))])
+        }
         (Agent::Running { .. }, Link::Connected) => None,
     };
     if let Some(lines) = notice {
@@ -1098,10 +1122,149 @@ fn draw_one_choice(frame: &mut Frame, area: Rect, areas: &mut Areas, label: &str
 }
 
 /// Leaving beam mid-send. Starts on Stay.
-fn draw_confirm_quit(frame: &mut Frame, area: Rect, areas: &mut Areas, peer: &str, focus: Choice) {
-    let popup = centered(area, 60, 8);
+/// `peer` is who a file is going to; `None` means one is coming in.
+fn draw_confirm_quit(
+    frame: &mut Frame,
+    area: Rect,
+    areas: &mut Areas,
+    peer: Option<&str>,
+    focus: Choice,
+) {
+    let popup = centered(area, 62, 8);
     frame.render_widget(Clear, popup);
-    let block = popup_block(" A file is still going out ");
+    let (title, first, second) = match peer {
+        Some(peer) => (
+            " A file is still going out ",
+            format!("Leaving beam cancels the send to {peer}."),
+            format!("{peer} is told, and keeps what arrived: sending again resumes."),
+        ),
+        None => (
+            " A file is arriving ",
+            "Leaving beam stops Receiving and cancels it.".to_string(),
+            "The sender is told, and what arrived is kept: sending again resumes.".to_string(),
+        ),
+    };
+    let block = popup_block(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [text, _, buttons] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(first), Line::from(second.fg(MUTED))])
+            .wrap(Wrap { trim: true }),
+        text,
+    );
+    draw_buttons(frame, buttons, areas, ("Leave", "Stay"), focus, true);
+}
+
+/// The Receiving switch at the top of Pending (ADR-0044). Bright while off,
+/// so it is noticed; it names whoever else receives when it is moot.
+fn draw_switch(frame: &mut Frame, area: Rect, app: &mut App) {
+    let chip = |text: &str, bg: Color, fg: Color| {
+        Span::styled(text.to_string(), Style::new().bg(bg).fg(fg).bold())
+    };
+    let elsewhere = app.receiving_elsewhere();
+    let (switch, title_colour, line, hint): (Span, Color, String, String) = match (
+        &app.switch,
+        elsewhere,
+    ) {
+        (Switch::Starting, _) => (
+            chip(" ◌  STARTING ", SELECTED, Color::White),
+            MUTED,
+            "Starting to receive…".to_string(),
+            String::new(),
+        ),
+        (Switch::Stopping, _) => (
+            chip(" ◌  STOPPING ", SELECTED, Color::White),
+            MUTED,
+            "Stopping…".to_string(),
+            String::new(),
+        ),
+        (Switch::On, _) => (
+            chip(" ●  ON ", GOOD, Color::White),
+            GOOD,
+            match &app.snapshot.agent {
+                Agent::Running { receive_dir } => {
+                    format!(
+                        "Friends can send you files while beam is open · saving to {receive_dir}"
+                    )
+                }
+                _ => "Friends can send you files while beam is open".to_string(),
+            },
+            "o or click to turn off · it stops when you leave beam".to_string(),
+        ),
+        (_, Some(Taken::Agent)) => (
+            chip(" ●  AGENT ", GOOD, Color::White),
+            GOOD,
+            "Receiving through the background agent, even when beam is closed".to_string(),
+            ":service stop stops it".to_string(),
+        ),
+        (_, Some(Taken::OtherView)) => (
+            chip(" ●  ELSEWHERE ", GOOD, Color::White),
+            GOOD,
+            "Another beam window is receiving for you".to_string(),
+            String::new(),
+        ),
+        (_, Some(Taken::Listen)) => (
+            chip(" ●  LISTEN ", GOOD, Color::White),
+            GOOD,
+            "`beam listen` is receiving in another terminal".to_string(),
+            String::new(),
+        ),
+        (Switch::Failed(why), None) => (
+            chip(" ○  OFF ", NOTICE, Color::Black),
+            NOTICE,
+            format!("Could not start receiving: {why}"),
+            "o or click to try again".to_string(),
+        ),
+        (Switch::Off, None) => (
+            chip(" ○  OFF ", NOTICE, Color::Black),
+            NOTICE,
+            "Turn on so friends can send you files".to_string(),
+            "press o, or click · pairing stays in Add friend".to_string(),
+        ),
+    };
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let title = Span::styled(" RECEIVING  ", Style::new().fg(title_colour).bold());
+    let switch_x = top.x + title.width() as u16;
+    let switch_width = switch.width() as u16;
+    frame.render_widget(
+        Line::from(vec![title, switch, Span::raw("  "), Span::raw(line)]),
+        top,
+    );
+    if !hint.is_empty() {
+        frame.render_widget(
+            Line::from(vec![
+                Span::raw(" ".repeat(13)),
+                Span::styled(hint, Style::new().fg(MUTED)),
+            ]),
+            bottom,
+        );
+    }
+    let clickable = elsewhere.is_none() || matches!(app.switch, Switch::On);
+    if clickable {
+        app.areas.add(
+            Rect::new(
+                switch_x,
+                top.y,
+                switch_width.min(top.right().saturating_sub(switch_x)),
+                1,
+            ),
+            Target::ReceiveSwitch,
+        );
+    }
+}
+
+/// A file is arriving: turn Receiving off anyway? Starts on Keep.
+fn draw_confirm_stop(frame: &mut Frame, area: Rect, areas: &mut Areas, focus: Choice) {
+    let popup = centered(area, 62, 8);
+    frame.render_widget(Clear, popup);
+    let block = popup_block(" A file is arriving ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [text, _, buttons] = Layout::vertical([
@@ -1112,15 +1275,22 @@ fn draw_confirm_quit(frame: &mut Frame, area: Rect, areas: &mut Areas, peer: &st
     .areas(inner);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!("Leaving beam cancels the send to {peer}.")),
+            Line::from("Turning Receiving off cancels it."),
             Line::from(
-                format!("{peer} is told, and keeps what arrived: sending again resumes.").fg(MUTED),
+                "The sender is told, and what arrived is kept: sending again resumes.".fg(MUTED),
             ),
         ])
         .wrap(Wrap { trim: true }),
         text,
     );
-    draw_buttons(frame, buttons, areas, ("Leave", "Stay"), focus, true);
+    draw_buttons(
+        frame,
+        buttons,
+        areas,
+        ("Turn off", "Keep receiving"),
+        focus,
+        true,
+    );
 }
 
 /// May this friend send this file? The same facts as `beam listen` (S-6).
@@ -1616,7 +1786,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Esc", "cancel"),
         ],
         (Some(Modal::SendStatus), _) => &[("Esc", "hide"), ("x", "cancel the send")],
-        (Some(Modal::ConfirmQuit { .. }), _) => &[("←→", "choose"), ("Enter", "confirm")],
+        (Some(Modal::ConfirmQuit { .. } | Modal::ConfirmStop { .. }), _) => {
+            &[("←→", "choose"), ("Enter", "confirm")]
+        }
         (Some(Modal::Accept { .. }), _) => &[
             ("←→", "choose"),
             ("Enter", "answer"),
@@ -1626,6 +1798,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         (None, Tab::Pending) if !app.pending.is_empty() => &[
             ("↑↓", "request"),
             ("Enter", "answer"),
+            ("o", "receiving on/off"),
+            (":", "commands"),
+            ("Tab", "tab"),
+            ("?", "help"),
+            ("Ctrl+Q", "quit"),
+        ],
+        (None, Tab::Pending) => &[
+            ("o", "receiving on/off"),
             (":", "commands"),
             ("Tab", "tab"),
             ("?", "help"),
@@ -1698,6 +1878,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Tab  ← →  1 2 3", "switch tab"),
         ("Enter", "answer a waiting request"),
         ("s", "send a file to the selected friend"),
+        ("o", "receiving on/off, while beam is open"),
         ("r", "rename the selected friend"),
         ("x  Delete", "remove the selected friend"),
         ("Ctrl+C", "copy the fingerprint shown"),
@@ -1922,6 +2103,7 @@ mod tests {
 
     use super::*;
     use crate::tui::app::{Event, Key, Me, MouseKind, Snapshot};
+    use crate::tui::pending::Owner;
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1958,6 +2140,8 @@ mod tests {
                 .collect(),
             agent,
             history: Vec::new(),
+            owner: Owner::Background,
+            listen_elsewhere: false,
             problem: None,
         })
     }
@@ -2048,7 +2232,7 @@ mod tests {
     fn the_pending_tab_tells_whether_anyone_can_send() {
         let mut app = app(&[], Agent::Stopped);
         app.on_key(Key::Char('2'));
-        assert!(render(&mut app, 100, 20).contains("Nobody can send you files"));
+        assert!(render(&mut app, 100, 20).contains("Turn on so friends can send you files"));
 
         app.snapshot.agent = Agent::Running {
             receive_dir: "D:\\Downloads".to_string(),
@@ -2237,12 +2421,12 @@ mod tests {
     fn pending_says_why_nothing_can_arrive() {
         let mut app = app(&[], Agent::Stopped);
         app.on_key(Key::Char('2'));
-        assert!(render(&mut app, 100, 20).contains(":service start"));
+        assert!(render(&mut app, 100, 20).contains("Nothing can arrive while Receiving is off"));
         app.snapshot.agent = Agent::Running {
             receive_dir: "x".into(),
         };
         app.link = Link::Lost("the background agent stopped".into());
-        assert!(render(&mut app, 100, 20).contains("Not connected"));
+        assert!(render(&mut app, 100, 20).contains("Not connected to the receiver"));
     }
 
     #[test]
@@ -2310,6 +2494,74 @@ mod tests {
         assert!(screen.contains("[Direct P2P]"), "{screen}");
         assert!(screen.contains("⇡ 50 % alice"), "{screen}");
         assert!(screen.contains("Cancel send"), "{screen}");
+    }
+
+    #[test]
+    fn the_switch_sits_on_top_of_pending_and_stands_out_while_off() {
+        let mut app = app(&["alice"], Agent::Stopped);
+        app.on_key(Key::Char('2'));
+        let screen = render(&mut app, 120, 24);
+        let switch = screen.find("RECEIVING").expect(&screen);
+        let nothing = screen.find("Nothing can arrive").expect(&screen);
+        assert!(switch < nothing, "the switch comes first:\n{screen}");
+        assert!(
+            screen.contains("○  OFF") && screen.contains("press o, or click"),
+            "{screen}"
+        );
+        assert!(
+            app.areas
+                .targets
+                .iter()
+                .any(|(_, t)| *t == Target::ReceiveSwitch)
+        );
+
+        app.switch = Switch::On;
+        app.snapshot.agent = Agent::Running {
+            receive_dir: "D:/Downloads".into(),
+        };
+        app.snapshot.owner = Owner::ThisView;
+        app.link = Link::Connected;
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains("●  ON"), "{screen}");
+        assert!(screen.contains("saving to D:/Downloads"), "{screen}");
+        assert!(screen.contains("Nothing is waiting"), "{screen}");
+    }
+
+    #[test]
+    fn the_switch_names_the_agent_when_the_agent_receives() {
+        let mut app = app(
+            &["alice"],
+            Agent::Running {
+                receive_dir: "x".into(),
+            },
+        );
+        app.on_key(Key::Char('2'));
+        let screen = render(&mut app, 120, 24);
+        assert!(screen.contains("●  AGENT"), "{screen}");
+        assert!(
+            !app.areas
+                .targets
+                .iter()
+                .any(|(_, t)| *t == Target::ReceiveSwitch)
+        );
+    }
+
+    #[test]
+    fn not_receiving_in_the_header_leads_to_the_switch() {
+        let mut app = app(&["alice"], Agent::Stopped);
+        render(&mut app, 120, 24);
+        let (area, _) = *app
+            .areas
+            .targets
+            .iter()
+            .find(|(area, t)| *t == Target::Tab(Tab::Pending) && area.y == 0)
+            .expect("the header badge is clickable");
+        app.on_event(Event::Mouse {
+            kind: MouseKind::Click,
+            column: area.x + 1,
+            row: 0,
+        });
+        assert_eq!(app.tab, Tab::Pending);
     }
 
     #[test]

@@ -99,6 +99,7 @@ async fn start_agent(home: &Home, accept_timeout: Duration) -> Running_ {
         port_mapping: false,
         notify: false,
         echo: false,
+        in_view: false,
     };
     let (identity, store) = (home.identity.clone(), home.store.clone());
     let task = tokio::spawn(async move {
@@ -506,6 +507,7 @@ async fn a_second_agent_in_the_same_home_is_refused() {
         port_mapping: false,
         notify: false,
         echo: false,
+        in_view: false,
     };
     let second = agent::run(
         bob.identity.clone(),

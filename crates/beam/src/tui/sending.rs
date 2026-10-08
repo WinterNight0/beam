@@ -43,7 +43,7 @@ impl Outgoing {
     }
 
     /// `bind` is `Loopback` only in tests.
-    fn start_on(store: Store, peer: String, path: PathBuf, bind: Bind) -> Self {
+    pub(super) fn start_on(store: Store, peer: String, path: PathBuf, bind: Bind) -> Self {
         let (update_tx, updates) = mpsc::channel();
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
