@@ -523,6 +523,139 @@ async fn a_second_session_for_the_same_partial_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// Batched flushing (ADR-0039)
+// ---------------------------------------------------------------------------
+
+/// Opens (or reopens) the partial for `payload` from the world's sender.
+async fn open_partial(world: &World, chunk_size: u32) -> beam::transfer::Partial {
+    let key = beam::transfer::PartialKey {
+        peer_fingerprint: world.sender.fingerprint(),
+        file_sha256: beam::transfer::sha256_hex(&world.payload),
+        size: world.payload.len() as u64,
+        chunk_size,
+    };
+    let plan = beam::transfer::ChunkPlan::new(world.payload.len() as u64, chunk_size);
+    world
+        .partials()
+        .open(&key, "payload.bin", plan)
+        .await
+        .expect("open the partial")
+}
+
+async fn store(world: &World, partial: &mut beam::transfer::Partial, chunk_size: u32, index: u32) {
+    let plan = beam::transfer::ChunkPlan::new(world.payload.len() as u64, chunk_size);
+    let offset = plan.offset_of(index) as usize;
+    let body = &world.payload[offset..offset + plan.len_of(index) as usize];
+    partial
+        .store_chunk(index, body, &beam::transfer::sha256_hex(body))
+        .await
+        .expect("store a chunk");
+}
+
+/// beam killed between two batched flushes loses nothing: each chunk was
+/// recorded as soon as it was written, and the operating system keeps what
+/// the process wrote. (Here the "kill" is dropping the partial unflushed.)
+#[tokio::test]
+async fn a_killed_receiver_keeps_chunks_it_had_not_flushed() {
+    let world = world(SMALL_CHUNK as usize * 6);
+
+    let mut partial = open_partial(&world, SMALL_CHUNK).await;
+    for index in 0..3 {
+        store(&world, &mut partial, SMALL_CHUNK, index).await;
+    }
+    assert_eq!(partial.unflushed_chunks(), 3);
+    drop(partial); // killed: no flush
+
+    let mut partial = open_partial(&world, SMALL_CHUNK).await;
+    assert_eq!(partial.bitmap().count(), 3);
+    assert_eq!(partial.reverify().await.expect("reverify"), 0);
+    assert_eq!(partial.bitmap().count(), 3, "a recorded chunk was lost");
+}
+
+/// After power loss, chunks that were recorded but never reached the disk are
+/// not trusted: `reverify` re-hashes them, drops them, and they are asked for
+/// again. Simulated by recording chunks, then emptying the data file the way
+/// a lost cache would leave it.
+#[tokio::test]
+async fn chunks_lost_to_power_failure_are_dropped_not_trusted() {
+    let world = world(SMALL_CHUNK as usize * 6);
+
+    let mut partial = open_partial(&world, SMALL_CHUNK).await;
+    for index in 0..3 {
+        store(&world, &mut partial, SMALL_CHUNK, index).await;
+    }
+    let part = partial.part_path();
+    drop(partial);
+    // The data never made it to disk; the record of it did.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .expect("open part")
+        .set_len(SMALL_CHUNK as u64) // chunk 0 survived, 1 and 2 did not
+        .expect("truncate");
+
+    let mut partial = open_partial(&world, SMALL_CHUNK).await;
+    assert_eq!(partial.bitmap().count(), 3, "the record survived");
+    assert_eq!(partial.reverify().await.expect("reverify"), 2);
+    assert!(partial.bitmap().get(0));
+    assert!(!partial.bitmap().get(1) && !partial.bitmap().get(2));
+
+    // And a whole session over it still produces the right file.
+    drop(partial);
+    let (sent, received) = world.session(ScriptedPrompt::new(true)).await;
+    sent.expect("send");
+    received.expect("receive");
+    assert_eq!(
+        std::fs::read(world.out.join("payload.bin")).expect("read result"),
+        world.payload
+    );
+}
+
+/// A batch is flushed by itself once `FLUSH_EVERY_CHUNKS` chunks are waiting,
+/// which bounds what power loss can cost.
+#[tokio::test]
+async fn a_full_batch_of_chunks_is_flushed_without_being_asked() {
+    let batch = beam::transfer::FLUSH_EVERY_CHUNKS;
+    let world = world(SMALL_CHUNK as usize * (batch + 2));
+
+    let mut partial = open_partial(&world, SMALL_CHUNK).await;
+    for index in 0..batch as u32 {
+        store(&world, &mut partial, SMALL_CHUNK, index).await;
+    }
+    assert_eq!(
+        partial.unflushed_chunks(),
+        0,
+        "a full batch was not flushed"
+    );
+    store(&world, &mut partial, SMALL_CHUNK, batch as u32).await;
+    assert_eq!(partial.unflushed_chunks(), 1);
+    partial.flush().await.expect("flush");
+    assert_eq!(partial.unflushed_chunks(), 0);
+}
+
+/// Large chunks are batched by size instead: `FLUSH_EVERY` bytes is a batch
+/// even when that is fewer than `FLUSH_EVERY_CHUNKS` chunks.
+#[tokio::test]
+async fn a_full_batch_of_bytes_is_flushed_without_being_asked() {
+    let chunk = 16 * 1024 * 1024;
+    let batch = (beam::transfer::FLUSH_EVERY / u64::from(chunk)) as u32;
+    assert!((batch as usize) < beam::transfer::FLUSH_EVERY_CHUNKS);
+    let world = world(chunk as usize * (batch as usize + 1));
+
+    let mut partial = open_partial(&world, chunk).await;
+    for index in 0..batch - 1 {
+        store(&world, &mut partial, chunk, index).await;
+    }
+    assert_eq!(partial.unflushed_chunks(), batch as usize - 1);
+    store(&world, &mut partial, chunk, batch - 1).await;
+    assert_eq!(
+        partial.unflushed_chunks(),
+        0,
+        "a full batch was not flushed"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Retention: what survives a failure, and what does not
 // ---------------------------------------------------------------------------
 

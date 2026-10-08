@@ -10,7 +10,9 @@ peers you have paired with can ask.
 
 How it all fits together — invites, pairing, finding a peer, hole punching,
 the transfer protocol — is explained step by step in
-[docs/how-it-works.md](docs/how-it-works.md).
+[docs/how-it-works.md](docs/how-it-works.md). What beam protects, what it does
+not, how to use it safely and how to report a problem are in
+[SECURITY.md](SECURITY.md).
 
 > **Status: milestone M6.** Pairing and file transfer run over iroh: encrypted
 > end to end, direct when possible and through a relay when not, with each
@@ -35,9 +37,29 @@ On Windows without `make`:
 powershell -ExecutionPolicy Bypass -File scripts\check.ps1
 ```
 
+### Installing on Windows, so `beam` works without `.\beam.exe`
+
+Double-click `scripts\install.bat`, or run it from a terminal. It builds beam
+in release mode and copies it to `%LOCALAPPDATA%\Programs\beam`, then adds
+that folder to your user PATH (no administrator rights needed). Open a new
+terminal afterwards and type `beam`. Run it again after pulling changes to
+update. `scripts\install.bat -Uninstall` removes it. Neither touches
+`~/.beam`, where your key and paired peers live.
+
+To give beam to someone without Rust, put `beam.exe` (from
+`target\release`) in a folder with `install.bat` and `install.ps1`.
+The script then installs that `beam.exe` instead of building one.
+
+(A `.bat` wrapper alone would not help: Windows finds a command without a
+path only in the folders on PATH, and PowerShell never looks in the current
+folder. So the real fix is putting beam's folder on PATH.)
+
 ## Use
 
 ```
+beam                           # open the full-screen view (friends, details, agent)
+beam ui cli                    # make plain `beam` print the help instead (`beam ui tui` undoes it)
+
 beam init                      # generate this device's keypair (once per machine)
 beam whoami                    # show your fingerprint
 beam peers                     # list paired peers
@@ -48,13 +70,34 @@ beam listen                    # wait for transfers and pairing: shows invite + 
 beam send alice project.zip    # send a file to a paired peer
 beam transfers                 # list partly received transfers
 beam transfers --clear         # discard them
+beam history                   # what came and went, newest first
+beam history --clear           # delete that record
 
 beam pair <INVITE> --name bob  # pair with a listening device, typing its code
 beam pair --wait --name alice  # pair without also receiving files
+
+beam service enable            # optional: receive in the background, from login
+beam inbox                     # accept or decline what the background agent holds
+beam service status|stop       # see or stop the background agent
+beam receive-dir <folder>      # where received files go
 ```
 
+The background agent is optional. With it on, paired devices can send while
+`beam listen` is closed: you get a notification and answer in `beam inbox`.
+It never accepts anything by itself, and it does not pair. See
+[docs/background-services.md](docs/background-services.md).
+
+**The full-screen view.** `beam` on its own opens a view like Discord's
+Friends page: your friends, their files, what is waiting for you, pairing,
+and a command palette (`:` or Ctrl+P) for everything else. Press `s` to send
+to a friend (a file browser opens); press `o` to start **Receiving** while
+beam is open, and answer requests in the Pending tab. The first run offers to
+create this device's identity. In the view, **Ctrl+C copies and Ctrl+Q
+quits**. `beam ui cli` turns it off. See [docs/tui.md](docs/tui.md).
+
 `listen` saves into the current directory unless given `--out <dir>`. Its
-pairing code works once and changes every ten minutes; after three wrong codes
+pairing code works once and changes every ten minutes. It is shown once, when
+`listen` starts; `beam whoami` in another terminal shows the current one. After three wrong codes
 in a row it stops offering pairing until it is restarted.
 
 Global flags: `--beam-dir <path>` (default `$BEAM_DIR`, else `~/.beam`) and
@@ -70,6 +113,9 @@ port  = 7820                                   # UDP port `listen` uses; 0 = ran
 
 With `relay = "none"`, only devices that can reach each other directly work: the
 same LAN, a shared VPN (Radmin VPN, ZeroTier, Tailscale…), or a public address.
+To test real direct P2P between two homes, follow the step-by-step guide in
+[docs/deploy.md](docs/deploy.md); `advertise = ["<public IP>:7820"]` puts a
+hand-forwarded public address in the invite.
 
 beam never uses n0's discovery service; the relay is the only n0 infrastructure
 it touches, and only if you leave the default. See [docs/n0-data.md](docs/n0-data.md).
@@ -107,7 +153,7 @@ cd /tmp/beam-demo && BEAM_DIR=$PWD/bob beam listen --out $PWD/inbox
   Saving to     /tmp/beam-demo/inbox
 
 To pair a new device, send it the invite and run on it:  beam pair <invite> --name <a name for this one>
-The pairing code works once and changes every 10 minutes.
+The pairing code works once and changes every 10 minutes; `beam whoami` shows the current one.
 Waiting for transfers. Every one has to be accepted by hand. Ctrl+C to stop.
 ```
 
@@ -224,7 +270,8 @@ a byte-order mark; beam skips it. The table below applies unchanged.
 | Answer the pairing question with `y` | Not paired. Only `yes` pairs |
 | Type a wrong pairing code | Both sides fail, nobody is asked, nothing is saved. `listen` pauses pairing for 5 s, then shows a new code |
 | Type three wrong codes in a row | `listen` turns pairing **off** until it is restarted, and says someone may be guessing. Files from paired devices still arrive |
-| Leave `listen` running for ten minutes | It prints a new pairing code; the old one no longer works |
+| Leave `listen` running for ten minutes | Nothing is printed, but `beam whoami` shows a new code; the old one no longer works, and a joiner who types it is told the code may have expired |
+| Run `beam whoami` while `listen` runs, and after stopping it | It shows `listen`'s invite, the current code and when it expires; afterwards, that `listen` is not running |
 | Answer a file with `n` | Both sides say it was declined, and `inbox/` gains nothing |
 | Answer nothing for 60 seconds | Both sides say it expired. Silence is a Reject, not a maybe |
 | Send twice at once, from two paired devices | The second sender is told `bob is receiving another file; try again later` |
@@ -347,9 +394,9 @@ when it can, by a copy when the destination is on another drive.
 
 Inside a `tmp/<id>/` directory, `state.json` records which chunks have arrived
 and `hashes` records what each one should be. The bitmap in `state.json` is
-always written **after** the chunk data has been flushed, so a crash loses the
-claim rather than the data: the chunk is fetched again instead of being trusted
-when it should not be.
+always written **after** the chunk data, and the disk is flushed every 8 chunks.
+The bitmap is a claim, not proof: on resume every claimed chunk is re-hashed,
+so one lost to a power cut is fetched again instead of being trusted.
 
 `known_peers` is plain text and safe to read:
 
@@ -406,6 +453,9 @@ crates/beam/
   tests/               command, integration and two-process tests
 docs/                  requirements, design decisions, test plan
 ```
+
+Transfer speed, what has been measured and the plan to improve it:
+[docs/performance-plan.md](docs/performance-plan.md).
 
 The project was originally written in Go; see ADR-0010 in
 [docs/decisions.md](docs/decisions.md) for why it moved to Rust and what that

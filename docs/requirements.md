@@ -25,7 +25,7 @@ deleted or renumbered.
 | F-8 | `beam pair <INVITE> --name <name>` performs first-time pairing using an invite and a pairing code, exchanging and confirming public keys with `spake2`. The other device waits with `beam listen` or `beam pair --wait --name <name>`. (Originally a 9-digit Short ID looked up on the rendezvous server; changed by ADR-0036.) | M4 |
 | F-13 | ~~A rendezvous server maps a Short ID to an iroh endpoint address.~~ — **Withdrawn (ADR-0036)**. There is no rendezvous server; see F-18. beam still never uses n0's DNS discovery. | M4 |
 | F-14 | The relay URL is configurable; n0's relay is the development default and a self-hosted `iroh-relay` replaces it later. | M4 |
-| F-9 | ~~`beam newcode`~~ — **dropped in M5.** `beam listen` renews its pairing code by itself after every attempt and every 10 minutes, and prints the new one (ADR-0028 amendment). | M5 |
+| F-9 | ~~`beam newcode`~~ — **dropped in M5.** `beam listen` renews its pairing code by itself after every attempt and every 10 minutes (ADR-0028 amendment). It no longer prints each new one; `beam whoami` shows the current code (F-21, ADR-0037). | M5 |
 | F-10 | A transfer resumes after an interruption without re-sending verified chunks. Resuming is triggered only by running `beam send` again: there is no automatic reconnection and no `beam resume`. | M3 |
 | F-12 | `beam transfers` lists partially received transfers; `beam transfers --clear` deletes them after confirmation. | M3 |
 | F-11 | The progress line states whether the connection is `[Direct P2P]` or `[Relay]`, and says so when the path changes mid-transfer (ADR-0032). | M5 |
@@ -34,6 +34,24 @@ deleted or renumbered.
 | F-17 | ~~`docs/deploy.md` explains running `beam-server` behind `wss://`.~~ — **Withdrawn (ADR-0036)**. There is no server to deploy; `deploy.md` now says so and covers pointing beam at another relay. | M5 |
 | F-18 | `beam listen` and `beam pair --wait` show an **invite**: `beam1` + base32 of the device's public key, its relay and up to six direct addresses, with a checksum. A damaged or mistyped invite is refused with a clear message before any network traffic, and the message never quotes the pasted text (ADR-0036). | post-M6 |
 | F-19 | After pairing, the joiner saves where the invite said its peer is (`addrs=`, and `relay=` when it differs from its own) on the peer's `known_peers` line. Running `beam pair <INVITE>` for a device that is already paired only updates those attributes — no code, no network, never the key or the name (ADR-0036). | post-M6 |
+| F-21 | `beam listen` prints its invite and pairing code once, at start; a code renewed after ten minutes is not printed. `beam whoami` shows a running `listen`'s invite, current code and its expiry, or why there is no code (in use, paused, off), or that `listen` is not running. A crashed `listen` never leaves a stale code on show (ADR-0037). | post-M6 |
+| F-22 | A joiner whose code did not match is told that the code may have expired, how often codes change, and how to get the current one (ADR-0037). | post-M6 |
+| F-29 | `beam` typed with nothing after it opens a full-screen view on a terminal: paired peers, the selected peer's details and fingerprint, and whether the background agent runs. Any argument, or output that is not a terminal, gives the normal CLI (ADR-0043). | post-M6 |
+| F-30 | `beam ui cli` makes plain `beam` print the help instead, and `beam ui tui` brings the view back; the choice is kept in `config.toml` (ADR-0043). | post-M6 |
+| F-31 | In the full-screen view, `:` or Ctrl+P opens a command palette that runs any beam command: typed as on the command line or picked from a filtered list, with Tab completion of friends and files. Commands that only print show their output in a pop-up; commands that ask questions run in the normal terminal and return to the view (ADR-0043). | post-M6 |
+| F-32 | The view's Add friend tab pairs without typing commands: paste their invite and a name, then type their code in a pop-up; or show this device's invite and code. Both people compare fingerprints in a pop-up that starts on No (ADR-0043). | post-M6 |
+| F-33 | With the background agent running, the view lists waiting requests (Pending tab, header count, the friend's panel) and answers them in an Accept pop-up that shows sender, fingerprint, file, size and resume state, starts on Decline, and never opens by itself; it shows the agent's progress while a file arrives (ADR-0043). | post-M6 |
+| F-34 | beam keeps a private history of transfers that reached a person (`~/.beam/history.jsonl`, newest 1000): `beam history` shows it newest first, `--clear` deletes it, and the view lists each friend's files and when they were last seen (ADR-0043). | post-M6 |
+| F-35 | The view sends a file to the selected friend (`s`, or `:send` in the palette): a file browser of every drive with a filter and drag-and-drop (ADR-0045), then a pop-up showing each stage and progress that can be hidden or cancelled; cancelling tells the receiver, and leaving mid-send asks first (ADR-0043). | post-M6 |
+| F-36 | A Receiving switch at the top of the view's Pending tab lets paired devices send while beam is open, without the background agent or a second terminal; it is off at every start, stops when beam closes, and asks before stopping a transfer in progress (ADR-0044). | post-M6 |
+| F-37 | On a device with no identity, the view offers to create it ("Welcome to beam … Create it now?") with Create it / Not now; it never replaces an existing identity (ADR-0045). | post-M6 |
+| F-38 | Sending from the view starts with a file browser: places and every drive, folders first with sizes and ages, a filter, Enter to open or send, Backspace to go up, and typed or dragged paths (ADR-0045). | post-M6 |
+| F-26 | An optional background agent (`beam service enable|start`) receives from paired devices without `beam listen`: it shows a desktop notification, and the person answers in `beam inbox` with the same prompt. Requests wait up to 5 minutes; unanswered is declined (ADR-0042). | post-M6 |
+| F-27 | `beam receive-dir` shows or sets where received files are saved. The default for the agent is the Windows Downloads folder (as Windows reports it, even if moved) or, on Linux, the folder the agent was started in. `beam listen` uses the setting when given no `--out` (ADR-0042). | post-M6 |
+| F-28 | The agent starts at login per user (Windows `HKCU` Run entry, Linux `systemd --user`), never as a system service and never with administrator or root rights; `beam service status` reports it (ADR-0042). | post-M6 |
+| F-25 | Ctrl+C in `beam send` or `beam listen` stops a transfer cleanly and the other device is told at once. Both terminals say which side stopped it (known from the QUIC close code, not from text) and that what arrived is kept for a resume. `listen` stops normally and removes `listen.json` (ADR-0041). | post-M6 |
+| F-24 | The sender may have up to 4 chunks in flight before their answers; a rejected chunk is re-sent after the others. The transfer protocol version is agreed when connecting (`beam/xfer/2`, falling back to `beam/xfer/1`, one chunk at a time), so old and new versions of beam work together (ADR-0040). | post-M6 |
+| F-23 | `advertise` in `config.toml` lists addresses to put first in this device's invite, for a public address beam cannot discover (a port forwarded by hand, with no relay). With `relay = "none"`, `listen` waits briefly for a router port mapping before showing the invite (ADR-0038). | post-M6 |
 | F-20 | `beam listen` binds a fixed UDP port (`port` in `config.toml`, default 7820) so its invite stays the same between runs. If the port is taken it uses another and warns (ADR-0036). | post-M6 |
 
 ## 2. Security requirements
@@ -71,6 +89,17 @@ convenience loses.
 | S-22 | ~~The rendezvous server keeps registrations in memory only and does not log requests.~~ — **Withdrawn (ADR-0036)**. There is no server. | M4 |
 | S-31 | An invite is a routing hint, not a credential. An invite whose key was swapped cannot reach the real device and does not spend its code; a wrong address for a paired key cannot redirect a send (ADR-0036). | post-M6 |
 | S-32 | Updating where a paired device is found (F-19) never changes its stored key; a device with a new key is a new pairing (rule 3, ADR-0036). | post-M6 |
+| S-33 | A relay from an invite or a saved `relay=` is used only if it is `https://` on a public host; anything else is dropped. `config.toml` may name any relay (ADR-0038). | post-M6 |
+| S-34 | An address update that would change a paired device's relay is saved only after the person answers yes to a question showing the old and new relay (ADR-0038). | post-M6 |
+| S-36 | The sender checks every chunk it reads for sending against the hash it took of that chunk before the request. A chunk that still does not match after 3 reads, or a file that got shorter, stops the transfer with CANCEL before that chunk is sent (ADR-0040). | post-M6 |
+| S-37 | The receiver accepts only chunks it is still missing: a chunk outside the transfer, or one that already arrived, ends the transfer. Each chunk gets at most 3 attempts, whatever order the chunks arrive in (ADR-0040). | post-M6 |
+| S-42 | The command palette accepts only what the CLI's own parser accepts, has no way to accept a transfer, and runs interactive commands as a separate `beam` process with their unchanged prompts (ADR-0043). | post-M6 |
+| S-43 | The history file is private, is never written for a request refused before the prompt (so a stranger cannot fill it), and its strings are cleaned before they are shown (ADR-0043). | post-M6 |
+| S-38 | The agent does not pair: the pairing protocol is not offered (ADR-0042). | post-M6 |
+| S-39 | The agent's local link answers only clients on loopback that present the token from the private `agent.json`; until then it reveals nothing and accepts no answer. One request takes one answer; any other is refused as too late (ADR-0042). | post-M6 |
+| S-40 | Router port mapping in the agent is off unless turned on with `beam service port-mapping on`, which shows a warning and needs `y` (ADR-0042). | post-M6 |
+| S-41 | Notification text from a peer is cleaned and passed to the OS notifier as data (environment variables), never as part of a command or script (ADR-0042). | post-M6 |
+| S-35 | Dependencies are audited against the RustSec database on every push, CI's token is read-only, and CI actions are pinned to commit hashes; the latest manual audit is recorded in `SECURITY.md` (ADR-0038). | post-M6 |
 | S-11 | Transfer IDs are random; replayed or expired IDs are rejected. | M2/M3 |
 | S-14 | A partial transfer is matched by (sender fingerprint, file_sha256, size, chunk_size) and never by a sender-supplied transfer ID, so no peer can attach to another peer's partial. | M3 |
 | S-15 | A have-bitmap from a peer is validated — exact length, no bits past the end — and a bad one aborts the transfer rather than being repaired. | M3 |
@@ -90,11 +119,12 @@ convenience loses.
 | D-7 | An existing destination file is never silently overwritten. | M2 |
 | D-8 | Received chunks are tracked with a bitmap, not a single resume index. | M3 |
 | D-9 | A transfer may only be resumed when the `file_sha256` and `size` in the new request match the stored transfer. The receiver persists the hashes of the chunks it has already verified, so resumed chunks are checked against the same values as the first attempt. A mismatch starts over as a new transfer. | M3 |
-| D-10 | Chunk data and its hash are written and flushed to disk **before** the bitmap records the chunk as present, so a crash loses the claim rather than the data. | M3 |
+| D-10 | Chunk data and its hash are written **before** the bitmap records the chunk as present, so the record never names a chunk whose bytes were not handed to the operating system. Since ADR-0039 the flush to disk is batched (D-15), and the record is a claim that D-11 checks; until then each chunk was flushed before it was recorded. | M3 |
 | D-11 | On resume, every chunk the bitmap claims is re-hashed against the persisted hash before it is offered to the sender; one that fails is simply re-requested. | M3 |
 | D-12 | A partial is locked while a session uses it; a second session for the same partial is refused with a clear message. | M3 |
 | D-13 | Committing a finished file works when the destination is on a different volume from `~/.beam/tmp`. | M3 |
 | D-14 | A partial survives being declined, expiring, or losing its connection; it is discarded on success, on whole-file hash failure, or when it holds nothing. Partials expire after 7 days, swept when `beam listen` starts. | M3 |
+| D-15 | Received chunks are recorded at once and flushed to disk in batches (every 8 chunks or 32 MiB), after the last chunk, and whenever a transfer stops early. A killed or crashed beam process loses nothing; power loss or an OS crash can lose at most the last batch, which D-11 detects and requests again (ADR-0039). | post-M6 |
 
 ## 4. Non-functional requirements
 
@@ -106,6 +136,7 @@ convenience loses.
 | N-4 | `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` pass before any milestone is called done. |
 | N-5 | Exit codes: 0 success, 1 error, 2 not implemented yet. |
 | N-6 | Nicknames are local labels. There is no global username registry, and a peer is not notified when it is renamed. |
+| N-8 | Throughput is measured with `tests/throughput.rs` (release build) before and after any change meant to affect it, and the numbers are recorded in `docs/performance-plan.md` (ADR-0039). |
 | N-7 | Free space is checked before the Accept prompt, on the volume holding partials and — when it differs — the destination volume, counting only the bytes still missing plus a small margin. Too little space is refused clearly rather than discovered part-way through. |
 
 ## 5. Implementation language
@@ -125,7 +156,9 @@ test on 2026-10-02 — two devices on different home networks about 50 km apart,
 no server, default configuration — paired with an invite and transferred a 5 GB
 file intact. It was slow. Why it was slow, and how often hole punching falls
 back to the relay (for example on Thai mobile CGNAT), is still to be measured;
-throughput work will be planned before any change.
+throughput work will be planned before any change. It ran at about 1 MB/s
+over the relay; the findings and the plan are in
+[performance-plan.md](performance-plan.md).
 
 ## 7. Out of scope
 

@@ -37,6 +37,7 @@ fn network() -> Network {
         relay: Relay::Disabled,
         bind: Bind::Loopback,
         port: 0,
+        advertise: Vec::new(),
     }
 }
 
@@ -201,6 +202,8 @@ fn options(home: &Home, policy: Policy) -> ListenOptions {
             message: Duration::from_secs(10),
             decision: Duration::from_secs(10),
         },
+        allow_pairing: true,
+        port_mapping: true,
     }
 }
 
@@ -292,6 +295,52 @@ async fn a_paired_peer_sends_a_file_over_iroh() {
     assert!(progress.0.contains(&Progress::Accepted {
         path: PathKind::Direct
     }));
+}
+
+/// ADR-0040: a new sender offers `beam/xfer/2` and `beam/xfer/1`. A current
+/// `listen` picks 2, so several chunks go in flight; a receiver that only
+/// knows 1 picks 1, so the sender falls back to one chunk at a time. (A
+/// sender that only knows 1 is every other test in this file: they dial
+/// `XFER_ALPN`.)
+#[tokio::test]
+async fn the_transfer_protocol_version_is_agreed_and_sets_the_window() {
+    use beam::transport::dial::{dial_transfer, window_for};
+    use beam::transport::endpoint::XFER_ALPN_V2;
+
+    let (alice, bob) = (home("alice"), home("bob"));
+    pair_by_hand(&alice, "bob", &bob, "alice");
+    let _listening = listen(&bob, Script::default(), options(&bob, Policy::default())).await;
+    let endpoint = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
+        .await
+        .unwrap();
+
+    let current = dial_transfer(&endpoint, bob.at()).await.expect("dial");
+    assert_eq!(current.alpn(), XFER_ALPN_V2);
+    assert_eq!(window_for(current.alpn()), beam::transfer::PIPELINE_WINDOW);
+
+    // An old receiver: knows only version 1.
+    let old = home("old");
+    let old_endpoint = endpoint::bind(
+        &old.identity,
+        &Relay::Disabled,
+        Bind::Loopback,
+        0,
+        &[XFER_ALPN],
+    )
+    .await
+    .unwrap();
+    let old_at = endpoint::advertised_addr(&old_endpoint, &Relay::Disabled, Bind::Loopback).await;
+    let accepting = old_endpoint.clone();
+    let held = tokio::spawn(async move { accepting.accept().await.unwrap().await.unwrap() });
+
+    let fallback = dial_transfer(&endpoint, old_at)
+        .await
+        .expect("dial the old receiver");
+    assert_eq!(fallback.alpn(), XFER_ALPN);
+    assert_eq!(window_for(fallback.alpn()), 1);
+    let _ = held.await;
+    endpoint.close().await;
+    old_endpoint.close().await;
 }
 
 #[derive(Default)]
@@ -1141,5 +1190,278 @@ mod impersonation {
         );
         alices.close().await;
         attackers.close().await;
+    }
+}
+
+// ------------------------------------------------- Ctrl+C on either side (ADR-0041)
+
+/// Reports once, on the first chunk that has moved, then stays quiet.
+struct FirstChunk(Option<mpsc::UnboundedSender<()>>);
+
+impl Reporter for FirstChunk {
+    fn report(&mut self, progress: Progress) {
+        if matches!(progress, Progress::Transferring { .. })
+            && let Some(tx) = self.0.take()
+        {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// How many chunks bob's partials hold, read from disk.
+fn chunks_kept(home: &Home) -> u32 {
+    beam::transfer::PartialStore::new(home.store.tmp_path())
+        .list(Duration::from_secs(3600))
+        .unwrap()
+        .iter()
+        .map(|p| p.have_chunks)
+        .sum()
+}
+
+/// The receiver's user stops `listen` (Ctrl+C) while chunks are moving. The
+/// sender is told at once, by name of side: `PeerInterrupted`, not a timeout.
+/// `listen` reports which transfer it cancelled, and what arrived is kept.
+#[tokio::test]
+async fn stopping_listen_mid_transfer_tells_the_sender_and_keeps_what_arrived() {
+    let (alice, bob) = (home("alice"), home("bob"));
+    pair_by_hand(&alice, "bob", &bob, "alice");
+
+    let (moving_tx, mut moving) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let (identity, store) = (bob.identity.clone(), bob.store.clone());
+    let opts = options(&bob, Policy::default());
+    let task = tokio::spawn(async move {
+        let _ = beam::listener::run_until(
+            identity,
+            store,
+            network(),
+            opts,
+            Script::default().transfers(&[true]),
+            move || FirstChunk(Some(moving_tx.clone())),
+            move |event| {
+                let _ = tx.send(event);
+            },
+            async {
+                let _ = stop_rx.await;
+            },
+        )
+        .await;
+    });
+    let mut listening = match tokio::time::timeout(PATIENCE, events.recv()).await {
+        Ok(Some(ListenEvent::Ready { code, invite, .. })) => {
+            *bob.listening_at.lock().unwrap() = Some(invite.endpoint_addr());
+            Listening { events, code, task }
+        }
+        other => panic!("listen did not start: {other:?}"),
+    };
+
+    // Big enough to still be moving when the first chunk lands.
+    let bytes = payload(48 * 1024 * 1024);
+    let sending = {
+        let path = alice.files.join("big.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let identity = alice.identity.clone();
+        let at = bob.at();
+        tokio::spawn(async move {
+            let endpoint = endpoint::bind(&identity, &Relay::Disabled, Bind::Loopback, 0, &[])
+                .await
+                .unwrap();
+            let connection = beam::transport::dial::dial_transfer(&endpoint, at)
+                .await
+                .unwrap();
+            let mut options = SendOptions::new(
+                path,
+                beam::identity::encode_public_key(&identity.verifying_key()),
+            );
+            options.chunk_size = 1024 * 1024;
+            let result = send_on(&connection, &mut options, &mut SilentReporter).await;
+            endpoint.close().await;
+            result
+        })
+    };
+
+    tokio::time::timeout(PATIENCE, moving.recv())
+        .await
+        .expect("no chunk ever arrived");
+    stop_tx.send(()).unwrap(); // Ctrl+C on bob's side
+
+    let sent = tokio::time::timeout(PATIENCE, sending)
+        .await
+        .expect("the sender was not told")
+        .unwrap();
+    assert!(
+        matches!(sent, Err(TransferError::PeerInterrupted)),
+        "expected PeerInterrupted, got {sent:?}"
+    );
+    match listening
+        .expect("the stop", |e| matches!(e, ListenEvent::Stopped { .. }))
+        .await
+    {
+        ListenEvent::Stopped { cancelled } => {
+            assert_eq!(cancelled, [alice.identity.fingerprint()]);
+        }
+        _ => unreachable!(),
+    }
+    assert!(
+        chunks_kept(&bob) > 0,
+        "what arrived was not kept for a resume"
+    );
+    assert!(std::fs::read_dir(&bob.inbox).unwrap().next().is_none());
+}
+
+/// The sender's user stops `beam send` (Ctrl+C) while chunks are moving.
+/// `listen` says the sender stopped it, rather than reporting a failure
+/// after a timeout, and keeps what arrived.
+#[tokio::test]
+async fn a_sender_stopped_mid_transfer_is_reported_as_such_by_listen() {
+    let (alice, bob) = (home("alice"), home("bob"));
+    pair_by_hand(&alice, "bob", &bob, "alice");
+    let mut listening = listen(
+        &bob,
+        Script::default().transfers(&[true]),
+        options(&bob, Policy::default()),
+    )
+    .await;
+
+    let bytes = payload(48 * 1024 * 1024);
+    let path = alice.files.join("big.bin");
+    std::fs::write(&path, &bytes).unwrap();
+    let endpoint = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
+        .await
+        .unwrap();
+    let connection = beam::transport::dial::dial_transfer(&endpoint, bob.at())
+        .await
+        .unwrap();
+    let (moving_tx, mut moving) = mpsc::unbounded_channel();
+    let sending = {
+        let connection = connection.clone();
+        let key = beam::identity::encode_public_key(&alice.identity.verifying_key());
+        tokio::spawn(async move {
+            let mut options = SendOptions::new(path, key);
+            options.chunk_size = 1024 * 1024;
+            send_on(&connection, &mut options, &mut FirstChunk(Some(moving_tx))).await
+        })
+    };
+
+    tokio::time::timeout(PATIENCE, moving.recv())
+        .await
+        .expect("no chunk was ever acknowledged");
+    beam::transport::dial::interrupt(&connection); // Ctrl+C on alice's side
+    let _ = sending.await;
+
+    let started = std::time::Instant::now();
+    match listening
+        .expect("the interruption", |e| {
+            matches!(
+                e,
+                ListenEvent::TransferInterrupted { .. } | ListenEvent::TransferFailed { .. }
+            )
+        })
+        .await
+    {
+        ListenEvent::TransferInterrupted { peer } => {
+            assert_eq!(peer, alice.identity.fingerprint());
+        }
+        other => panic!("reported as a plain failure: {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "listen waited for a timeout instead of hearing the close"
+    );
+    endpoint.close().await;
+    assert!(
+        chunks_kept(&bob) > 0,
+        "what arrived was not kept for a resume"
+    );
+}
+
+/// Found by a real Ctrl+C: a sender still hashing a large file is connected
+/// but has not opened its stream. Stopping `listen` then must still tell it
+/// at once (not after it finishes hashing), name it as cancelled, and report
+/// nothing more after `Stopped`.
+#[tokio::test]
+async fn stopping_listen_while_the_sender_is_still_hashing_tells_it_at_once() {
+    let (alice, bob) = (home("alice"), home("bob"));
+    pair_by_hand(&alice, "bob", &bob, "alice");
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let (identity, store) = (bob.identity.clone(), bob.store.clone());
+    let opts = options(&bob, Policy::default());
+    let _task = tokio::spawn(async move {
+        let _ = beam::listener::run_until(
+            identity,
+            store,
+            network(),
+            opts,
+            Script::default().transfers(&[true]),
+            || SilentReporter,
+            move |event| {
+                let _ = tx.send(event);
+            },
+            async {
+                let _ = stop_rx.await;
+            },
+        )
+        .await;
+    });
+    match tokio::time::timeout(PATIENCE, events.recv()).await {
+        Ok(Some(ListenEvent::Ready { invite, .. })) => {
+            *bob.listening_at.lock().unwrap() = Some(invite.endpoint_addr());
+        }
+        other => panic!("listen did not start: {other:?}"),
+    }
+
+    // Large enough that hashing it takes several seconds in a test build.
+    let path = alice.files.join("huge.bin");
+    std::fs::write(&path, payload(512 * 1024 * 1024)).unwrap();
+    let identity = alice.identity.clone();
+    let at = bob.at();
+    let sending = tokio::spawn(async move {
+        let endpoint = endpoint::bind(&identity, &Relay::Disabled, Bind::Loopback, 0, &[])
+            .await
+            .unwrap();
+        let connection = beam::transport::dial::dial_transfer(&endpoint, at)
+            .await
+            .unwrap();
+        let mut options = SendOptions::new(
+            path,
+            beam::identity::encode_public_key(&identity.verifying_key()),
+        );
+        let result = send_on(&connection, &mut options, &mut SilentReporter).await;
+        endpoint.close().await;
+        result
+    });
+
+    tokio::time::sleep(Duration::from_secs(1)).await; // connected, still hashing
+    let stopped_at = std::time::Instant::now();
+    stop_tx.send(()).unwrap();
+
+    let sent = tokio::time::timeout(PATIENCE, sending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(sent, Err(TransferError::PeerInterrupted)),
+        "expected PeerInterrupted, got {sent:?}"
+    );
+    assert!(
+        stopped_at.elapsed() < Duration::from_secs(4),
+        "the sender only noticed after hashing ({:?})",
+        stopped_at.elapsed()
+    );
+
+    let mut after = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(500), events.recv()).await
+    {
+        after.push(event);
+    }
+    match after.as_slice() {
+        [ListenEvent::Stopped { cancelled }] => {
+            assert_eq!(cancelled, &[alice.identity.fingerprint()]);
+        }
+        other => panic!("expected exactly one Stopped, got {other:?}"),
     }
 }

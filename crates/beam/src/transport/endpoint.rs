@@ -17,8 +17,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
-use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, presets};
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
+use iroh::endpoint::{
+    BindOpts, IdleTimeout, PortmapperConfig, QuicTransportConfig, VarInt, presets,
+};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey, Watcher};
 
 use crate::config::Relay;
 use crate::identity::Identity;
@@ -32,6 +34,20 @@ pub const PAIR_ALPN: &[u8] = b"beam/pair/1";
 /// QUIC stream. Versioned like the pairing one.
 pub const XFER_ALPN: &[u8] = b"beam/xfer/1";
 
+/// Version 2 of file transfers: the same messages, but the sender may have
+/// several chunks in flight and re-sends a rejected one after the others
+/// (ADR-0040). A receiver that only knows version 1 needs each chunk answered
+/// before the next. The name is agreed in the TLS handshake, before any
+/// message, so the two can never be mixed up: a new sender offers both, and
+/// a listener picks the newest it knows ([`transfer_alpns`]).
+pub const XFER_ALPN_V2: &[u8] = b"beam/xfer/2";
+
+/// The transfer protocols `listen` accepts, newest first. The TLS server picks
+/// the first of its own list that the client offered.
+pub fn transfer_alpns() -> [&'static [u8]; 2] {
+    [XFER_ALPN_V2, XFER_ALPN]
+}
+
 /// How long a connection may go without hearing from the peer before it is
 /// considered gone. iroh sends keep-alives every 5 s, so a live peer is never
 /// idle this long; a crashed one is noticed within 15 s instead of noq's 30 s
@@ -39,8 +55,27 @@ pub const XFER_ALPN: &[u8] = b"beam/xfer/1";
 /// the sender is known to be gone (ADR-0030).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How many bytes of one stream may be in flight, unacknowledged. A stream
+/// can go no faster than this divided by the round-trip time; noq's default of
+/// 1.25 MB allows only about 12.5 MB/s at 100 ms. 16 MiB holds a whole 4 MiB
+/// chunk several times over, so a chunk goes out in one round trip instead of
+/// four (performance plan, step 3).
+pub const STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// How many bytes a peer may have in flight to us across *all* streams of one
+/// connection. noq sets no limit, so without this a peer could open its 100
+/// allowed streams and make us buffer 100 stream windows. 32 MiB bounds the
+/// memory one connection can claim, while leaving a full stream window free
+/// for the transfer stream.
+pub const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+
 /// How long to wait for the relay before announcing direct addresses only.
 const RELAY_WAIT: Duration = Duration::from_secs(10);
+
+/// With no relay, how long to wait for the router to report a port mapping
+/// (UPnP, NAT-PMP, PCP). That mapping is the only public address a device
+/// can learn without a relay (ADR-0038).
+const PORTMAP_WAIT: Duration = Duration::from_secs(3);
 
 /// Where the endpoint's UDP socket is bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,6 +96,20 @@ pub enum EndpointError {
     Bind(String),
 }
 
+/// The QUIC settings every beam endpoint uses: the idle timeout and the flow
+/// control windows above. Public so the throughput benchmark can build an
+/// endpoint that behaves like beam's.
+pub fn transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(IDLE_TIMEOUT).expect("15 s is a valid idle timeout"),
+        ))
+        .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
+        .receive_window(VarInt::from_u32(CONNECTION_WINDOW))
+        .send_window(u64::from(CONNECTION_WINDOW))
+        .build()
+}
+
 /// Opens an iroh endpoint that uses this device's identity.
 ///
 /// `port` is the UDP port to bind, or 0 for a random one. `listen` asks for a
@@ -75,8 +124,23 @@ pub async fn bind(
     port: u16,
     alpns: &[&[u8]],
 ) -> Result<Endpoint, EndpointError> {
-    match bind_on(identity, relay, bind, port, alpns).await {
-        Err(_) if port != 0 => bind_on(identity, relay, bind, 0, alpns).await,
+    bind_with(identity, relay, bind, port, alpns, true).await
+}
+
+/// [`bind`], choosing whether iroh may ask the router to forward the port
+/// (UPnP, NAT-PMP, PCP). The background agent leaves it off unless the person
+/// turned it on (ADR-0042): with it, a fixed port becomes reachable from the
+/// internet for as long as the agent runs.
+pub async fn bind_with(
+    identity: &Identity,
+    relay: &Relay,
+    bind: Bind,
+    port: u16,
+    alpns: &[&[u8]],
+    port_mapping: bool,
+) -> Result<Endpoint, EndpointError> {
+    match bind_on(identity, relay, bind, port, alpns, port_mapping).await {
+        Err(_) if port != 0 => bind_on(identity, relay, bind, 0, alpns, port_mapping).await,
         result => result,
     }
 }
@@ -87,6 +151,7 @@ async fn bind_on(
     bind: Bind,
     port: u16,
     alpns: &[&[u8]],
+    port_mapping: bool,
 ) -> Result<Endpoint, EndpointError> {
     let secret = SecretKey::from_bytes(&identity.signing_key().to_bytes());
     let relay_mode = match relay {
@@ -94,16 +159,14 @@ async fn bind_on(
         Relay::Url(url) => RelayMode::custom([url.clone()]),
     };
 
-    let transport = QuicTransportConfig::builder()
-        .max_idle_timeout(Some(
-            IdleTimeout::try_from(IDLE_TIMEOUT).expect("15 s is a valid idle timeout"),
-        ))
-        .build();
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .relay_mode(relay_mode)
-        .transport_config(transport)
+        .transport_config(transport_config())
         .alpns(alpns.iter().map(|a| a.to_vec()).collect());
+    if !port_mapping {
+        builder = builder.portmapper_config(PortmapperConfig::Disabled);
+    }
     let invalid = |e: iroh::endpoint::InvalidSocketAddr| EndpointError::Bind(e.to_string());
     match (bind, port) {
         (Bind::Loopback, port) => {
@@ -150,8 +213,27 @@ pub fn bound_port(endpoint: &Endpoint) -> Option<u16> {
 /// relay URL is included. If the relay cannot be reached the address still
 /// carries the direct addresses, which is enough on a LAN.
 pub async fn advertised_addr(endpoint: &Endpoint, relay: &Relay, bind: Bind) -> EndpointAddr {
-    if let Relay::Url(_) = relay {
-        let _ = tokio::time::timeout(RELAY_WAIT, endpoint.online()).await;
+    match (relay, bind) {
+        (Relay::Url(_), _) => {
+            let _ = tokio::time::timeout(RELAY_WAIT, endpoint.online()).await;
+        }
+        // No relay to learn a public address from: give the router's port
+        // mapping a moment to appear, if the router offers one.
+        (Relay::Disabled, Bind::Any) => {
+            let mut watcher = endpoint.watch_addr();
+            let _ = tokio::time::timeout(PORTMAP_WAIT, async {
+                loop {
+                    if watcher.get().ip_addrs().any(|a| is_public(a.ip())) {
+                        break;
+                    }
+                    if watcher.updated().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        (Relay::Disabled, Bind::Loopback) => {}
     }
     let addr = endpoint.addr();
     match bind {
@@ -165,6 +247,30 @@ pub async fn advertised_addr(endpoint: &Endpoint, relay: &Relay, bind: Bind) -> 
                 }
             }
             only_loopback
+        }
+    }
+}
+
+/// Whether an address is reachable from the internet: not loopback,
+/// private, link-local, carrier-grade NAT (100.64.0.0/10), unique-local or
+/// unspecified.
+pub fn is_public(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (a == 100 && (64..128).contains(&b)))
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local())
         }
     }
 }
@@ -212,6 +318,29 @@ mod tests {
         );
         assert!(addr.ip_addrs().next().is_some(), "{addr:?} is not dialable");
         endpoint.close().await;
+    }
+
+    #[test]
+    fn only_internet_reachable_addresses_count_as_public() {
+        for public in ["8.8.8.8", "1.1.1.1", "2001:4860::8888"] {
+            assert!(is_public(public.parse().unwrap()), "{public}");
+        }
+        for local in [
+            "10.0.0.5",
+            "192.168.1.20",
+            "172.16.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "0.0.0.0",
+            "203.0.113.7",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+        ] {
+            assert!(!is_public(local.parse().unwrap()), "{local}");
+        }
     }
 
     #[tokio::test]

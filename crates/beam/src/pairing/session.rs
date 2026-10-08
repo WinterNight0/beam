@@ -44,6 +44,8 @@ pub struct Network {
     /// The UDP port a waiting device binds, or 0 for a random one. Dialling
     /// always uses a random port.
     pub port: u16,
+    /// Addresses a waiting device puts first in its invite (ADR-0038).
+    pub advertise: Vec<std::net::SocketAddr>,
 }
 
 /// Timeouts, overridable by tests.
@@ -236,7 +238,8 @@ pub async fn wait<C: Confirm + Clone>(
     .await?;
     let result = async {
         let invite =
-            Invite::new(&endpoint::advertised_addr(&endpoint, &network.relay, network.bind).await);
+            Invite::new(&endpoint::advertised_addr(&endpoint, &network.relay, network.bind).await)
+                .with_advertised(&network.advertise);
         {
             // Peek at the code only to show it; `take` is what spends it.
             let code = slot.peek().expect("a fresh slot holds its code");

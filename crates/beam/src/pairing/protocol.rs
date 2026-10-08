@@ -156,11 +156,17 @@ impl Session {
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {
     #[error(
-        "the pairing code did not match. If it was typed correctly, someone else may be \
-         trying to pair in the other device's place"
+        "the pairing code did not match. The code may have expired: it changes every 10 \
+         minutes and after every attempt, and an older one no longer works. Ask for the \
+         current code (`beam whoami` on the other device shows it). If the code was \
+         current and typed correctly, someone else may be trying to pair in the other \
+         device's place"
     )]
     WrongCode,
-    #[error("the other device did not confirm the pairing code; most likely it was typed wrong")]
+    #[error(
+        "the other device did not confirm the pairing code; most likely it was typed \
+         wrong, or it was an older code that had already expired"
+    )]
     NotConfirmed,
     #[error(
         "the other device claimed a public key that is not the one it proved on the \

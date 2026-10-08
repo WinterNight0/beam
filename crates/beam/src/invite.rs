@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{DEFAULT_RELAY, Relay};
 use crate::identity::{Fingerprint, Peer, ShortId};
-use crate::transport::endpoint::{endpoint_id, verifying_key};
+use crate::transport::endpoint::{endpoint_id, is_public, verifying_key};
 
 /// Every invite starts with this, so it is recognisable and versioned.
 pub const PREFIX: &str = "beam1";
@@ -123,6 +123,22 @@ impl Invite {
         }
     }
 
+    /// Puts `extra` addresses first, then the discovered ones, within the
+    /// usual limit. `advertise` in `config.toml` uses this for a public
+    /// address beam cannot discover itself, such as a port forwarded by hand
+    /// with no relay (ADR-0038).
+    pub fn with_advertised(mut self, extra: &[SocketAddr]) -> Self {
+        let mut addrs: Vec<SocketAddr> = extra.to_vec();
+        for addr in self.addrs {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+        addrs.truncate(MAX_ADDRS);
+        self.addrs = addrs;
+        self
+    }
+
     /// The Short ID of the device. Pairing binds the code to it (ADR-0026),
     /// and both sides derive it from the key.
     pub fn short_id(&self) -> ShortId {
@@ -203,7 +219,11 @@ impl Invite {
                 let len = reader.byte()? as usize;
                 let text =
                     std::str::from_utf8(reader.take(len)?).map_err(|_| InviteError::Malformed)?;
-                Some(parse_relay(text).ok_or(InviteError::Malformed)?)
+                // A relay this device will not use from an invite (plain
+                // http, or a local host) is dropped rather than refused: the
+                // joiner falls back to its own relay, and the key and
+                // addresses are still good (ADR-0038).
+                parse_relay(text)
             }
             _ => return Err(InviteError::Malformed),
         };
@@ -258,6 +278,16 @@ impl FromStr for Invite {
     }
 }
 
+/// The `relay=` value `remember` would save for `invite`: its relay, unless
+/// that is this device's own.
+pub fn relay_attr(invite: &Invite, own_relay: &Relay) -> Option<String> {
+    invite
+        .relay
+        .as_ref()
+        .filter(|relay| !matches!(own_relay, Relay::Url(own) if own == *relay))
+        .map(|relay| relay.to_string())
+}
+
 /// Saves where `invite` says its device can be found on that device's entry.
 ///
 /// Only *where* changes. The key is not touched here or anywhere else: a new
@@ -266,12 +296,7 @@ impl FromStr for Invite {
 /// if it ever changes.
 pub fn remember(peer: &mut Peer, invite: &Invite, own_relay: &Relay) {
     debug_assert_eq!(peer.public_key, invite.key, "an invite for another key");
-    let relay = invite
-        .relay
-        .as_ref()
-        .filter(|relay| !matches!(own_relay, Relay::Url(own) if own == *relay))
-        .map(|relay| relay.to_string());
-    peer.set_attr(RELAY_ATTR, relay);
+    peer.set_attr(RELAY_ATTR, relay_attr(invite, own_relay));
     let addrs = (!invite.addrs.is_empty()).then(|| {
         invite
             .addrs
@@ -320,13 +345,31 @@ fn is_default_relay(relay: &RelayUrl) -> bool {
     *relay == default_relay()
 }
 
-/// An `http(s)` relay URL short enough for an invite.
+/// A relay URL this device will accept from an invite or a saved `relay=`:
+/// `https://`, short enough, and not naming a host on this machine or the
+/// local network.
+///
+/// A crafted invite must not make beam open connections to a router's admin
+/// page or other local services, or talk to a relay in plain text. A relay
+/// of your own over `http://` belongs in `config.toml`, which is yours to
+/// write (ADR-0038).
 fn parse_relay(text: &str) -> Option<RelayUrl> {
-    if text.len() > MAX_RELAY_LEN || !(text.starts_with("https://") || text.starts_with("http://"))
-    {
+    if text.len() > MAX_RELAY_LEN || !text.starts_with("https://") {
         return None;
     }
-    text.parse().ok()
+    let url: RelayUrl = text.parse().ok()?;
+    let local = match url.host_str() {
+        // IPv6 hosts come in brackets.
+        Some(host) => match host.trim_start_matches('[').trim_end_matches(']').parse() {
+            Ok(ip) => !is_public(ip),
+            Err(_) => {
+                let name = host.trim_end_matches('.').to_ascii_lowercase();
+                name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local")
+            }
+        },
+        None => true,
+    };
+    (!local).then_some(url)
 }
 
 /// Reads an invite's bytes in order, failing on a short read.
@@ -486,6 +529,53 @@ mod tests {
     }
 
     #[test]
+    fn an_http_or_local_relay_in_an_invite_is_dropped_not_used() {
+        for relay in [
+            "http://relay.example.org/",
+            "https://192.168.1.1/",
+            "https://10.0.0.1:8443/",
+            "https://127.0.0.1/",
+            "https://[::1]/",
+            "https://localhost/",
+            "https://router.local/",
+        ] {
+            let mut original = invite(None, &["192.168.1.20:7820"]);
+            original.relay = Some(relay.parse().unwrap());
+            let parsed: Invite = original.to_string().parse().unwrap();
+            assert_eq!(parsed.relay, None, "{relay} was kept");
+            assert_eq!(parsed.key, original.key, "{relay}: the rest still counts");
+            assert_eq!(parsed.addrs, original.addrs);
+        }
+        // A public https relay is kept.
+        let ok = invite(Some("https://relay.example.org/"), &[]);
+        assert_eq!(ok.to_string().parse::<Invite>().unwrap(), ok);
+    }
+
+    #[test]
+    fn advertised_addresses_come_first_without_duplicates() {
+        let discovered = invite(None, &["192.168.1.20:7820", "10.0.0.5:7820"]);
+        let with = discovered.with_advertised(&[
+            "203.0.113.7:7820".parse().unwrap(),
+            "10.0.0.5:7820".parse().unwrap(),
+        ]);
+        assert_eq!(
+            with.addrs,
+            [
+                "203.0.113.7:7820".parse::<SocketAddr>().unwrap(),
+                "10.0.0.5:7820".parse().unwrap(),
+                "192.168.1.20:7820".parse().unwrap(),
+            ]
+        );
+        let many: Vec<SocketAddr> = (1..=10)
+            .map(|i| format!("203.0.113.{i}:7820").parse().unwrap())
+            .collect();
+        assert_eq!(
+            invite(None, &[]).with_advertised(&many).addrs.len(),
+            MAX_ADDRS
+        );
+    }
+
+    #[test]
     fn link_local_and_unspecified_addresses_are_left_out_and_ipv4_comes_first() {
         let addr = EndpointAddr::new(endpoint_id(&vectors::verifying_key("alpha")))
             .with_ip_addr("[fe80::1]:7820".parse().unwrap())
@@ -564,7 +654,7 @@ mod tests {
     #[test]
     fn a_hand_edited_attribute_that_does_not_parse_is_skipped() {
         let mut alice = peer();
-        alice.set_attr(RELAY_ATTR, Some("ftp://nope".into()));
+        alice.set_attr(RELAY_ATTR, Some("http://192.168.1.1/".into()));
         alice.set_attr(ADDRS_ATTR, Some("nonsense,10.0.0.5:7820".into()));
         let addr = peer_addr(&alice, &Relay::Disabled);
         assert!(addr.relay_urls().next().is_none());

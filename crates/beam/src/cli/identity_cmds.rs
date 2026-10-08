@@ -4,6 +4,8 @@ use serde::Serialize;
 
 use super::{App, CommandError, Io};
 use crate::identity::{Identity, KEY_TYPE, Peer, PeerError, StoreError, encode_public_key};
+use crate::listen_status::{self, ListenStatus, Listening, PairingStatus};
+use crate::pairing::PairingCode;
 use crate::ui;
 
 /// The `--json` shape of `beam whoami` and `beam init`.
@@ -16,6 +18,30 @@ struct SelfJson {
     #[serde(skip_serializing_if = "String::is_empty")]
     comment: String,
     dir: String,
+    /// What a running `beam listen` offers, or `null` (ADR-0037). Only
+    /// `whoami` fills it in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listening: Option<ListeningJson>,
+    /// Whether the background agent runs, and where it saves (ADR-0042).
+    /// Never its token. Only `whoami` fills it in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentJson>,
+}
+
+#[derive(serde::Serialize)]
+struct AgentJson {
+    running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receive_dir: Option<String>,
+}
+
+/// The `--json` shape of a running `listen`, as `whoami` sees it.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ListeningJson {
+    Status(ListenStatus),
+    Unreadable { unreadable: bool },
+    No(()),
 }
 
 /// The `--json` shape of one entry of `beam peers`.
@@ -39,6 +65,8 @@ impl App {
             public_key: encode_public_key(&identity.verifying_key()),
             comment: identity.comment().to_string(),
             dir: self.store.dir().display().to_string(),
+            listening: None,
+            agent: None,
         }
     }
 
@@ -78,9 +106,31 @@ impl App {
 
     pub(super) fn whoami(&self, io: &mut Io<'_>) -> Result<(), CommandError> {
         let identity = self.store.load_identity()?;
+        let listening = listen_status::read(&self.store);
+        let agent = crate::agent::status::read(&self.store);
 
         if self.json {
-            return write_json(io, &self.self_json(&identity));
+            let mut json = self.self_json(&identity);
+            json.listening = Some(match listening {
+                Listening::Yes(status) => ListeningJson::Status(status),
+                Listening::Unreadable => ListeningJson::Unreadable { unreadable: true },
+                Listening::No => ListeningJson::No(()),
+            });
+            json.agent = Some(match agent {
+                crate::agent::status::Running::Yes(status) => AgentJson {
+                    running: true,
+                    receive_dir: Some(status.receive_dir),
+                },
+                crate::agent::status::Running::Unreadable => AgentJson {
+                    running: true,
+                    receive_dir: None,
+                },
+                crate::agent::status::Running::No => AgentJson {
+                    running: false,
+                    receive_dir: None,
+                },
+            });
+            return write_json(io, &json);
         }
         ui::field(io.out, "Short ID", &identity.short_id().grouped())?;
         ui::field(io.out, "Fingerprint", &identity.fingerprint().to_string())?;
@@ -93,6 +143,21 @@ impl App {
             ),
         )?;
         ui::field(io.out, "Directory", &self.store.dir().display().to_string())?;
+        writeln!(io.out)?;
+        show_listening(io, &listening)?;
+        if let crate::agent::status::Running::Yes(status) = agent {
+            let who = if status.in_view {
+                "beam's full-screen view is receiving (until it closes)"
+            } else {
+                "The background agent is running"
+            };
+            writeln!(
+                io.out,
+                "{who}: paired devices can send files, which you answer in the view's Pending \
+                 tab or with `beam inbox`.\nIt saves them to {}.",
+                crate::untrusted::name(&status.receive_dir)
+            )?;
+        }
         self.warn_permissions(io);
         Ok(())
     }
@@ -192,7 +257,7 @@ pub(super) fn write_json<T: Serialize>(io: &mut Io<'_>, value: &T) -> Result<(),
 
 /// A best-effort machine name for the public key comment. It is cosmetic, so a
 /// missing value is not an error.
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     for key in ["COMPUTERNAME", "HOSTNAME"] {
         if let Ok(name) = std::env::var(key)
             && !name.trim().is_empty()
@@ -201,4 +266,72 @@ fn hostname() -> String {
         }
     }
     String::new()
+}
+
+/// The part of `whoami` about a running `listen`: its invite and the pairing
+/// code that works right now (ADR-0037).
+fn show_listening(io: &mut Io<'_>, listening: &Listening) -> std::io::Result<()> {
+    let status = match listening {
+        Listening::No => {
+            return writeln!(
+                io.out,
+                "beam listen is not running. Run it to pair with a device or receive files."
+            );
+        }
+        Listening::Unreadable => {
+            return writeln!(
+                io.out,
+                "beam listen is running, but what it offers could not be read. \
+                 Restart it to see its invite and pairing code."
+            );
+        }
+        Listening::Yes(status) => status,
+    };
+    let now = listen_status::unix(std::time::SystemTime::now());
+    writeln!(io.out, "beam listen is running:")?;
+    ui::field(io.out, "Invite", &status.invite)?;
+    match &status.pairing {
+        PairingStatus::Live { code, expires_at } => {
+            let grouped = PairingCode::parse(code)
+                .map(|c| c.grouped())
+                .unwrap_or_else(|_| code.clone());
+            ui::field(io.out, "Pairing code", &grouped)?;
+            let left = expires_at.saturating_sub(now);
+            let when = if left == 0 {
+                "now; run `beam whoami` again in a moment for the next one".to_string()
+            } else {
+                format!("in {}", minutes(left))
+            };
+            ui::field(io.out, "Code expires", &when)?;
+        }
+        PairingStatus::InUse => ui::field(
+            io.out,
+            "Pairing code",
+            "in use: a device is pairing right now",
+        )?,
+        PairingStatus::Paused { until } => ui::field(
+            io.out,
+            "Pairing code",
+            &format!(
+                "none: paused for {} s after a failed attempt",
+                until.saturating_sub(now).max(1)
+            ),
+        )?,
+        PairingStatus::Off { failures } => ui::field(
+            io.out,
+            "Pairing code",
+            &format!(
+                "none: pairing is off after {failures} failed attempts; restart `beam listen`"
+            ),
+        )?,
+    }
+    Ok(())
+}
+
+/// Whole minutes, rounded up, in words.
+fn minutes(secs: u64) -> String {
+    match secs.div_ceil(60) {
+        1 => "1 minute".to_string(),
+        n => format!("{n} minutes"),
+    }
 }

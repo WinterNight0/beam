@@ -1214,3 +1214,347 @@ async fn a_sender_turned_away_as_busy_is_told_to_try_later() {
     assert!(sent.unwrap_err().to_string().contains("another file"));
     assert!(std::fs::read_dir(&dirs.out).unwrap().next().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Several chunks in flight, and checking the sender's own reads (ADR-0040)
+// ---------------------------------------------------------------------------
+
+/// Plays the receiving side's reading by hand: one CHUNK_START and its data.
+async fn read_chunk_by_hand(server: &mut tokio::io::DuplexStream) -> (u32, Vec<u8>) {
+    let start = match read_message(server).await.expect("read") {
+        Message::ChunkStart(start) => start,
+        other => panic!("expected CHUNK_START, got {}", other.kind_name()),
+    };
+    let mut body = Vec::new();
+    loop {
+        match read_message(server).await.expect("read") {
+            Message::ChunkData { index, bytes } => {
+                assert_eq!(index, start.index);
+                body.extend_from_slice(&bytes);
+            }
+            other => panic!("expected CHUNK_DATA, got {}", other.kind_name()),
+        }
+        if body.len() >= start.len as usize {
+            break;
+        }
+    }
+    (start.index, body)
+}
+
+/// Plays the sending side's writing by hand: one chunk, announced with
+/// `digest` (which may not match `body`, to provoke a NAK).
+async fn write_chunk_by_hand(
+    client: &mut tokio::io::DuplexStream,
+    index: u32,
+    body: &[u8],
+    digest: &str,
+) {
+    write_message(
+        client,
+        &Message::ChunkStart(ChunkStart {
+            index,
+            len: body.len() as u32,
+            sha256: digest.to_string(),
+        }),
+    )
+    .await
+    .expect("write chunk start");
+    for slice in body.chunks(beam::transfer::MAX_CHUNK_DATA) {
+        write_message(
+            client,
+            &Message::ChunkData {
+                index,
+                bytes: slice.to_vec(),
+            },
+        )
+        .await
+        .expect("write chunk data");
+    }
+}
+
+/// ADR-0040, sender side: no more than `PIPELINE_WINDOW` chunks go out before
+/// their answers, and a rejected chunk is re-sent after the others rather
+/// than holding them up (option B).
+#[tokio::test]
+async fn the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_one() {
+    const CHUNK: u32 = 1000;
+    let identity = Identity::generate("sender").expect("generate");
+    let dirs = dirs();
+    let bytes = payload(6 * CHUNK as usize);
+    let path = write_file(&dirs.files, "window.bin", &bytes);
+
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let mut options = SendOptions::new(path, encode_public_key(&identity.verifying_key()));
+    options.chunk_size = CHUNK;
+    assert_eq!(options.window, beam::transfer::PIPELINE_WINDOW);
+    let send = tokio::spawn(async move {
+        let mut client = client;
+        send_file(&mut client, &options, &mut SilentReporter).await
+    });
+
+    let transfer_id = match read_message(&mut server).await.expect("read") {
+        Message::TransferRequest(request) => request.transfer_id,
+        other => panic!("unexpected {}", other.kind_name()),
+    };
+    write_message(
+        &mut server,
+        &Message::Accept(beam::transfer::Accept {
+            transfer_id,
+            have_bitmap: None,
+        }),
+    )
+    .await
+    .expect("write accept");
+
+    // A full window arrives without any answer...
+    let window = beam::transfer::PIPELINE_WINDOW as usize;
+    let mut first = Vec::new();
+    for _ in 0..window {
+        first.push(read_chunk_by_hand(&mut server).await.0);
+    }
+    assert_eq!(first, [0, 1, 2, 3]);
+    // ...and nothing more until something is answered.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), read_message(&mut server))
+            .await
+            .is_err(),
+        "the sender went past its window"
+    );
+
+    let ack = |index| Message::ChunkAck(beam::transfer::ChunkAck { index });
+    write_message(&mut server, &ack(0)).await.unwrap();
+    write_message(
+        &mut server,
+        &Message::ChunkNak(beam::transfer::ChunkNak {
+            index: 1,
+            reason: beam::transfer::NakReason::HashMismatch,
+        }),
+    )
+    .await
+    .unwrap();
+    write_message(&mut server, &ack(2)).await.unwrap();
+    write_message(&mut server, &ack(3)).await.unwrap();
+
+    // The rest, with chunk 1 again, then COMPLETE.
+    let mut rest = Vec::new();
+    for _ in 0..3 {
+        let (index, body) = read_chunk_by_hand(&mut server).await;
+        let start = (index * CHUNK) as usize;
+        assert_eq!(body, bytes[start..start + CHUNK as usize]);
+        rest.push(index);
+        write_message(&mut server, &ack(index)).await.unwrap();
+    }
+    rest.sort_unstable();
+    assert_eq!(
+        rest,
+        [1, 4, 5],
+        "the rejected chunk was not re-sent exactly once"
+    );
+    assert!(matches!(
+        read_message(&mut server).await.expect("read"),
+        Message::Complete(_)
+    ));
+    write_message(
+        &mut server,
+        &Message::Complete(beam::transfer::Complete {
+            transfer_id,
+            final_name: Some("window.bin".to_string()),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let summary = send.await.expect("task").expect("send");
+    assert_eq!(summary.bytes_sent, bytes.len() as u64);
+}
+
+/// ADR-0040, receiver side: chunks may arrive in any order, and a rejected
+/// chunk may come back after others. The file is still exactly right.
+#[tokio::test]
+async fn the_receiver_takes_missing_chunks_in_any_order() {
+    const CHUNK: u32 = 64 * 1024;
+    let pair = paired();
+    let dirs = dirs();
+    let bytes = payload(3 * CHUNK as usize);
+    let expected = bytes.clone();
+    let sender_key = encode_public_key(&pair.sender.verifying_key());
+
+    let (mut client, server) = tokio::io::duplex(1024 * 1024);
+    let sender = tokio::spawn(async move {
+        let transfer_id = TransferId::generate().expect("id");
+        write_message(
+            &mut client,
+            &Message::TransferRequest(TransferRequest {
+                transfer_id,
+                sender_public_key: sender_key,
+                file_name: "shuffled.bin".to_string(),
+                size: bytes.len() as u64,
+                chunk_size: CHUNK,
+                chunk_count: 3,
+                file_sha256: beam::transfer::sha256_hex(&bytes),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message(&mut client).await.unwrap(),
+            Message::Accept(_)
+        ));
+
+        let chunk = |i: u32| bytes[(i * CHUNK) as usize..((i + 1) * CHUNK) as usize].to_vec();
+        let mut bad = chunk(0);
+        bad[0] ^= 0xff;
+        // 2, then a corrupted 0, then 1, then 0 again: all in flight at once.
+        let plan: [(u32, Vec<u8>); 4] = [(2, chunk(2)), (0, bad), (1, chunk(1)), (0, chunk(0))];
+        for (index, body) in &plan {
+            let digest = beam::transfer::sha256_hex(&chunk(*index));
+            write_chunk_by_hand(&mut client, *index, body, &digest).await;
+        }
+        let mut answers = Vec::new();
+        for _ in 0..plan.len() {
+            answers.push(match read_message(&mut client).await.unwrap() {
+                Message::ChunkAck(a) => format!("ack {}", a.index),
+                Message::ChunkNak(n) => format!("nak {}", n.index),
+                other => panic!("unexpected {}", other.kind_name()),
+            });
+        }
+        write_message(
+            &mut client,
+            &Message::Complete(beam::transfer::Complete {
+                transfer_id,
+                final_name: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = read_message(&mut client).await;
+        answers
+    });
+
+    let received = receive_file(
+        server,
+        &pair.receiver_known_peers,
+        &options_for(&dirs),
+        ScriptedPrompt::new(true),
+        &mut SilentReporter,
+        &mut HashSet::new(),
+    )
+    .await
+    .expect("receive");
+
+    assert_eq!(sender.await.unwrap(), ["ack 2", "nak 0", "ack 1", "ack 0"]);
+    assert_eq!(
+        std::fs::read(dirs.out.join(&received.final_name)).unwrap(),
+        expected
+    );
+}
+
+/// ADR-0040: any order does not mean anything goes. A chunk that already
+/// arrived, or one outside the transfer, ends it, and nothing is saved.
+#[tokio::test]
+async fn a_duplicate_or_unknown_chunk_is_refused() {
+    const CHUNK: u32 = 64 * 1024;
+    for (case, second) in [("duplicate", 0u32), ("outside the transfer", 7)] {
+        let pair = paired();
+        let dirs = dirs();
+        let bytes = payload(3 * CHUNK as usize);
+        let sender_key = encode_public_key(&pair.sender.verifying_key());
+
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        let sender = tokio::spawn(async move {
+            let transfer_id = TransferId::generate().expect("id");
+            write_message(
+                &mut client,
+                &Message::TransferRequest(TransferRequest {
+                    transfer_id,
+                    sender_public_key: sender_key,
+                    file_name: "refused.bin".to_string(),
+                    size: bytes.len() as u64,
+                    chunk_size: CHUNK,
+                    chunk_count: 3,
+                    file_sha256: beam::transfer::sha256_hex(&bytes),
+                }),
+            )
+            .await
+            .unwrap();
+            let _ = read_message(&mut client).await;
+            let body = bytes[..CHUNK as usize].to_vec();
+            let digest = beam::transfer::sha256_hex(&body);
+            write_chunk_by_hand(&mut client, 0, &body, &digest).await;
+            write_chunk_by_hand(&mut client, second, &body, &digest).await;
+            // Keep the pipe open until the receiver has decided.
+            while read_message(&mut client).await.is_ok() {}
+        });
+
+        let received = receive_file(
+            server,
+            &pair.receiver_known_peers,
+            &options_for(&dirs),
+            ScriptedPrompt::new(true),
+            &mut SilentReporter,
+            &mut HashSet::new(),
+        )
+        .await;
+        assert!(
+            matches!(received, Err(TransferError::BadRequest(_))),
+            "{case}: expected BadRequest, got {received:?}"
+        );
+        assert!(
+            std::fs::read_dir(&dirs.out).unwrap().next().is_none(),
+            "{case}: a file was saved"
+        );
+        sender.abort();
+    }
+}
+
+/// ADR-0040: the sender checks every chunk it reads against the hash it took
+/// before asking. A file changed (or cut short) after that is caught at the
+/// first chunk, before any of it is sent, and the receiver is told why.
+#[tokio::test]
+async fn a_file_changed_while_being_sent_is_caught_before_it_is_sent() {
+    for (case, change) in [("changed", 0usize), ("cut short", 1)] {
+        let identity = Identity::generate("sender").expect("generate");
+        let dirs = dirs();
+        let bytes = payload(5_000);
+        let path = write_file(&dirs.files, "moving.bin", &bytes);
+
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let options = SendOptions::new(path.clone(), encode_public_key(&identity.verifying_key()));
+        let send = tokio::spawn(async move {
+            let mut client = client;
+            send_file(&mut client, &options, &mut SilentReporter).await
+        });
+
+        // The request means the hashing is done; change the file now.
+        let transfer_id = match read_message(&mut server).await.expect("read") {
+            Message::TransferRequest(request) => request.transfer_id,
+            other => panic!("unexpected {}", other.kind_name()),
+        };
+        if change == 0 {
+            let mut edited = bytes.clone();
+            edited[100] ^= 0xff;
+            std::fs::write(&path, edited).unwrap();
+        } else {
+            std::fs::write(&path, &bytes[..1000]).unwrap();
+        }
+        write_message(
+            &mut server,
+            &Message::Accept(beam::transfer::Accept {
+                transfer_id,
+                have_bitmap: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(read_message(&mut server).await.unwrap(), Message::Cancel(_)),
+            "{case}: the receiver was not told; a chunk may have been sent"
+        );
+        let result = send.await.unwrap();
+        assert!(
+            matches!(result, Err(TransferError::SourceChanged { index: 0 })),
+            "{case}: expected SourceChanged, got {result:?}"
+        );
+    }
+}

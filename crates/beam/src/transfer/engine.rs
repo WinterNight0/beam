@@ -24,6 +24,17 @@ pub const DEFAULT_KEEPALIVE_EVERY: Duration = Duration::from_secs(1);
 /// How many times one chunk may be re-sent after a hash mismatch.
 pub const DEFAULT_CHUNK_ATTEMPTS: u32 = 3;
 
+/// How many chunks the sender may have sent but not yet had answered, when
+/// the receiver speaks `beam/xfer/2` (ADR-0040). Four 4 MiB chunks fill the
+/// 16 MiB QUIC stream window, so this changes no memory bound. With the old
+/// protocol, or one at a time, the line is idle for a round trip per chunk.
+pub const PIPELINE_WINDOW: u32 = 4;
+
+/// How many times the sender re-reads a chunk of its own file that does not
+/// match the hash taken before the transfer, before deciding the file has
+/// changed (ADR-0040).
+pub const SOURCE_READ_ATTEMPTS: u32 = 3;
+
 /// Why a transfer did not complete.
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
@@ -35,6 +46,12 @@ pub enum TransferError {
     /// The reason is the peer's text: shown only through `untrusted`.
     #[error("the transfer was cancelled: {}", crate::untrusted::text(.0))]
     Cancelled(String),
+
+    /// The person at the other device stopped beam (Ctrl+C) during the
+    /// transfer. Known from how the connection was closed, not from anything
+    /// the peer wrote (ADR-0041).
+    #[error("the other device stopped beam (Ctrl+C) and cancelled the transfer")]
+    PeerInterrupted,
 
     /// File bytes arrived before this side had sent ACCEPT (S-4).
     ///
@@ -68,6 +85,17 @@ pub enum TransferError {
     /// A chunk kept failing its hash.
     #[error("chunk {index} failed its hash {attempts} times; giving up")]
     ChunkFailed { index: u32, attempts: u32 },
+
+    /// The file being sent no longer matches what was hashed before the
+    /// request: it was changed while being sent, or the disk returned
+    /// different data each time it was read (ADR-0040).
+    #[error(
+        "the file changed while it was being sent, or the disk returned different data for it \
+         (chunk {index} no longer matches what was read before the transfer started); \
+         stopped, and the other side kept nothing of it. Send it again once the file is not \
+         being changed"
+    )]
+    SourceChanged { index: u32 },
 
     /// The assembled file did not match the hash promised for it.
     #[error("the finished file does not match the hash the sender promised; nothing was saved")]

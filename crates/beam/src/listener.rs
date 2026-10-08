@@ -20,7 +20,9 @@
 //! against real iroh endpoints.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::config::Relay;
+use crate::history::{self, Direction, Outcome};
 use crate::identity::{Fingerprint, Identity, Peer, Store};
 use crate::invite::Invite;
 use crate::pairing::rotation::{NewCodeReason, Notice, Policy, Rotation, Unavailable};
@@ -36,15 +39,21 @@ use crate::pairing::{
     Confirm, Network, Pairing, PairingCode, Timeouts, attempt_kind, refuse_connection, serve,
 };
 use crate::transfer::{
-    Prompt, ReceiveOptions, ReceiveSummary, RejectReason, Reporter, TransferId, receive_file,
-    turn_away,
+    Prompt, PromptRequest, ReceiveOptions, ReceiveSummary, RejectReason, Reporter, TransferId,
+    receive_file, turn_away,
 };
-use crate::transport::dial::watch_route;
-use crate::transport::endpoint::{self, EndpointError, PAIR_ALPN, XFER_ALPN, verifying_key};
+use crate::transport::dial::{interrupt, peer_interrupted, watch_route};
+use crate::transport::endpoint::{
+    self, EndpointError, PAIR_ALPN, XFER_ALPN, XFER_ALPN_V2, verifying_key,
+};
 
 /// How long to wait for the peer to close after the last message, so that
 /// message is not cut off by our own close.
 const LINGER: Duration = Duration::from_secs(5);
+
+/// When `listen` is stopped, how long a cancelled transfer gets to save what
+/// it received, and the endpoint to deliver its close frames.
+const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// What `listen` does, apart from the network.
 #[derive(Clone, Debug)]
@@ -59,6 +68,14 @@ pub struct ListenOptions {
     pub pairing: Policy,
     /// Pairing message and decision timeouts.
     pub timeouts: Timeouts,
+    /// Whether this listener pairs at all. The background agent does not: it
+    /// takes transfers from paired devices only, so nobody who finds it can
+    /// try pairing codes (ADR-0042). Off means the pairing protocol is not
+    /// even offered in the handshake.
+    pub allow_pairing: bool,
+    /// Whether iroh may ask the router to forward the port (UPnP, NAT-PMP,
+    /// PCP). `beam listen` does; the agent only if turned on (ADR-0042).
+    pub port_mapping: bool,
 }
 
 /// Something worth telling the person watching `listen`.
@@ -115,6 +132,15 @@ pub enum ListenEvent {
         peer: Fingerprint,
         error: String,
     },
+    /// The sender's user stopped beam (Ctrl+C) mid-transfer (ADR-0041).
+    TransferInterrupted {
+        peer: Fingerprint,
+    },
+    /// `listen` was stopped by its user. `cancelled` holds the peers whose
+    /// transfers were in progress; each was told (ADR-0041).
+    Stopped {
+        cancelled: Vec<Fingerprint>,
+    },
 }
 
 /// Why `listen` could not start.
@@ -140,6 +166,11 @@ struct Shared<Q, R> {
     prompt: Q,
     reporter: Box<dyn Fn() -> R + Send + Sync>,
     events: Box<dyn Fn(ListenEvent) + Send + Sync>,
+    /// Transfers in progress, to be told if `listen` is stopped.
+    active: Mutex<Vec<(Fingerprint, Connection)>>,
+    /// Set once `listen` is stopping, so a cancelled transfer is reported
+    /// once, as part of [`ListenEvent::Stopped`], not also as a failure.
+    stopping: AtomicBool,
 }
 
 impl<Q, R> Shared<Q, R> {
@@ -173,12 +204,53 @@ where
     Q: Prompt + Confirm + Clone + Send + Sync + 'static,
     R: Reporter + Send + 'static,
 {
-    let endpoint = endpoint::bind(
+    run_until(
+        identity,
+        store,
+        network,
+        options,
+        prompt,
+        reporter,
+        events,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// Like [`run`], and stops cleanly when `stop` completes: what `beam listen`
+/// does on Ctrl+C (ADR-0041). A transfer in progress is closed with
+/// [`CLOSE_INTERRUPTED`](crate::transport::dial::CLOSE_INTERRUPTED), so the
+/// sender is told at once; it keeps what it received, for a resume; and
+/// [`ListenEvent::Stopped`] says which transfers were cancelled.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_until<Q, R>(
+    identity: Identity,
+    store: Store,
+    network: Network,
+    options: ListenOptions,
+    prompt: Q,
+    reporter: impl Fn() -> R + Send + Sync + 'static,
+    events: impl Fn(ListenEvent) + Send + Sync + 'static,
+    stop: impl Future<Output = ()>,
+) -> Result<(), ListenError>
+where
+    Q: Prompt + Confirm + Clone + Send + Sync + 'static,
+    R: Reporter + Send + 'static,
+{
+    // Newest transfer protocol first: the TLS server picks the first of these
+    // that the sender offers (ADR-0040).
+    let alpns: &[&[u8]] = if options.allow_pairing {
+        &[PAIR_ALPN, XFER_ALPN_V2, XFER_ALPN]
+    } else {
+        &[XFER_ALPN_V2, XFER_ALPN]
+    };
+    let endpoint = endpoint::bind_with(
         &identity,
         &network.relay,
         network.bind,
         network.port,
-        &[PAIR_ALPN, XFER_ALPN],
+        alpns,
+        options.port_mapping,
     )
     .await?;
     let got = endpoint::bound_port(&endpoint).unwrap_or(0);
@@ -200,6 +272,8 @@ where
         prompt,
         reporter: Box::new(reporter),
         events: Box::new(events),
+        active: Mutex::new(Vec::new()),
+        stopping: AtomicBool::new(false),
     });
 
     // Dropping the set aborts everything in it, so nothing outlives `run`.
@@ -218,7 +292,8 @@ where
     // network reach this one. With no relay this is immediate.
     let invite = Invite::new(
         &endpoint::advertised_addr(&endpoint, &shared.network.relay, shared.network.bind).await,
-    );
+    )
+    .with_advertised(&shared.network.advertise);
     shared.tell(ListenEvent::Ready {
         invite,
         fingerprint: shared.identity.fingerprint(),
@@ -226,7 +301,15 @@ where
         relay: shared.network.relay.clone(),
     });
 
-    while let Some(incoming) = endpoint.accept().await {
+    let mut stop = std::pin::pin!(stop);
+    loop {
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => incoming,
+            () = &mut stop => break,
+        };
+        let Some(incoming) = incoming else {
+            return Ok(());
+        };
         // Reap finished handlers so the set does not grow without bound.
         while tasks.try_join_next().is_some() {}
         let shared = Arc::clone(&shared);
@@ -238,11 +321,27 @@ where
             let alpn = connection.alpn().to_vec();
             if alpn == PAIR_ALPN {
                 handle_pairing(&shared, connection).await;
-            } else if alpn == XFER_ALPN {
+            } else if alpn == XFER_ALPN_V2 || alpn == XFER_ALPN {
+                // One receiver serves both: it accepts any missing chunk in
+                // any order, of which one at a time is a special case.
                 handle_transfer(&shared, connection).await;
             }
         });
     }
+
+    // Stopped by the person at the keyboard. Tell every sender mid-transfer,
+    // let its handler save what arrived (its slot frees when it has), and
+    // give the close frames a moment to leave before the endpoint goes.
+    shared.stopping.store(true, Ordering::SeqCst);
+    let active: Vec<_> = std::mem::take(&mut *shared.active.lock().expect("not poisoned"));
+    for (_, connection) in &active {
+        interrupt(connection);
+    }
+    let _ = tokio::time::timeout(STOP_GRACE, shared.transfer_slot.acquire()).await;
+    shared.tell(ListenEvent::Stopped {
+        cancelled: active.into_iter().map(|(peer, _)| peer).collect(),
+    });
+    let _ = tokio::time::timeout(STOP_GRACE, endpoint.close()).await;
     Ok(())
 }
 
@@ -403,13 +502,21 @@ where
         return;
     };
 
+    // Counted as in progress from the moment it holds the slot: a sender
+    // still hashing its file has not opened its stream yet, and a stop must
+    // tell it too (ADR-0041).
+    shared
+        .active
+        .lock()
+        .expect("not poisoned")
+        .push((peer, connection.clone()));
+
     let (send, recv) = match connection.accept_bi().await {
         Ok(halves) => halves,
         Err(e) => {
-            shared.tell(ListenEvent::TransferFailed {
-                peer,
-                error: e.to_string(),
-            });
+            forget(shared, &connection);
+            drop(permit);
+            report_failure(shared, &connection, peer, e.to_string());
             return;
         }
     };
@@ -421,31 +528,138 @@ where
     options.proven_sender = Some(peer_key);
 
     let mut reporter = (shared.reporter)();
+    let asked = Arc::new(Mutex::new(None));
+    let prompt = Remembering {
+        inner: shared.prompt.clone(),
+        asked: Arc::clone(&asked),
+    };
     let result = {
         let mut seen = shared.seen.lock().await;
         receive_file(
             tokio::io::join(recv, send),
             &known,
             &options,
-            shared.prompt.clone(),
+            prompt,
             &mut reporter,
             &mut seen,
         )
         .await
     };
+    let asked = asked.lock().expect("not poisoned").take();
+    remember_in_history(shared, &connection, peer, asked, &result);
     drop(reporter);
+    forget(shared, &connection);
     // The transfer is over, whatever the peer does next: free the slot now,
     // not after lingering for its close below.
     drop(permit);
 
     match result {
         Ok(summary) => shared.tell(ListenEvent::Received(summary)),
-        Err(e) => shared.tell(ListenEvent::TransferFailed {
-            peer,
-            error: e.to_string(),
-        }),
+        Err(e) => {
+            if shared.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            report_failure(shared, &connection, peer, e.to_string());
+        }
     }
     linger_then_close(&connection).await;
+}
+
+/// The listener's prompt, noting what was asked and what the answer was, so
+/// the history can say which file was declined.
+#[derive(Clone)]
+struct Remembering<Q> {
+    inner: Q,
+    asked: Asked,
+}
+
+/// The request shown, and the answer once given.
+type Asked = Arc<Mutex<Option<(PromptRequest, Option<bool>)>>>;
+
+impl<Q: Prompt> Prompt for Remembering<Q> {
+    fn confirm(&mut self, request: &PromptRequest) -> std::io::Result<bool> {
+        *self.asked.lock().expect("not poisoned") = Some((request.clone(), None));
+        let answer = self.inner.confirm(request);
+        if let Ok(yes) = &answer
+            && let Some((_, said)) = self.asked.lock().expect("not poisoned").as_mut()
+        {
+            *said = Some(*yes);
+        }
+        answer
+    }
+}
+
+/// Writes the receiver's line in `history.jsonl` (ADR-0043): only for a
+/// request that reached a person, so a peer cannot fill it with requests
+/// refused before the prompt.
+fn remember_in_history<Q, R>(
+    shared: &Shared<Q, R>,
+    connection: &Connection,
+    peer: Fingerprint,
+    asked: Option<(PromptRequest, Option<bool>)>,
+    result: &Result<ReceiveSummary, crate::transfer::TransferError>,
+) {
+    let entry = match (result, asked) {
+        (Ok(summary), _) => history::Entry::now(
+            Direction::Received,
+            &summary.peer_name,
+            &summary.fingerprint,
+            &summary.final_name,
+            summary.bytes,
+            Outcome::Done,
+            summary.resumed.then(|| "resumed".to_string()),
+        ),
+        (Err(_), None) => return,
+        (Err(e), Some((request, answer))) => {
+            let (outcome, note) = if shared.stopping.load(Ordering::SeqCst) {
+                (Outcome::Cancelled, Some("you stopped beam".to_string()))
+            } else if answer == Some(false) {
+                (Outcome::Declined, None)
+            } else if peer_interrupted(connection) {
+                (Outcome::Cancelled, Some("they stopped beam".to_string()))
+            } else {
+                (Outcome::Failed, Some(e.to_string()))
+            };
+            history::Entry::now(
+                Direction::Received,
+                &request.peer_name,
+                &peer.to_string(),
+                &request.file_name,
+                request.size,
+                outcome,
+                note,
+            )
+        }
+    };
+    history::record(&shared.store, &entry);
+}
+
+/// No longer counts `connection` as a transfer in progress.
+fn forget<Q, R>(shared: &Shared<Q, R>, connection: &Connection) {
+    shared
+        .active
+        .lock()
+        .expect("not poisoned")
+        .retain(|(_, c)| c.stable_id() != connection.stable_id());
+}
+
+/// Says why a transfer ended early: the sender's user stopped it, or it
+/// failed. Nothing, if `listen` itself is stopping: [`ListenEvent::Stopped`]
+/// names those transfers, once.
+fn report_failure<Q, R>(
+    shared: &Shared<Q, R>,
+    connection: &Connection,
+    peer: Fingerprint,
+    error: String,
+) {
+    if shared.stopping.load(Ordering::SeqCst) {
+        return;
+    }
+    if peer_interrupted(connection) {
+        shared.tell(ListenEvent::TransferInterrupted { peer });
+    } else {
+        shared.tell(ListenEvent::TransferFailed { peer, error });
+    }
 }
 
 /// The sender closes once it has read our last message; wait for that rather

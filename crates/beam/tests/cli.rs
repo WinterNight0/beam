@@ -137,6 +137,25 @@ fn whoami_reports_the_key_on_disk() {
     );
 }
 
+/// ADR-0037: `whoami` says whether `listen` is running, and without it there
+/// is no code to show.
+#[test]
+fn whoami_says_when_listen_is_not_running() {
+    let (_tmp, dir) = initialised();
+    let text = run(&dir, "", &["whoami"]);
+    assert_eq!(text.code, EXIT_OK, "{}", text.stderr);
+    assert!(
+        text.stdout.contains("beam listen is not running"),
+        "{}",
+        text.stdout
+    );
+    assert!(!text.stdout.contains("Pairing code"), "{}", text.stdout);
+
+    let json = run(&dir, "", &["whoami", "--json"]);
+    let json: Value = serde_json::from_str(&json.stdout).expect("valid JSON");
+    assert!(json["listening"].is_null(), "{json}");
+}
+
 #[test]
 fn whoami_without_an_identity_points_at_init() {
     let (_tmp, dir) = beam_dir();
@@ -357,6 +376,32 @@ fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
             outcome.stderr
         );
     }
+
+    // The attempt is in the history, as a failure to reach alice (ADR-0043).
+    let history = beam::history::read(&store);
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0].direction, beam::history::Direction::Sent);
+    assert_eq!(history[0].outcome, beam::history::Outcome::Failed);
+    assert_eq!(history[0].file, "note.txt");
+    assert_eq!(
+        history[0].fingerprint,
+        Store::new(&dir)
+            .load_known_peers()
+            .unwrap()
+            .lookup("alice")
+            .unwrap()
+            .fingerprint()
+            .hex()
+    );
+    let shown = run(&dir, "", &["history"]);
+    assert!(
+        shown.stdout.contains("sent to alice") && shown.stdout.contains("failed"),
+        "{}",
+        shown.stdout
+    );
+    let cleared = run(&dir, "", &["history", "--clear", "--yes"]);
+    assert_eq!(cleared.code, EXIT_OK, "{}", cleared.stderr);
+    assert!(beam::history::read(&store).is_empty());
 }
 
 /// With the relay off and no address saved there is nowhere to look; beam says
@@ -540,6 +585,87 @@ fn pair_with_a_name_that_is_taken_fails_before_the_network() {
         "{}",
         outcome.stderr
     );
+}
+
+/// ADR-0038 (F-1): an invite that would move a paired device to a different
+/// relay is not applied without a yes — a peer's key is public, so anyone can
+/// make such an invite, and a relay sees when you send and can block it.
+#[test]
+fn an_invite_that_changes_a_peers_relay_needs_a_yes() {
+    let (_tmp, dir) = initialised();
+    seed_peers(&dir);
+    let store = Store::new(&dir);
+    let key = store
+        .load_known_peers()
+        .unwrap()
+        .lookup("alice")
+        .unwrap()
+        .public_key;
+    let invite = beam::invite::Invite {
+        key,
+        relay: Some("https://relay.example.org/".parse().unwrap()),
+        addrs: vec!["203.0.113.7:7820".parse().unwrap()],
+    }
+    .to_string();
+
+    // Refused: nothing at all is saved, not even the addresses.
+    let no = run(&dir, "n\n", &["pair", &invite, "--name", "alice"]);
+    assert_eq!(no.code, EXIT_OK, "{}", no.stderr);
+    for needle in [
+        "different relay",
+        "https://relay.example.org/",
+        "can block it",
+        "Nothing was changed",
+    ] {
+        assert!(
+            no.stdout.contains(needle),
+            "no {needle:?} in: {}",
+            no.stdout
+        );
+    }
+    let alice = store.load_known_peers().unwrap();
+    let alice = alice.lookup("alice").unwrap();
+    assert_eq!(alice.attr("relay"), None);
+    assert_eq!(alice.attr("addrs"), None);
+
+    // Accepted: the relay and the addresses are saved; the key never changes.
+    let yes = run(&dir, "y\n", &["pair", &invite, "--name", "alice"]);
+    assert_eq!(yes.code, EXIT_OK, "{}", yes.stderr);
+    let known = store.load_known_peers().unwrap();
+    let alice = known.lookup("alice").unwrap();
+    assert_eq!(alice.attr("relay"), Some("https://relay.example.org/"));
+    assert_eq!(alice.attr("addrs"), Some("203.0.113.7:7820"));
+    assert_eq!(alice.public_key, key);
+
+    // The same invite again changes nothing about the relay, so it is not asked.
+    let again = run(&dir, "", &["pair", &invite, "--name", "alice"]);
+    assert_eq!(again.code, EXIT_OK, "{}", again.stderr);
+    assert!(
+        !again.stdout.contains("different relay"),
+        "{}",
+        again.stdout
+    );
+}
+
+/// A config for testing direct connections without a relay is accepted, and
+/// a broken `advertise` entry names the file.
+#[test]
+fn a_no_relay_config_with_an_advertised_address_is_accepted() {
+    let (_tmp, dir) = initialised();
+    std::fs::write(
+        dir.join("config.toml"),
+        "relay = \"none\"\nport = 7820\nadvertise = [\"203.0.113.7:7820\"]\n",
+    )
+    .unwrap();
+    let config = beam::config::Config::load(&dir.join("config.toml")).unwrap();
+    assert_eq!(config.relay, beam::config::Relay::Disabled);
+    assert_eq!(config.advertise.len(), 1);
+
+    std::fs::write(dir.join("config.toml"), "advertise = [\"my-pc:7820\"]\n").unwrap();
+    let outcome = run(&dir, "", &["pair", "--wait", "--name", "alice"]);
+    assert_eq!(outcome.code, EXIT_ERROR);
+    assert!(outcome.stderr.contains("config.toml"), "{}", outcome.stderr);
+    assert!(outcome.stderr.contains("advertise"), "{}", outcome.stderr);
 }
 
 /// ADR-0036: the invite of a device that is already paired updates where to
@@ -826,4 +952,47 @@ fn an_ambiguous_transfer_id_is_refused_rather_than_guessed() {
         run(&dir, "", &["transfers"]).stdout.contains("one.zip"),
         "an ambiguous id deleted something anyway"
     );
+}
+
+#[test]
+fn beam_ui_switches_what_plain_beam_opens_and_keeps_the_rest_of_the_config() {
+    let (_tmp, dir) = beam_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    fs::write(&config, "# mine\nport = 0\n").unwrap();
+
+    let shown = run(&dir, "", &["ui"]);
+    assert_eq!(shown.code, EXIT_OK, "{}", shown.stderr);
+    assert!(
+        shown.stdout.contains("opens the full-screen view"),
+        "{}",
+        shown.stdout
+    );
+
+    let cli = run(&dir, "", &["ui", "cli"]);
+    assert_eq!(cli.code, EXIT_OK, "{}", cli.stderr);
+    assert!(cli.stdout.contains("now prints the help"), "{}", cli.stdout);
+    let text = fs::read_to_string(&config).unwrap();
+    assert_eq!(text, "# mine\nport = 0\nui = \"cli\"\n");
+
+    let json = run(&dir, "", &["--json", "ui"]);
+    let value: Value = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(value["ui"], "cli");
+
+    let tui = run(&dir, "", &["ui", "tui"]);
+    assert_eq!(tui.code, EXIT_OK, "{}", tui.stderr);
+    assert_eq!(fs::read_to_string(&config).unwrap(), "# mine\nport = 0\n");
+
+    let bad = run(&dir, "", &["ui", "gui"]);
+    assert_eq!(bad.code, EXIT_ERROR);
+}
+
+#[test]
+fn arguments_never_open_the_full_screen_view() {
+    // `--beam-dir` alone is an argument: the help, not the view.
+    let (_tmp, dir) = beam_dir();
+    let outcome = run(&dir, "", &[]);
+    assert_eq!(outcome.code, EXIT_OK, "{}", outcome.stderr);
+    assert!(outcome.stdout.contains("Usage"), "{}", outcome.stdout);
+    assert!(outcome.stdout.contains("beam ui cli"), "{}", outcome.stdout);
 }

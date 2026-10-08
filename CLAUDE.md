@@ -13,6 +13,7 @@ routed through any server.
 ## Core user experience
 
 ```
+beam                           # full-screen view (ADR-0043); `beam ui cli` turns it off
 beam init                      # generate device keypair (once per machine)
 beam listen                    # wait for transfers; shows invite + pairing code
 beam pair <INVITE> --name alice  # first-time pairing using invite + pairing code
@@ -22,6 +23,10 @@ beam peers                     # list paired peers + fingerprints
 beam rename alice ali
 beam remove alice
 beam whoami                    # show own ID + fingerprint
+beam service enable            # optional background agent (ADR-0042)
+beam inbox                     # accept/decline what the agent holds
+beam receive-dir <folder>      # where received files go
+beam history                   # what came and went (ADR-0043)
 ```
 
 ## Non-negotiable rules
@@ -50,6 +55,8 @@ beam whoami                    # show own ID + fingerprint
 - Build: cargo workspace; `make check` = `cargo fmt --check` + `cargo clippy -D warnings`
   + `cargo test`. `unsafe_code = "forbid"` workspace-wide.
 - CLI: `clap` (derive).
+- Full-screen view: `ratatui` 0.30 with its `crossterm` backend (through ratatui's
+  re-export), approved for ADR-0043. Plain `beam` on a terminal opens it.
 - Identity keys: Ed25519 (`ed25519-dalek`), PKCS#8 PEM via the `pkcs8` feature.
 - Pairing: `spake2` (PAKE). Check that it is maintained before adopting; propose
   alternatives if not.
@@ -154,10 +161,66 @@ own workspace crates only if compile times demand it.
 - **Post-M6 (ADR-0036)** No rendezvous server: `listen` shows an invite, `beam pair
   <INVITE>` pairs, peers are dialled by key through the relay and saved addresses,
   `listen` binds a fixed port (7820). Merged 2026-10-02 after a cross-network test.
-- **Next (to be planned before coding):** throughput. Known limits: QUIC stream window
-  1.25 MB (noq default), one 4 MiB chunk in flight at a time, two fsyncs per chunk,
-  n0's public relay being rate-limited.
-- Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.
+- **Post-M6 (ADR-0037)** `listen` prints its code once; `beam whoami` shows the live
+  invite and code from `~/.beam/listen.json` (trusted only while `listen.lock` is held);
+  a joiner with a wrong code is told it may have expired.
+- **Post-M6 (ADR-0038)** Security review: relay changes via invite need a yes; invite
+  relays must be `https://` on public hosts; CI read-only, actions pinned, `cargo audit`;
+  `advertise` config for direct testing. Open: R-8 (scannable `listen`), to be planned.
+  `SECURITY.md` holds the audit results and must be updated with each new check.
+- **Post-M6 (ADR-0039)** Throughput steps 1-4: `tests/throughput.rs` benchmark (ignored;
+  run in release, `BEAM_BENCH_RTT_MS` adds delay), QUIC stream window 16 MiB and
+  connection window 32 MiB; each chunk recorded at once, disk flushed in batches (8 chunks
+  / 32 MiB, and when a transfer stops); `reverify` on resume is what makes an unflushed
+  record safe. Measure any speed change with the benchmark.
+- **Post-M6 (ADR-0040)** Throughput step 5: up to 4 chunks in flight on ALPN
+  `beam/xfer/2` (sender offers `/2` and `/1`; `listen` prefers `/2`; `/1` = one at a time).
+  A NAK'd chunk is re-sent after the others; the receiver takes any *missing* chunk in any
+  order and refuses duplicates or unknown indices. The sender checks each chunk it reads
+  against the hash from its first pass and CANCELs on mismatch (`SourceChanged`).
+  The whole-file hash before commit remains the integrity anchor.
+- **Post-M6 (ADR-0041)** Ctrl+C in `send`/`listen` closes the connection with QUIC
+  application code 2 (`CLOSE_INTERRUPTED`); the peer reports "<name> stopped beam on their
+  side". `listener::run_until` stops `listen` cleanly (tells senders, keeps partials, one
+  `Stopped` event, removes `listen.json`).
+- **Post-M6 (ADR-0042)** Background agent (`src/agent/`): `beam agent` runs
+  `listener::run_until` with pairing off, port mapping per `agent_port_mapping`
+  (default off; `beam service port-mapping on` warns + y/N), 5 min Accept window;
+  its Prompt hands requests to `beam inbox` over loopback TCP gated by the token
+  in private `agent.json` and shows an OS notification (PowerShell toast /
+  notify-send / osascript, text via env vars). Per-user only: HKCU Run entry or
+  `systemd --user`; never a system service. `beam receive-dir` sets `receive_dir`
+  (Windows default: real Downloads folder; Linux: start folder). `listen` and the
+  agent exclude each other. See `docs/background-services.md`.
+- **Post-M6 (ADR-0043)** Full-screen view (`src/tui/`, ratatui 0.30 +
+  crossterm via its re-export): plain `beam` on a terminal opens it unless
+  `ui = "cli"` (`beam ui cli|tui`); any argument means the normal CLI
+  (`cli::start` vs `cli::execute`). Discord Friends layout. `tui::app` is pure
+  state (unit tested), `tui::view` draws (TestBackend tests) and records click
+  areas. Ctrl+C copies, Ctrl+Q quits (as in Fresh). Steps: 1 view + toggle,
+  2 mouse/text boxes/rename/remove, 3 command palette (`:`/Ctrl+P, checked by
+  `cli::check`; `palette::place` = here / terminal (own process) / pop-up),
+  4 add friend (`tui::pairing` runs `pairing::join`/`wait` on a thread; code
+  pop-up → fingerprint check starting on No; port falls back so the agent never
+  pairs), 5 pending (`tui::inbox` = the `beam inbox` link; requests never pop
+  up by themselves; Accept pop-up starts on Decline), 6 history (`src/history.rs`,
+  private `history.jsonl`, written by `send` and the listener; `beam history`;
+  last seen = newest answered line), 7 send (`tui::sending` = `beam send` on a
+  thread, shared messages/history; one at a time; hide/cancel; quit asks),
+  8 docs (`docs/tui.md`) (done). No online dots.
+- **Post-M6 (ADR-0044)** Receiving switch at the top of the view's Pending tab
+  (`o` or click; amber OFF / green ON): runs `agent::run` inside the view
+  (`tui::receiving`, `in_view` in `agent.json`): pairing off, 5 min, agent port
+  mapping, notifications; agent lock so listen/agent refuse; off at every start,
+  stops with the view; asks before stopping a transfer.
+- **Post-M6 (ADR-0045)** First-run welcome card in the view (no identity →
+  "Create it now?", Create it = `beam init`, never replaces); `s` opens a file
+  browser (`tui::browse`: places + every drive, natural sort, filter, typed or
+  dragged paths, `Fs` injectable for tests).
+- **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
+  (performance plan step 0). n0's public relay stays rate-limited.
+- Stretch (only if time allows): bandwidth limit, folder transfer. (The TUI and
+  transfer history are done: ADR-0043..0045.)
 
 ## Testing expectations
 

@@ -495,6 +495,124 @@ invite by chat and the code by another channel; the other runs `beam pair
 <invite> --name …`; both compare fingerprints and type `yes`; then send in
 **both** directions. Note `[Direct P2P]` or `[Relay]` and the time taken.
 
+## Implemented (post-M6): the pairing code on demand (ADR-0037)
+
+| Requirement | Test |
+|---|---|
+| F-21 `whoami` shows the running `listen`'s invite and code; a renewed code updates it | `listen_status::a_running_listen_shows_its_invite_and_the_current_code` |
+| F-21 no code while in use, paused or off, each said so | `listen_status::attempts_pauses_and_switching_off_are_shown_without_a_code` |
+| F-21 a crash leaves no stale code on show | `listen_status::a_status_left_by_a_crash_is_not_believed` (and checked by hand: `whoami` after force-killing `listen` says it is not running) |
+| A clean exit removes the code from disk | `listen_status::a_clean_exit_takes_the_code_off_disk` |
+| A second `listen` in one beam home | `listen_status::a_second_listen_in_the_same_home_does_not_overwrite_the_first` |
+| `listen.json` is private | `listen_status::the_status_file_is_private` (Unix) |
+| `whoami` with no `listen` | `tests/cli.rs::whoami_says_when_listen_is_not_running` (text and `--json`) |
+| **As processes**: `whoami` matches what `listen` printed; after an attempt `listen` says where the new code is, `whoami` shows it, and `listen` never printed it; pairing with it works | `tests/end_to_end.rs::over_iroh::listen_pairs_but_only_with_yes_in_full` |
+
+## Implemented (post-M6): security review fixes (ADR-0038)
+
+| Requirement | Test |
+|---|---|
+| **S-34 a relay change needs a yes** (F-1) | `tests/cli.rs::an_invite_that_changes_a_peers_relay_needs_a_yes`: refused saves nothing, not even addresses; accepted saves relay and addresses, key unchanged; the same invite again asks nothing |
+| **S-33 only `https://` public relays from invites** (F-3) | `invite::an_http_or_local_relay_in_an_invite_is_dropped_not_used` (http, private IPv4, loopback v4/v6, `localhost`, `*.local`; the rest of the invite still counts); a public https relay is kept |
+| What counts as a public address | `transport::endpoint::only_internet_reachable_addresses_count_as_public` (private, CGNAT, link-local, unique-local, documentation ranges are not) |
+| F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
+| S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
+
+## Implemented (post-M6): the full-screen view and history (ADR-0043)
+
+The full list, by layer, and the manual steps are in
+[tui.md §8](tui.md). Test names below are in `crates/beam/src/tui/` unless a
+file is given.
+
+| Requirement | Test |
+|---|---|
+| F-29 plain `beam` opens the view; arguments never do | `tests/cli.rs::arguments_never_open_the_full_screen_view`; `cli::start` falls back to help off a terminal (manual: `beam \| more`) |
+| F-30 `beam ui cli\|tui` | `tests/cli.rs::beam_ui_switches_what_plain_beam_opens_and_keeps_the_rest_of_the_config`, `config::ui_is_read_and_defaults_to_the_full_screen_view` |
+| F-31 / S-42 command palette | `palette::tests::*`, `app::tests::a_whole_command_runs_where_it_belongs_and_is_remembered`, `a_wrong_command_says_why_and_stays_open`, `nothing_typed_in_the_palette_can_accept_a_transfer`, `tests::a_command_run_here_uses_this_views_home_and_shows_its_output` |
+| F-32 Add friend, fingerprint check starts on No | `pairing::tests::two_views_pair_through_the_real_protocol_and_both_save`, `a_no_on_either_side_saves_nothing_on_both`, `app::tests::the_fingerprint_check_starts_on_no`, `the_code_pop_up_takes_digits_and_never_sends_a_malformed_code`, `a_relay_change_starts_on_no`, `tests::pair_checks_the_invite_and_the_name_before_any_network` |
+| F-33 Pending and the Accept pop-up (starts on Decline) | `inbox::tests::with_an_agent::accepting_in_the_view_saves_the_file`, `declining_in_the_view_saves_nothing`, `pending::tests::*`, `view::tests::the_accept_pop_up_shows_who_what_how_big_and_the_fingerprint` |
+| F-34 / S-43 history and last seen | `history::tests::*` (`src/history.rs`), `tests/cli.rs::send_to_a_peer_that_is_not_listening_says_how_to_re_pair` (a real `send` writes its line; `beam history`, `--clear`), the agent tests above (receiver's line), `view::tests::a_friends_panel_lists_their_files_newest_first_and_when_last_seen` |
+| F-35 sending from the view | `sending::tests::a_send_from_the_view_waits_for_the_yes_then_arrives`, `a_decline_is_said_plainly_and_nothing_arrives`, `cancelling_while_they_decide_tells_them_and_is_recorded`, `send::tests::*` |
+| F-36 Receiving switch (ADR-0044) | `receiving::tests::the_switch_starts_a_receiver_that_shuts_out_listen_and_stops_cleanly`, `it_will_not_start_beside_a_running_listen`, `with_the_switch_on_a_friend_sends_and_the_view_accepts`, `pending::tests::the_switch_turns_on_and_off_and_says_so`, `turning_off_mid_transfer_asks_first_and_no_is_the_default`, `the_switch_will_not_fight_the_agent_or_listen`, `view::tests::the_switch_sits_on_top_of_pending_and_stands_out_while_off` |
+| F-37 first-run welcome (ADR-0045) | `app::tests::the_first_run_offers_to_create_the_identity_and_enter_does_it`, `not_now_leaves_and_keys_do_nothing_else_meanwhile`, `tests::the_first_run_makes_an_identity_once_and_never_replaces_it`, `view::tests::the_first_run_shows_a_welcome_with_create_it_highlighted` |
+| F-38 file browser (ADR-0045) | `browse::tests::*`, `send::tests::s_opens_the_browser_and_enter_goes_in_then_sends`, `typing_filters_backspace_goes_up_and_a_dragged_path_is_sent`, `esc_closes_and_the_browser_reopens_where_it_was_left`, `tab_goes_to_the_places_and_enter_jumps`, `view::tests::sending_shows_the_browser_then_a_progress_pop_up_and_a_header_pill` |
+| Keys, mouse, terminal | `tests::ctrl_c_copies_ctrl_q_quits_and_other_ctrl_keys_are_ignored`, `left_clicks_and_the_wheel_count_and_mouse_moves_do_not`, `view::tests::clicking_where_a_friend_was_drawn_selects_them`, `a_tiny_terminal_does_not_panic`, `input::tests::*` |
+
+## Implemented (post-M6): background agent (ADR-0042)
+
+The full list, and the manual steps, are in
+[background-services.md §5](background-services.md).
+
+| Requirement | Test |
+|---|---|
+| F-26 accept in the inbox, saved to the receive folder; decline; expiry | `tests/agent.rs::a_request_is_accepted_in_the_inbox_and_saved_to_the_receive_folder`, `declining_in_the_inbox_saves_nothing`, `an_unanswered_request_expires_and_saves_nothing` |
+| S-39 no token, no information, no answer; one answer per request | `tests/agent.rs::a_client_without_the_token_learns_nothing_and_cannot_answer`, `the_first_answer_decides_and_a_second_is_too_late`, `agent::ipc::*` |
+| S-38 the agent does not pair | `tests/agent.rs::the_agent_does_not_pair` |
+| S-7 at the agent | `tests/agent.rs::an_unpaired_device_is_refused_without_a_request` |
+| `service stop`, one agent per home, status file | `tests/agent.rs::a_stop_request_stops_the_agent_and_takes_its_token_off_disk`, `a_second_agent_in_the_same_home_is_refused`, `agent::status::*` |
+| S-41 notification text is data | `agent::notify::the_text_travels_as_data_not_as_code` |
+| F-27 receive folder setting | `config::receive_dir_and_agent_port_mapping_are_read`, `set_value_changes_one_key_and_keeps_the_rest` |
+| F-28 login entry and unit | `agent::service::*` |
+| S-40, manual run on Windows | `background-services.md` §5, run 2026-10-04 |
+
+## Implemented (post-M6): Ctrl+C on either side (ADR-0041)
+
+| Requirement | Test |
+|---|---|
+| F-25 receiver stops mid-transfer: sender told at once, `Stopped` names it, data kept | `tests/listen.rs::stopping_listen_mid_transfer_tells_the_sender_and_keeps_what_arrived` |
+| F-25 sender stops mid-transfer: `listen` reports it as the sender's doing, within 5 s, data kept | `tests/listen.rs::a_sender_stopped_mid_transfer_is_reported_as_such_by_listen` |
+| F-25 receiver stops while the sender is still hashing: told at once, one `Stopped`, nothing after | `tests/listen.rs::stopping_listen_while_the_sender_is_still_hashing_tells_it_at_once` |
+
+### Manual: a real Ctrl+C on each side
+
+Two terminals, a large file (hundreds of MiB), paired devices.
+
+1. `beam listen` on one, `beam send <peer> <file>` on the other, accept, and
+   press Ctrl+C in the **sender** while the progress line moves. Expected:
+   - the sender prints `cancelled: you stopped beam (Ctrl+C). <peer> was told …`;
+   - `listen` prints `<sender> stopped beam on their side (Ctrl+C) …` at once,
+     not after 15 s, and keeps listening.
+2. Repeat, pressing Ctrl+C in **`listen`**. Expected:
+   - `listen` prints `Stopped listening (Ctrl+C). Cancelled the transfer from …`
+     and exits;
+   - the sender prints `<peer> stopped beam on their side (Ctrl+C) …`;
+   - `beam whoami` on the receiver says `listen` is not running.
+3. Send the same file again: it resumes, after a new Accept.
+
+Run on 2026-10-04 with a genuine console Ctrl+C on each side. Both terminals
+showed the expected text. The first run found the still-hashing gap, now
+covered by the test above.
+
+### Manual: direct P2P across the internet with no relay
+
+Follow "No relay at all: testing real direct P2P" in `deploy.md`. Record each
+side's situation (UPnP, manual forward with `advertise`, or CGNAT), whether it
+connected, and the time for the same file with and without the relay.
+
+## Implemented (post-M6): throughput, steps 1–4 (ADR-0039)
+
+| Requirement | Test |
+|---|---|
+| N-8 throughput is measured | `tests/throughput.rs::throughput_over_loopback_iroh` (ignored; `cargo test --release --test throughput -- --ignored --nocapture`, with `BEAM_BENCH_MIB` and `BEAM_BENCH_RTT_MS`) |
+| D-15 a killed receiver keeps chunks it had not flushed | `tests/resume.rs::a_killed_receiver_keeps_chunks_it_had_not_flushed` |
+| D-15 chunks lost to power failure are dropped, re-fetched, and the file is still right | `tests/resume.rs::chunks_lost_to_power_failure_are_dropped_not_trusted` (simulated by truncating the data file after the chunks were recorded) |
+| D-15 a batch flushes by itself | `tests/resume.rs::a_full_batch_of_chunks_is_flushed_without_being_asked`, `a_full_batch_of_bytes_is_flushed_without_being_asked` |
+| D-15 a transfer that stops keeps what it verified | the existing hang-up tests in `tests/resume.rs` (`partial_session`), and the kill tests in `tests/end_to_end.rs` (`killed::*`, `over_iroh::killing_the_sender_over_iroh_then_resuming`) |
+| D-10 data before record; D-11 re-hash on resume | `tests/resume.rs::a_corrupted_stored_chunk_is_re_fetched_rather_than_trusted` |
+
+## Implemented (post-M6): throughput step 5 and the sender's own check (ADR-0040)
+
+| Requirement | Test |
+|---|---|
+| F-24 at most 4 chunks in flight; a rejected chunk re-sent after the others | `tests/transfer.rs::the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_one` |
+| F-24 the version is agreed and sets the window; a `beam/xfer/1`-only receiver gets one at a time | `tests/listen.rs::the_transfer_protocol_version_is_agreed_and_sets_the_window`; old senders: every `tests/listen.rs` test that dials `XFER_ALPN` |
+| S-37 chunks in any order, NAK then retry later | `tests/transfer.rs::the_receiver_takes_missing_chunks_in_any_order` |
+| S-37 a duplicate or out-of-range chunk ends the transfer, nothing saved | `tests/transfer.rs::a_duplicate_or_unknown_chunk_is_refused` |
+| S-36 a file changed or cut short mid-send is stopped before that chunk is sent, and the receiver is told | `tests/transfer.rs::a_file_changed_while_being_sent_is_caught_before_it_is_sent` |
+| Chunk hashes from the first read | `transfer::chunk::chunk_hashes_from_the_first_read_match_each_chunk` |
+| Kill and resume with chunks in flight | the existing `tests/end_to_end.rs` kill tests, now pipelined |
+| Throughput | `tests/throughput.rs` with `BEAM_BENCH_RTT_MS=50/100/200` |
+
 ## Manual test steps
 
 Some things cannot honestly be covered by an automated test on one machine.

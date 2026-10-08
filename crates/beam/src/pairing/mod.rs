@@ -18,5 +18,5 @@ pub use protocol::{Offer, PairingError, Role};
 pub use rotation::{Attempt, Notice, Policy, Rotation, Unavailable};
 pub use session::{
     Confirm, ConfirmRequest, Event, Network, PairError, Paired, Pairing, Timeouts, attempt_kind,
-    choose_name, join, refuse_connection, serve, wait,
+    check_name, choose_name, join, refuse_connection, serve, wait,
 };

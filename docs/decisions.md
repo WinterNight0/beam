@@ -1655,3 +1655,807 @@ was (CLAUDE.md, identity model):
   server-side tests of signed registrations, which go with the server. The
   rendezvous implementation is preserved in history: commit `fc86508` is the
   end of M6 with the server.
+
+---
+
+## ADR-0037 — `listen` shows its pairing code once; `whoami` shows the current one
+
+**Status:** accepted (post-M6, branch `main-QoL`). Amends ADR-0028 (how a
+renewed code is announced).
+
+**Context.** `listen` renews its pairing code after every attempt and every
+ten minutes (ADR-0028), and printed each new code as a notice. A first test
+across two home networks sent a 5 GB file. The transfer ran for a long time,
+and the receiver's screen kept filling with `New pairing code: …` lines that
+had nothing to do with it. Codes are needed rarely, once per new device, but
+they were announced every ten minutes for as long as `listen` ran.
+
+The joiner had the opposite problem. A code that had just been renewed fails
+in exactly the same way as a mistyped one, and the message ("If it was typed
+correctly, someone else may be trying to pair…") did not mention the far more
+likely cause.
+
+### Decision
+
+* **`listen` prints the invite and the code once, at start**, and says that
+  `beam whoami` shows the current code. A code renewed because ten minutes
+  passed is not printed at all. After an attempt, one short line says the code
+  was used (or that pairing is back on after a pause) and that `whoami` shows
+  the new one. That line follows something the person just saw happen, so it
+  is not noise.
+* **`beam whoami` shows what a running `listen` offers**: the invite, the code
+  that works now, and when it expires. When there is no code it says why: an
+  attempt is in progress, pairing is paused, or pairing is off after three
+  failures. It also says when `listen` is not running at all. `--json` adds a
+  `listening` object, or `null`.
+* **How a separate process knows.** `listen` writes its state to
+  `~/.beam/listen.json` whenever the code or the pairing state changes. It
+  also holds a lock on `~/.beam/listen.lock` (the standard library's advisory
+  file lock, as partials already use) for as long as it runs. `whoami`
+  believes `listen.json` only while that lock is held. The operating system
+  releases the lock when the process ends, however it ends, so a crashed
+  `listen` never leaves a stale code on show. A clean exit also deletes the
+  file. A second `listen` in the same beam home does not take over the file,
+  and says so.
+* **The joiner is told an expired code is a likely cause.** The wrong-code
+  message now says that the code changes every ten minutes and after every
+  attempt, that an older one no longer works, and to ask for the current one
+  (`beam whoami` on the other device). The possibility of someone pairing in
+  the other device's place is still mentioned. The `listen` side's message
+  says the joiner may have used an older code.
+
+### Why not tell the joiner exactly that the code had expired?
+
+Telling a stale code from a mistyped one would mean checking the joiner's
+attempt against the previous code as well. SPAKE2 is built so that a failed
+run reveals nothing about which code was tried: that is what limits an
+attacker to one guess per attempt. Trying a second code would weaken that and
+amount to inventing cryptography, against rule 4. Keeping the old code valid
+for a grace period would be the same thing in another form, and would also
+make "single use" untrue. A hint is the honest option.
+
+### Consequences
+
+* A long transfer's screen shows only the transfer.
+* **A live pairing code is now on disk** while `listen` runs. The file is
+  private (mode 0600 on Unix, written atomically like `known_peers`). On
+  Windows the mode bits do not apply (ADR-0004), so another account on the
+  same machine could read it. Accepted: the code is single use, lives at most
+  ten minutes, and is only half of pairing. Both people still have to compare
+  fingerprints and type `yes`, and anyone who can read `~/.beam` can already
+  read the private key next to it.
+* Someone who wants the code has to run `whoami` in another terminal. That is
+  one command, against a screen that used to change every ten minutes whether
+  anyone needed a code or not.
+* Tests: `listen_status` unit tests (the code shown and renewed, attempt,
+  pause and off states, a crash's leftover ignored, a clean exit removing the
+  file, a second `listen` not overwriting the first, the file private on
+  Unix); `tests/cli.rs::whoami_says_when_listen_is_not_running`; and
+  `tests/end_to_end.rs::over_iroh::listen_pairs_but_only_with_yes_in_full`,
+  which now reads both codes from `whoami` with a real `listen` running, and
+  checks that the renewed code was never printed.
+
+---
+
+## ADR-0038 — Security review fixes: relay changes need a yes, invite relays are https and public, CI hardened; `advertise` for direct testing
+
+**Status:** accepted (post-M6, branch `main-QoL`). Amends ADR-0036.
+
+**Context.** On 2026-10-02 the project was checked for vulnerabilities (the
+full results are in `SECURITY.md` §7). The dependency check found nothing
+exploitable: no CVE or RustSec vulnerability in any of the 393 locked crates,
+and no CISA KEV entry for anything beam uses. A review of beam's own code,
+focused on what ADR-0036 changed, found four issues:
+
+* **F-1 (medium).** `beam pair <invite>` for an already-paired device saved
+  the invite's relay without asking, and a saved `relay=` overrides this
+  device's own relay. A peer's public key is not secret, so anyone could
+  build an invite naming it with their own relay ("I moved, here's my new
+  invite"). Every later send to that peer would then go through the
+  attacker's relay, which sees when and from where, and can block it. Files
+  stay unreadable: the connection still proves the key. ADR-0036 and R-4
+  described this path as "unreachable at worst", which understated it.
+* **F-2 (low).** `listen`'s fixed port, together with iroh's router port
+  mapping (on by default), makes a running `listen` findable by scanning.
+  Anyone can then open a pairing connection, use up codes, and learn the
+  device's public key.
+* **F-3 (low).** An invite's relay could be any `http://` or `https://` URL,
+  including a host on the local network. A crafted invite could make beam
+  connect to a router's admin page or another local service, or talk to a
+  relay in plain text.
+* **F-4 (low, supply chain).** CI had no `permissions:` block, so its token
+  got the repository default; the third-party actions were referenced by
+  movable tags; and nothing checked dependencies for new advisories.
+
+The rule for fixing: patch now only what does not make beam harder to use.
+
+### Decision
+
+* **F-1: a relay change needs a yes.** When an invite for a paired device
+  would change its saved relay, `beam pair` shows the fingerprint, the relay
+  now and after, and what a relay can see. It saves nothing unless the answer
+  is yes. Address-only updates stay silent: they cannot leak anything,
+  because the relay still reaches the peer. Nearly everyone uses the default
+  relay, so the question is rare. It appears exactly when something unusual
+  is happening.
+* **F-3: invites carry only `https://` relays on public hosts.** A relay URL
+  in an invite, or in a saved `relay=`, that is plain `http://`, or names an
+  IP in a private, loopback, link-local, carrier-grade-NAT or unique-local
+  range, or names `localhost` or `*.local`, is **dropped, not fatal**. The
+  invite still pairs, and the joiner falls back to its own relay.
+  `config.toml` still accepts any relay, including `http://`, because that
+  file is the user's own choice (for example, a test relay on the LAN).
+* **F-4: CI hardened.** `permissions: contents: read`; checkout does not
+  keep credentials; every third-party action is pinned to a full commit
+  hash, with the release named in a comment; and a new `audit` job runs
+  `cargo audit` on every push and pull request. A vulnerability fails the
+  build, and an unmaintained-crate notice is a warning.
+* **F-2: not patched; recorded as open risk R-8.** Both fixes found cost
+  something users would feel:
+  - Turning off port mapping makes direct connections rarer, and is exactly
+    what lets `relay = "none"` work across the internet.
+  - A secret in the invite that `listen` checks before spending a code would
+    change the invite format and the pairing handshake.
+  Both are to be planned and decided before any code changes.
+* **`advertise` in `config.toml`.** It came out of making `relay = "none"`
+  usable for testing direct P2P across the internet. Without a relay, the
+  only public address beam can learn is a router port mapping. With a port
+  forwarded by hand, beam cannot know the public address, so the invite
+  carried only LAN addresses. `advertise = ["<public IP>:7820"]` puts given
+  addresses first in the invite. Separately, with no relay, `listen` now
+  waits up to 3 seconds for the router to report a port mapping before
+  showing the invite. With a relay it waits for the relay, as before.
+
+### Consequences
+
+* The forged-relay attack (F-1) now needs the victim to say yes to a question
+  that explains the risk. A forged address-only update can still make a peer
+  unreachable until the next real invite (R-4, unchanged).
+* A crafted invite can no longer make beam connect to local services, or to a
+  relay in plain text.
+* New advisories against beam's dependencies show up on the next push.
+* With `relay = "none"`, `listen` and `pair --wait` take up to 3 seconds
+  longer to show the invite when the router offers no port mapping.
+* Tests:
+  - `invite::an_http_or_local_relay_in_an_invite_is_dropped_not_used`
+  - `invite::advertised_addresses_come_first_without_duplicates`
+  - `transport::endpoint::only_internet_reachable_addresses_count_as_public`
+  - `config::advertised_addresses_are_read_and_checked`
+  - `tests/cli.rs::an_invite_that_changes_a_peers_relay_needs_a_yes`
+  - `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted`
+  - `tests/pairing.rs::advertised_addresses_lead_the_invite`
+
+## ADR-0039 — Throughput, steps 1–4: a benchmark, larger QUIC windows, batched flushes
+
+**Status:** accepted (post-M6, branch `main-QoL`). Follows
+`docs/performance-plan.md`; amends ADR-0022 (when a chunk counts).
+
+**Context.** The first cross-network transfer (5.5 GB, 2026-10-02) took about
+1.5 hours, at about 1 MB/s, entirely over n0's relay. The same file on one
+Wi-Fi network went direct at about 18 MB/s, close to what Wi-Fi allows
+between two devices. So the relay path, not beam, limited that test. Reading
+the code still found limits of beam's own that a faster path will hit:
+
+* QUIC's default stream window, 1.25 MB, caps one stream at 1.25 MB per round
+  trip;
+* every 4 MiB chunk was flushed three times (data, hashes, `state.json`) and
+  renamed into place, and the `state.json` write was blocking file I/O on the
+  async thread;
+* nothing measured any of it.
+
+The rule for this work: the user notices nothing except the speed. No new
+command, flag, prompt or setting, and no rule in `CLAUDE.md` changes.
+
+### Decision
+
+* **Step 1, a benchmark.** `tests/throughput.rs`, ignored by default:
+  `cargo test --release --test throughput -- --ignored --nocapture`. A real
+  `listen` and sender over iroh on loopback, timed phase by phase.
+  `BEAM_BENCH_RTT_MS` adds a round trip with a delaying UDP proxy. The proxy
+  faces the sender on IPv6 and the listener on IPv4, because otherwise iroh's
+  hole punching finds the direct loopback path at once and bypasses it. It
+  runs on plain threads that poll the clock: async timers released packets in
+  bursts, and the first versions of the proxy limited the very thing being
+  measured.
+* **Step 2, build.** A debug build is about 7× slower (mostly hashing), so
+  real transfers must use `--release`. Adding `lto = "fat"` and
+  `codegen-units = 1` was measured and made no difference, so it was **not
+  adopted**: it would only slow builds.
+* **Step 3, QUIC windows** (`transport::endpoint::transport_config`): stream
+  window 16 MiB (`STREAM_WINDOW`), and connection receive and send windows
+  32 MiB (`CONNECTION_WINDOW`). noq sets *no* connection limit by default,
+  so a peer could open its 100 allowed streams and make us buffer 100 stream
+  windows (125 MB at the old default). The explicit connection window now
+  bounds that at 32 MiB, which is tighter than before. Only configuration, so
+  old and new copies of beam still work together.
+* **Step 4, batched flushes** (`transfer::partial`). Each chunk is written
+  (data, then hash) and **recorded at once** in the bitmap and `state.json`
+  (a rename, without waiting for the disk). The disk flush is batched. A flush
+  of data, hashes and `state.json` happens:
+  - every 8 chunks or 32 MiB, whichever comes first (`FLUSH_EVERY_CHUNKS`,
+    `FLUSH_EVERY`);
+  - after the last chunk, before the whole-file check and the move into
+    place;
+  - when a transfer stops early for any reason.
+
+  The `state.json` write runs on tokio's blocking pool.
+
+  **This amends ADR-0022's rule (D-10)**, which flushed each chunk before
+  recording it. The record is now a claim, not proof. That is safe because
+  the proof already existed: on every resume, `reverify` re-hashes every
+  claimed chunk against its stored hash before offering it (D-11), and the
+  whole file is checked before it is kept. Two cases:
+  - **beam killed or crashed:** the operating system still holds what the
+    process wrote and writes it out, so the data and the record are both
+    there. Nothing is lost.
+  - **Power loss or an OS crash:** the last unflushed batch may be missing or
+    stale. Any claimed chunk whose bytes did not survive fails `reverify`, is
+    dropped, and is asked for again. A `state.json` lost the same way makes
+    the partial unreadable, and it starts over.
+
+  The first version recorded a chunk only after its batch was flushed. That
+  made a killed receiver lose up to a batch for no reason, since a process
+  kill does not lose written data. It was replaced before review.
+
+### Consequences
+
+* **Measured** (loopback, this machine, release build; full numbers in
+  `docs/performance-plan.md`):
+
+  | | Before | After |
+  |---|---|---|
+  | No added delay (beam's own costs) | 136–141 MB/s | 165–178 MB/s (step 4) |
+  | 50 ms round trip | 18 MB/s | 34 MB/s (step 3) |
+  | 100 ms round trip | 9.2 MB/s | 16.8 MB/s (step 3) |
+
+  At 50 and 100 ms the result is now close to the limit of one chunk in
+  flight: each 4 MiB chunk costs about two round trips (send, then wait for
+  CHUNK_ACK). Only step 5 (pipelining) moves that.
+* None of this speeds up a transfer limited by n0's relay or by a slow
+  upload. The path is what limits that.
+* **Crash cost.** A transfer that stops (connection lost, sender killed,
+  cancel, stall) keeps every verified chunk, and so does a receiver whose beam
+  process is killed or crashes. Only power loss or an OS crash on the receiver
+  can cost anything: at most the last batch (32 MiB), found by `reverify` and
+  asked for again. Resuming still needs a new Accept.
+* Recording each chunk costs a `state.json` rename per chunk: about 165 MB/s
+  instead of about 175 MB/s with no added delay, and no difference with
+  delay.
+* CHUNK_ACK now means "verified and written", not "flushed". The sender
+  never relied on more: what the receiver has is decided by its own bitmap,
+  sent in ACCEPT.
+* Peak memory per connection can reach about 32 MiB of in-flight data.
+* Tests:
+  - `tests/resume.rs::a_killed_receiver_keeps_chunks_it_had_not_flushed`
+  - `tests/resume.rs::chunks_lost_to_power_failure_are_dropped_not_trusted`
+  - `tests/resume.rs::a_full_batch_of_chunks_is_flushed_without_being_asked`
+  - `tests/resume.rs::a_full_batch_of_bytes_is_flushed_without_being_asked`
+  - The existing interruption tests still pass unchanged: in-process
+    hang-ups in `tests/resume.rs`, and killed processes in
+    `tests/end_to_end.rs`. They now also prove that a transfer that stops
+    keeps what it verified. Batching by chunk count, not only by bytes, is
+    what lets the kill tests still see progress part-way through a 2 MiB
+    file; with bytes alone, a small file was not flushed until it had all
+    arrived, and the tests stopped interrupting anything.
+
+## ADR-0040 — Throughput step 5: several chunks in flight (`beam/xfer/2`), and the sender checks what it reads
+
+**Status:** accepted (post-M6, branch `main-QoL`). Follows ADR-0039 and
+`docs/performance-plan.md`. Amends ADR-0016 (chunks no longer strictly one
+at a time or in order).
+
+**Context.** After ADR-0039, the last limit inside beam was B-1: the sender
+waited for each chunk's CHUNK_ACK before sending the next, so every 4 MiB
+chunk cost about two round trips. The benchmark showed exactly that: 34 MB/s
+at a 50 ms round trip and 17 MB/s at 100 ms. Reviewing the integrity story
+for this change also found a weakness that predates it. The sender reads its
+file twice, once to compute `file_sha256` and again to send each chunk, and
+each chunk's hash came from the second read. So a file edited during a send,
+or a disk returning bad data, passed every chunk check. It was caught only by
+the receiver's whole-file check at the very end: safe, since nothing was
+saved, but the whole transfer was wasted.
+
+### Decision
+
+* **Several chunks in flight.** After ACCEPT, the sender keeps up to
+  `PIPELINE_WINDOW` = 4 chunks sent but unanswered. Four 4 MiB chunks fill
+  the 16 MiB QUIC stream window (ADR-0039), so no memory bound changes. A
+  chunk's frames are still written together: CHUNK_START, then its data.
+* **A rejected chunk is re-sent after the others (option B).** On
+  CHUNK_NAK, the sender puts the chunk back at the front of its queue, and
+  the chunks already in flight carry on. The receiver accepts **any chunk
+  still missing, in any order**. It refuses, as a protocol error, a chunk not
+  asked for, one outside the transfer, or one that already arrived. Each
+  chunk still gets at most 3 attempts.
+
+  Option A was rejected: after a NAK, the receiver would discard everything
+  until the retry, and the sender would resend from the rejected chunk on.
+  It wastes up to three chunks per NAK and adds a "discarding" state. B fits
+  the design that already exists: a bitmap, and a partial file written by
+  position.
+* **A new protocol name, `beam/xfer/2`.** TRANSFER_REQUEST and ACCEPT reject
+  unknown fields, so a capability field would make an old peer refuse the
+  transfer. Instead, the version is agreed in the TLS handshake:
+  - `beam send` offers `beam/xfer/2` and `beam/xfer/1`;
+  - `listen` lists `/2` first, and the TLS server picks the first of its own
+    list that the client offered;
+  - the window follows the result: 4 for `/2`, 1 for `/1`.
+
+  The new receiver serves both, because one chunk at a time, in order, is a
+  special case of "any missing chunk". So an old sender works with a new
+  `listen`, and a new sender works with an old one.
+* **The sender checks what it sends.** Its first read now also keeps each
+  chunk's SHA-256 (`hash_stream_and_chunks`: 32 bytes per chunk, about 44 KB
+  for 5.5 GB). Every chunk read for sending is checked against that hash
+  first. A mismatch is read again, up to 3 times in all, in case a read
+  failed once. If it still does not match, or the file got shorter, the
+  sender sends CANCEL ("the file changed while it was being sent") and stops
+  with `SourceChanged`. The receiver keeps its partial, and a later send of
+  the changed file starts over, because its `file_sha256` differs.
+  CHUNK_START now carries the hash from before the request.
+
+### What guarantees integrity
+
+Unchanged, and independent of chunk order:
+
+1. QUIC/TLS: nothing on the wire can be altered or inserted.
+2. Each chunk is checked against its hash in memory before it is written.
+3. The receiver re-reads the assembled file and checks it against
+   `file_sha256`, which was committed before Accept. Only then is it moved
+   into place. Otherwise nothing is saved.
+
+Check 3 makes any mistake in between harmless: a damaged chunk, a chunk
+written in the wrong place by a bug, a bad disk read on the receiver. The
+result is the promised file or no file. The new sender check adds that a
+problem at the source is caught at its first chunk, with a clear message,
+instead of at the end.
+
+**What no software check can cover:** damage after the final check (faulty
+RAM, a disk that corrupts a stored file later), or damage that the operating
+system's file cache hides from the read-back. This is recorded in
+`SECURITY.md`.
+
+### Consequences
+
+* **Measured** (loopback with a delaying proxy, release build):
+
+  | Added round trip | One chunk at a time (after ADR-0039) | 4 in flight |
+  |---|---|---|
+  | 0 | about 175 MB/s | about 175 MB/s |
+  | 50 ms | 34 MB/s | 107–110 MB/s |
+  | 100 ms | 17 MB/s | 72–74 MB/s |
+  | 200 ms | 8.4 MB/s | 40 MB/s |
+
+  Now it is the network, QUIC's congestion control and the relay that limit a
+  long link, not beam's waiting. A relay-limited or Wi-Fi-limited transfer is
+  unchanged.
+* A chunk that keeps failing still ends the transfer after 3 attempts. A
+  duplicate or unrequested chunk ends it at once.
+* The receiver cannot see how many chunks the sender has in flight, and does
+  not need to: what it buffers is bounded by the QUIC connection window
+  (32 MiB) and one chunk being assembled.
+* Progress counts **acknowledged** chunks, so 100% still means received.
+* A changed source file is reported at once instead of after the whole
+  transfer.
+* Tests:
+  - `tests/transfer.rs::the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_one`
+  - `tests/transfer.rs::the_receiver_takes_missing_chunks_in_any_order`
+  - `tests/transfer.rs::a_duplicate_or_unknown_chunk_is_refused`
+  - `tests/transfer.rs::a_file_changed_while_being_sent_is_caught_before_it_is_sent`
+    (changed and cut short)
+  - `tests/listen.rs::the_transfer_protocol_version_is_agreed_and_sets_the_window`
+    (new to new picks `/2`; new to a `/1`-only receiver picks `/1`)
+  - `transfer::chunk::chunk_hashes_from_the_first_read_match_each_chunk`
+  - The existing suites now run pipelined: the CLI and `listen` tests over
+    `/2`, and the TCP test transport with a window of 4. That includes every
+    kill-and-resume test, with chunks in flight when the process dies. Old
+    senders are covered by the `listen` tests that dial `beam/xfer/1`.
+
+## ADR-0041 — Ctrl+C on either side: both terminals say who stopped the transfer
+
+**Status:** accepted (post-M6, branch `main-QoL`).
+
+**Context.** beam did not handle Ctrl+C: the process just died. The other
+side saw nothing until QUIC's idle timeout (15 s), then a generic "transfer
+failed: timed out" or "connection lost", with no hint that a person had
+stopped it, or who. A stopped `listen` also left `listen.json` behind, which
+`whoami` only knew to distrust because of the lock (ADR-0037).
+
+### Decision
+
+* **beam send and beam listen catch Ctrl+C** (tokio's `signal` feature; the
+  crate behind it was already in `Cargo.lock` through iroh, so no new
+  dependency). A second Ctrl+C ends the process at once, in case stopping
+  cleanly hangs.
+* **The other side is told through the QUIC close, with a beam code.** The
+  stopping side closes the connection with application code
+  `CLOSE_INTERRUPTED` = 2 (0 is a normal end, 1 an error). The peer gets the
+  CONNECTION_CLOSE frame at once. A close that QUIC reports as made *by the
+  peer* (`ApplicationClosed`, never `LocallyClosed`) with that code becomes
+  `TransferError::PeerInterrupted` on the sender, or
+  `ListenEvent::TransferInterrupted` in `listen`. Which side stopped is
+  therefore known from the connection, not from text.
+  - A CANCEL message was rejected: it needs the stream, mid-chunk, and
+    would not reach a sender that has not opened its stream yet.
+  - At worst, a peer could falsely claim its user interrupted, which only
+    changes the wording of a failure it could cause anyway.
+* **`listen` stops cleanly** (`listener::run_until`):
+  - every transfer in progress is closed with the code, counted from the
+    moment it holds the transfer slot, which includes a sender still hashing
+    its file;
+  - each handler gets up to 3 s to save what arrived;
+  - one `Stopped { cancelled }` event names those transfers, with no
+    separate failure messages;
+  - the endpoint is closed, `listen` exits normally, and `listen.json` is
+    removed.
+* **`send` races the transfer against the connection closing**, so a
+  receiver that stops is noticed at once, even while the sender is still
+  hashing a large file.
+* **What each terminal says:**
+
+  | | The side that pressed Ctrl+C | The other side |
+  |---|---|---|
+  | Sender stopped | `cancelled: you stopped beam (Ctrl+C). bob was told …` | `alice stopped beam on their side (Ctrl+C), so the transfer from alice was cancelled.` |
+  | Receiver stopped | `Stopped listening (Ctrl+C). Cancelled the transfer from alice, and told alice.` | `bob stopped beam on their side (Ctrl+C), so the transfer was cancelled.` |
+
+  Both sides add that what arrived is kept, and that sending the same file
+  again resumes it.
+
+### Consequences
+
+* Nothing about Accept, resume or integrity changes. An interrupted transfer
+  ends like any failed one: the partial is kept, and a resume needs a new
+  Accept.
+* `beam send` exits 1 after Ctrl+C, and `beam listen` exits 0: stopping it is
+  its normal end.
+* The hidden `--addr` TCP test transport does not catch Ctrl+C.
+* Tests:
+  - `tests/listen.rs::stopping_listen_mid_transfer_tells_the_sender_and_keeps_what_arrived`
+  - `tests/listen.rs::a_sender_stopped_mid_transfer_is_reported_as_such_by_listen`
+    (and within 5 s, not after the idle timeout)
+  - `tests/listen.rs::stopping_listen_while_the_sender_is_still_hashing_tells_it_at_once`.
+    This was found by the manual check below. In that window `listen` had not
+    counted the sender, so it got a generic "connection lost", and `listen`
+    printed a stray failure after "Stopped".
+  - Manual, on real processes: a genuine Ctrl+C sent to a `beam send` and to
+    a `beam listen` console mid-transfer (`test-plan.md`). Both terminals
+    showed the messages above.
+
+## ADR-0042 — Background agent: receive without `beam listen`, accept in `beam inbox`
+
+**Status:** accepted (post-M6, branch `main-QoL`). Full description,
+security analysis and limits: `docs/background-services.md`.
+
+**Context.** Receiving needed `beam listen` open in a terminal. The goal: a
+paired device can send at any time, and the person is notified and decides.
+The constraint is rule 1. A Windows service or system daemon has no terminal
+to ask in, and running as SYSTEM or root would be dangerous.
+
+**Decisions taken with the team (2026-10-04):**
+- notifications with built-in OS tools (no new dependency);
+- requests wait 5 minutes;
+- a command to set the receive folder, defaulting to the real Downloads
+  folder on Windows (even if moved) and to the terminal's folder on Linux;
+- router port mapping in the agent is a toggle, off by default, that warns
+  and asks y/N before turning on.
+
+### Decision
+
+* **A per-user agent plus a terminal inbox.**
+  - `beam agent` runs the listener with no terminal: `listener::run_until`
+    with pairing off, port mapping as configured, and a 5-minute Accept
+    window. Its prompt hands each request to `beam inbox` and shows a
+    notification.
+  - `beam inbox` shows the same prompt, through the same prompt desk, as
+    `beam listen`.
+  - An answer there is the Accept, and silence is a no.
+* **The agent does not pair.** The pairing protocol is not offered in the
+  handshake (`ListenOptions::allow_pairing`), so an agent that is always
+  reachable gives nobody codes to try (R-8).
+* **Local link: loopback TCP plus a token.**
+  - `beam inbox` connects to `127.0.0.1`.
+  - The agent says nothing until the client presents the 32-byte token from
+    `agent.json` (private, compared in constant time).
+  - There is a 5 s limit for the first message, 64 KiB lines and 8 clients.
+  - Chosen over Unix sockets and named pipes for one code path and no
+    `unsafe`.
+* **Per-user start, never a system service.**
+  - Windows: an `HKCU\…\Run` value runs `beam service start`, which
+    launches the agent through `Start-Process` with its window hidden.
+    Spawning it directly would let it inherit the caller's handles; found in
+    the manual test.
+  - Linux: a `systemd --user` unit.
+  - Both carry `--beam-dir`.
+* **Notifications:** Windows PowerShell toast, `notify-send`, or `osascript`.
+  The text travels in environment variables and is XML-escaped on Windows. At
+  most one notification every 10 s.
+* **Settings:** `receive_dir` (also used by `beam listen` without `--out`)
+  and `agent_port_mapping`, edited one key at a time, keeping the rest of
+  `config.toml`.
+* **`beam send` waits 5 min 15 s** for an answer. Each receiver ends its own
+  question first: `listen` after 60 s, the agent after 5 minutes.
+* **`listen` and the agent exclude each other** in one beam home.
+
+### Consequences
+
+* No new remote attack path. The surfaces are handled as follows:
+  - a longer exposure window: pairing off, port mapping off by default;
+  - one local link: same user only;
+  - accepted risk **R-9**: the relay can see the device's online presence
+    while the agent runs.
+* New commands: `agent`, `inbox`, `service enable|disable|start|stop|status|port-mapping`,
+  `receive-dir`.
+* Limitations: a console flashes briefly at Windows login; no macOS login
+  start; no notification on a Linux server without a desktop; an older
+  `beam send` waits only 60 s. The Linux paths were checked by CI and review,
+  not run on a real Linux machine.
+* Tests: `tests/agent.rs` (9: accept, decline, expiry, first answer wins, no
+  token learns nothing, no pairing, strangers refused, stop, one per home);
+  unit tests in `agent::{status, ipc, notify, service}` and `config`; a
+  manual real-process run on Windows (`background-services.md` §5).
+
+## ADR-0043 — Full-screen view: plain `beam` opens a TUI
+
+**Status:** accepted, step 1 of 7 (post-M6, branch `main-QoL`).
+
+**Context.** With the background agent (ADR-0042), beam is something a person
+keeps around rather than runs once. Typing `peers`, `inbox` and `send` one at
+a time hides what is going on. The team wants a full-screen view in the style
+of Discord's Friends page: friends on the left, each friend's transfers in the
+middle, details on the right. Fresh (a terminal editor) was the reference for
+how such a program is built in Rust.
+
+**Decisions taken with the team (2026-10-05):**
+- `beam` with nothing after it opens the view. Anything after it (`--help`,
+  `send …`, even `--beam-dir x`) is the normal CLI, unchanged.
+- A toggle stays for people who want only the CLI: `beam ui cli|tui`
+  (`ui` in `config.toml`, default `tui`).
+- Dependencies `ratatui` and `crossterm` approved (rule 4).
+- No live "online" dots: there is no server to know, and probing peers would
+  leak presence. The view shows "last seen" from local history (step 4).
+- Transfer history is kept, as a log of what came and went (step 4).
+- Pairing from the view uses a temporary port while that screen is open, so
+  the agent still never pairs (step 6).
+- (Second round) A command palette at the bottom, opened with `:` or Ctrl+P,
+  so every beam feature is usable from the view. Commands with no screen of
+  their own yet "step out": the view hides, the normal CLI runs with its
+  normal prompts, and Enter returns. Mouse first, and a text cursor in every
+  input box. Add friend becomes an invite box, then a pairing-code pop-up.
+- Keys as in Fresh: **Ctrl+C copies, Ctrl+Q quits**.
+
+### Decision
+
+* **ratatui 0.30 with only its crossterm backend** (`default-features =
+  false`), the same pair Fresh uses. crossterm comes through ratatui's
+  re-export, so the two versions can never disagree. Fresh's code is GPL-3.0
+  and is not copied; beam is MIT.
+* **Plain `beam` opens the view only on a terminal.** If stdin or stdout is
+  not a terminal (a pipe, a script, a test), or `ui = "cli"`, it prints the
+  help as before. `cli::start` makes that choice; `cli::execute` never opens
+  the view, so every existing test and script is unaffected.
+* **State and drawing are split.** `tui::app` turns a key into a new state
+  and never touches the terminal; `tui::view` draws a state; `tui` owns the
+  terminal. The state is unit tested, and the screens are tested with
+  ratatui's in-memory `TestBackend`.
+* **The terminal is always restored**: on a key, an error, or a panic.
+  `ratatui::init` installs a hook for raw mode and the screen; beam's own hook
+  also turns mouse capture and bracketed paste off first.
+* **Ctrl+C copies, Ctrl+Q quits.** In raw mode Ctrl+C is an ordinary key, not
+  a signal, which is how Fresh uses it for copy. `q` also quits when no text
+  box is open; Esc only closes pop-ups. ADR-0041 still holds for `beam send`
+  and `beam listen` on the CLI.
+* **Copy without a dependency:** the OS tool (`clip.exe`, `pbcopy`, `wl-copy`,
+  `xclip`, `xsel`), else an OSC 52 sequence to the terminal. Only text beam
+  made (fingerprints, invites) is copied.
+* **Mouse:** clicks pick tabs, friends, buttons and the cursor position in a
+  text box; the wheel scrolls the list. Drawing records where each clickable
+  thing landed (`app::Areas`), so hit-testing uses the real layout. Capturing
+  the mouse turns off the terminal's own selection; Shift+drag still selects,
+  and the help says so.
+* **Pop-ups that change something start on the safe choice**: Remove starts
+  on Keep. Pasted text arrives whole (bracketed paste) and is cleaned to one
+  line.
+* **The command palette accepts exactly what the CLI does.** A typed line is
+  split like a shell line (quotes keep spaces; backslashes are ordinary, for
+  Windows paths) and checked by `cli::check`, the CLI's own clap parser. A
+  partial line runs the best match if it is a whole command, or fills it in
+  (`send` → `send alice `) and waits. Tab completes friends and file paths.
+* **Where a palette command runs** (`palette::place`):
+  - *here*, in-process with captured output shown in a pop-up, for commands
+    that only print (`peers`, `whoami`, `service status|start|stop|…`,
+    `receive-dir`, `ui`, `--help`). They get empty input, which every beam
+    prompt reads as no.
+  - *terminal*, as a separate `beam` process after the view steps aside, for
+    commands that ask or keep running (`send`, `pair`, `listen`, `inbox`,
+    `init`, `transfers --clear`, `service port-mapping on`). Their prompts and
+    warnings are the reviewed CLI text, unchanged. A separate process keeps
+    their Ctrl+C their own (ADR-0041); a tokio Ctrl+C listener keeps it from
+    also ending the view while they run.
+  - the view's own pop-ups for `rename` and `remove` (`remove -y` still asks).
+* **Nothing in the palette can accept a transfer**: there is no such command,
+  and the check rejects anything the CLI would.
+* **Add friend runs the real pairing code** (`tui::pairing`): `pairing::join`
+  and `pairing::wait` on a background thread, with the view answering their
+  two questions (the code, and whether the fingerprints match) over a
+  channel. The protocol is unchanged: the code is typed before connecting and
+  checked for form before it is sent, so a typo is never a guess; the key
+  saved is the one the connection proved; a question left unanswered is a no.
+  Closing a pairing pop-up drops the worker, which cancels the attempt.
+* **The fingerprint check starts on No**, so Enter alone never pairs.
+* **Before any network**, Pair checks the invite, refuses this device's own,
+  and refuses a taken name. An invite for a friend already paired only
+  updates where to find them; if it changes their relay, a pop-up asks first
+  and starts on Keep (ADR-0038).
+* **Show my invite** binds the configured port, which falls back to a random
+  one when the agent or `listen` holds it, so the agent itself still never
+  pairs. The new friend is named after their device's suggestion
+  (`choose_name`), as with `listen`; rename changes it.
+* **Pending talks to the agent as `beam inbox` does** (`tui::inbox`): loopback,
+  the token from the private `agent.json`, the same messages. The agent keeps
+  the last word: one answer per request, the first wins, a late one is
+  refused (S-39). The view reconnects at each refresh, so an agent started
+  from the palette appears within seconds.
+* **A request never opens a pop-up by itself**, so a request arriving while
+  someone types cannot catch a stray Enter. It shows at once instead: a count
+  on the tab, a red "N waiting" in the header, a line in the status bar, and
+  a WAITING row in that friend's middle panel. Enter or a click opens it.
+* **The Accept pop-up shows what `listen` shows** (S-6): this device's name
+  for the sender, their fingerprint, the file, its size, what is already here
+  on a resume, and the time left. It **starts on Decline**; `d` declines; Esc
+  closes it and leaves the request waiting, and expiry is a no.
+* **History** (`src/history.rs`, `~/.beam/history.jsonl`): one JSON line per
+  transfer that reached a person — sent, saved, declined, cancelled, failed —
+  with the peer's nickname *and fingerprint* (so a renamed friend keeps their
+  files), file name, size and a short note. `beam send` writes the sender's
+  line; the listener writes the receiver's, so `listen` and the agent both
+  do. A request refused before any prompt is not written, so a stranger
+  cannot fill the file. Private, newest 1000, rewritten atomically under a
+  lock (`std::fs::File::lock`), and never able to fail a transfer.
+  `beam history [--clear]` shows or deletes it.
+* **Last seen** is the newest history line with that friend that got an
+  answer (not a failure to reach them). Times are relative ("2 h ago"), which
+  needs no time zone. The friend's middle panel lists their files, newest
+  first.
+* **Sending from the view** (`tui::sending`) is `beam send` on a background
+  thread: the same dial, `send_on`, accept wait (outlasting the agent's five
+  minutes), error messages (`net_cmds::unreachable_message` /
+  `refused_message`, now shared) and history line (`history::send_outcome`,
+  shared). Progress comes from the engine's `Reporter` and is drawn: looking
+  for them, reading the file, waiting for their yes, sending with a bar and
+  `[Direct P2P]`/`[Relay]`, them checking it.
+* *(The file box below was replaced by a file browser in ADR-0045.)*
+* `s` on a friend, or `:send alice <file>` in the palette, opens a file box
+  with Tab completion; a file dragged onto the terminal pastes its path and
+  the quotes are removed. One send at a time. Esc hides the pop-up and a
+  header pill keeps the progress; `s` brings it back. Cancel closes the
+  connection the ADR-0041 way, so the receiver is told and keeps what
+  arrived. Leaving beam mid-send asks first (starts on Stay); leaving anyway
+  cancels and waits up to 3 s for the receiver to be told. `send` with a
+  hidden developer flag still steps out to the terminal.
+* **Peer text is cleaned before it is drawn** (`untrusted`, ADR-0034), as on
+  the CLI; `known_peers` can be edited by hand.
+* **The view reads `~/.beam` again every 2 s**, so a peer paired or an agent
+  started in another terminal appears without a key press.
+
+### Steps
+
+1. Dependencies, `beam ui`, the view with friends, details and agent status. *(done)*
+2. Mouse, text boxes with a cursor, Ctrl+C copy / Ctrl+Q quit, rename and
+   remove pop-ups, a Discord-like look. *(done)*
+3. Command palette (`:` / Ctrl+P): typed commands parsed by the CLI's own
+   parser, a filtered list, Tab completion, output in a pop-up, "step out"
+   for the rest. *(done)*
+4. Add friend: invite box, pairing-code pop-up, fingerprint check (starts on
+   No); Show my invite on a temporary port. *(done)*
+5. Pending requests from the agent and the Accept pop-up (starts on Decline).
+   *(done)*
+6. History file and "last seen". *(done)*
+7. Send from the view, with progress. *(done)*
+8. `docs/tui.md` and the remaining doc updates. *(done)*
+
+Full description, security analysis (V-1..V-12) and limits: `docs/tui.md`.
+
+### Consequences
+
+* 39 new crates in `Cargo.lock`; none has a known advisory (OSV.dev,
+  2026-10-05). The binary grows by the size of the view.
+* `beam` alone no longer prints help on a terminal. The help says how to get
+  that back (`beam ui cli`), and `beam --help` always works.
+* Tests: `tui::app` (cursor, tabs, quitting, help, refresh), `tui::view`
+  (friends page, narrow terminal, no identity, pending, help, tiny terminal),
+  `tui` (key translation), `config` (`ui`), `tests/cli.rs` (`beam ui`, and
+  arguments never open the view).
+
+## ADR-0044 — The Receiving switch: listen inside the full-screen view
+
+**Status:** accepted (post-M6, branch `main-QoL`). User-facing description and
+security rows V-13..V-15: `docs/tui.md` §4.2a and §6.
+
+**Context.** Testing the view showed a gap: to receive at all, a person had
+to start the background agent or run `beam listen` in a second terminal.
+Someone who does not want an always-on agent had no way to receive from the
+view itself.
+
+**Decisions taken with the team (2026-10-08), all as recommended:**
+- pairing stays off while receiving this way (pairing is Add friend's job);
+- a request waits five minutes, as at the agent (requests never pop up by
+  themselves, so noticing one can take a moment);
+- router port mapping follows the agent's setting (off unless
+  `beam service port-mapping on`);
+- a desktop notification per request;
+- the switch is off at every start and never remembered.
+
+### Decision
+
+* **A switch at the top of the Pending tab**, above a rule: amber `○ OFF`
+  while nothing receives, green `● ON` while this view does. `o` (any tab) or
+  a click toggles it; the header's "○ not receiving" leads to it. When the
+  agent, another view or `beam listen` already receives, the strip says
+  which, and there is nothing to toggle.
+* **It runs `agent::run` inside the view's process** (`tui::receiving`) with
+  a new `in_view` option. That brings every agent rule unchanged (all four
+  choices above are the agent's own), its lock (so `listen`, a second agent
+  and a second switch refuse), and its token-protected local link, which the
+  Pending tab already uses. `agent.json` records `in_view`, so `beam service
+  status` and `beam whoami` say the view is receiving, until it closes.
+* **It never outlives the view.** Turning it off or leaving beam stops it the
+  `listen` way (ADR-0041): a sender mid-transfer is told, and the partial is
+  kept. Doing either while a file is arriving asks first, starting on Keep;
+  on leaving, the view waits up to 5 s for the stop.
+* Rejected: starting the background agent from the switch (the person asked
+  for something that does not stay running), and a third, separate listener
+  in the view (it would duplicate the agent's prompt, link and rules).
+
+### Consequences
+
+* Receiving without a second terminal or an always-on agent.
+* While on, the device is reachable as with the agent (R-9), but only while
+  beam is open and only after a deliberate switch.
+* Tests: `tui::receiving` (starts, shuts out a second receiver and `listen`,
+  stops cleanly; a friend sends and the view accepts end to end),
+  `tui::pending` (toggle, confirmations, refusing to fight the agent or
+  `listen`), `tui::view` (the strip, its states, the header badge).
+
+## ADR-0045 — First-run welcome, and a file browser for sending
+
+**Status:** accepted (post-M6, branch `main-QoL`). User-facing description:
+`docs/tui.md` §1 and §4.1.
+
+**Context.** Two rough edges in the full-screen view, found in use:
+- on a device with no identity, the view only said to leave and run
+  `beam init`, a technical word, in another command;
+- choosing a file to send meant typing its path (with completion); people
+  expect to browse, like an editor's "open folder" dialog with every drive.
+
+### Decision
+
+* **Welcome card on the first run.** When there is no identity file at all
+  (not when one exists but cannot be read), the view shows "Welcome to beam …
+  Create it now?" with **Create it** (highlighted) and **Not now**. Create it
+  runs exactly what `beam init` does (`Identity::generate` named after the
+  computer, `save_identity` without force), so an existing identity can never
+  be replaced from here; then the view opens Add friend. Not now leaves beam,
+  since nothing else works yet. The word "init" is not shown.
+* **A file browser behind `s`** (`tui::browse`): places and every drive on
+  the left (Windows drive letters that exist; elsewhere `/`, `/media`,
+  `/run/media`, `/mnt`, `/Volumes`), the folder on the right, folders first in
+  natural order, with sizes and ages; hidden and system files hidden unless
+  the filter starts with `.`. Typing filters; Enter opens or sends; Backspace
+  goes up and keeps the cursor on the folder just left; a typed or dragged
+  path goes straight there. It reopens where it was left. The disk is reached
+  only through an `Fs` of plain functions, so the browser is tested against
+  a made-up tree. It replaces the earlier path box; `:send alice <file>` is
+  unchanged.
+* No new dependency: drives are found by checking `A:\`..`Z:\`, and Windows
+  hidden/system attributes come from `std::os::windows::fs::MetadataExt`.
+
+### Consequences
+
+* A first-time user is never sent to a second command to get started.
+* Sending starts with a familiar browser; typing a path still works.
+* Tests: `tui::app` (first run: Enter creates and moves to Add friend; Not
+  now leaves; other keys do nothing), `tui::tests` (creates once, never
+  replaces), `tui::view` (welcome card, no technical words), `tui::browse`
+  (sorting, hidden files, filter, enter/up, places, typed paths, unreadable
+  folders, fallback start, the real disk), `tui::send` (open, send, Esc and
+  reopen where left, places), `tui::view` (the browser drawn).

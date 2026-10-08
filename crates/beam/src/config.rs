@@ -1,4 +1,5 @@
-//! `~/.beam/config.toml`: the relay, and the port `listen` uses.
+//! `~/.beam/config.toml`: the relay, the port `listen` uses, where received
+//! files go, the background agent's port mapping, and what plain `beam` opens.
 //!
 //! Both are network choices rather than identity, so they live in a file a
 //! person edits by hand — TOML, not JSON, for that reason. A missing file
@@ -12,9 +13,28 @@
 //! # UDP port `beam listen` binds, so its invite stays the same between
 //! # runs. 0 picks a random port each time.
 //! port = 7820
+//!
+//! # Extra addresses to put first in this device's invite. For testing
+//! # direct connections with `relay = "none"` behind a router whose port
+//! # you forwarded by hand: beam cannot discover that address itself.
+//! advertise = ["203.0.113.7:7820"]
+//!
+//! # Where received files are saved: by `beam listen` when it is given no
+//! # --out, and by the background agent. Set with `beam receive-dir`.
+//! receive_dir = "D:\\Downloads"
+//!
+//! # Whether the background agent asks the router to forward its port (UPnP,
+//! # NAT-PMP, PCP). Off unless turned on, after a warning, with
+//! # `beam service port-mapping on` (ADR-0042).
+//! agent_port_mapping = false
+//!
+//! # What `beam` with nothing after it opens: "tui" (the full-screen view,
+//! # the default) or "cli" (the help, as before). Set with `beam ui`.
+//! ui = "cli"
 //! ```
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use iroh::RelayUrl;
@@ -55,6 +75,26 @@ impl fmt::Display for Relay {
     }
 }
 
+/// What plain `beam`, with no arguments, opens (ADR-0043).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiMode {
+    /// The full-screen terminal view.
+    #[default]
+    Tui,
+    /// The help text; every command is typed out.
+    Cli,
+}
+
+impl UiMode {
+    /// The value as written in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Cli => "cli",
+        }
+    }
+}
+
 /// The settings beam reads from `config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -63,6 +103,14 @@ pub struct Config {
     pub relay: Relay,
     /// UDP port for `beam listen`; 0 means a random one.
     pub port: u16,
+    /// Addresses to put first in this device's invite (ADR-0038).
+    pub advertise: Vec<SocketAddr>,
+    /// Where received files go, if the person chose (ADR-0042).
+    pub receive_dir: Option<PathBuf>,
+    /// Whether the background agent may ask the router to forward its port.
+    pub agent_port_mapping: bool,
+    /// What plain `beam` opens.
+    pub ui: UiMode,
 }
 
 /// Why the config file could not be used.
@@ -78,6 +126,15 @@ pub enum ConfigError {
     Parse { path: PathBuf, message: String },
     #[error("{path}: relay must be a URL or \"{RELAY_NONE}\", not {value:?}")]
     Relay { path: PathBuf, value: String },
+    #[error(
+        "{path}: advertise entries must be IP:port with a real address and a port, \
+         such as \"203.0.113.7:7820\", not {value:?}"
+    )]
+    Advertise { path: PathBuf, value: String },
+    #[error("{path}: receive_dir must be a full path, not {value:?}")]
+    ReceiveDir { path: PathBuf, value: String },
+    #[error("{path}: ui must be \"tui\" or \"cli\", not {value:?}")]
+    Ui { path: PathBuf, value: String },
 }
 
 /// The file as written. Unknown keys are an error, so a typo such as
@@ -91,6 +148,10 @@ struct RawConfig {
     rendezvous: Option<String>,
     relay: Option<String>,
     port: Option<u16>,
+    advertise: Option<Vec<String>>,
+    receive_dir: Option<String>,
+    agent_port_mapping: Option<bool>,
+    ui: Option<String>,
 }
 
 impl Default for Config {
@@ -98,6 +159,10 @@ impl Default for Config {
         Self {
             relay: Relay::Url(DEFAULT_RELAY.parse().expect("the default relay URL parses")),
             port: DEFAULT_PORT,
+            advertise: Vec::new(),
+            receive_dir: None,
+            agent_port_mapping: false,
+            ui: UiMode::Tui,
         }
     }
 }
@@ -134,8 +199,113 @@ impl Config {
         if let Some(port) = raw.port {
             config.port = port;
         }
+        for value in raw.advertise.unwrap_or_default() {
+            let addr = value
+                .trim()
+                .parse::<SocketAddr>()
+                .ok()
+                .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
+                .ok_or_else(|| ConfigError::Advertise {
+                    path: path.to_path_buf(),
+                    value: value.clone(),
+                })?;
+            config.advertise.push(addr);
+        }
+        if let Some(dir) = raw.receive_dir {
+            let dir = PathBuf::from(dir.trim());
+            if !dir.is_absolute() {
+                return Err(ConfigError::ReceiveDir {
+                    path: path.to_path_buf(),
+                    value: dir.display().to_string(),
+                });
+            }
+            config.receive_dir = Some(dir);
+        }
+        config.agent_port_mapping = raw.agent_port_mapping.unwrap_or(false);
+        if let Some(value) = raw.ui {
+            config.ui = match value.trim().to_ascii_lowercase().as_str() {
+                "tui" => UiMode::Tui,
+                "cli" => UiMode::Cli,
+                _ => {
+                    return Err(ConfigError::Ui {
+                        path: path.to_path_buf(),
+                        value,
+                    });
+                }
+            };
+        }
         Ok(config)
     }
+}
+
+/// Sets `key` to `value` in the config file at `path`, keeping everything
+/// else in it — comments, other keys, their order — as it was.
+///
+/// `value` is TOML already (a quoted string from [`toml_string`], or `true`).
+/// `None` removes the key. The result is parsed before it is written, so a
+/// file beam cannot read again is never left behind.
+pub fn set_value(path: &Path, key: &str, value: Option<&str>) -> Result<(), ConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let is_key = |line: &str| {
+        let line = line.trim_start();
+        line.strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut done = false;
+    for line in text.lines() {
+        if is_key(line) {
+            if let (Some(value), false) = (value, done) {
+                lines.push(format!("{key} = {value}"));
+                done = true;
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if let (Some(value), false) = (value, done) {
+        lines.push(format!("{key} = {value}"));
+    }
+    let mut new = lines.join("\n");
+    new.push('\n');
+    Config::parse(&new, path)?;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::write(path, new).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// `text` as a TOML basic string, quoted and escaped.
+pub fn toml_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn parse_relay(value: &str) -> Option<Relay> {
@@ -216,6 +386,31 @@ mod tests {
     }
 
     #[test]
+    fn advertised_addresses_are_read_and_checked() {
+        let config =
+            parse("relay = \"none\"\nadvertise = [\"203.0.113.7:7820\", \"[2001:db8::7]:7820\"]\n")
+                .unwrap();
+        assert_eq!(config.relay, Relay::Disabled);
+        assert_eq!(
+            config.advertise,
+            [
+                "203.0.113.7:7820".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::7]:7820".parse().unwrap()
+            ]
+        );
+        assert!(Config::default().advertise.is_empty());
+        for bad in [
+            "203.0.113.7",
+            "0.0.0.0:7820",
+            "203.0.113.7:0",
+            "example.org:7820",
+        ] {
+            let err = parse(&format!("advertise = [\"{bad}\"]")).unwrap_err();
+            assert!(matches!(err, ConfigError::Advertise { .. }), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn a_byte_order_mark_is_ignored() {
         let config = parse("\u{feff}relay = \"none\"\n").unwrap();
         assert_eq!(config.relay, Relay::Disabled);
@@ -227,5 +422,76 @@ mod tests {
             Relay::Url(url) => assert!(url.to_string().contains("aps1-1.relay.n0.iroh.link")),
             Relay::Disabled => panic!("the development default relays"),
         }
+    }
+
+    #[test]
+    fn receive_dir_and_agent_port_mapping_are_read() {
+        let config = parse("").unwrap();
+        assert_eq!(config.receive_dir, None);
+        assert!(
+            !config.agent_port_mapping,
+            "port mapping is off unless turned on"
+        );
+
+        let dir = std::env::temp_dir();
+        let text = format!(
+            "receive_dir = {}\nagent_port_mapping = true\n",
+            toml_string(&dir.display().to_string())
+        );
+        let config = parse(&text).unwrap();
+        assert_eq!(config.receive_dir.as_deref(), Some(dir.as_path()));
+        assert!(config.agent_port_mapping);
+
+        let err = parse("receive_dir = \"downloads\"").unwrap_err();
+        assert!(matches!(err, ConfigError::ReceiveDir { .. }), "{err}");
+    }
+
+    #[test]
+    fn set_value_changes_one_key_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# my relay\nrelay = \"none\"\n\nport = 0 # random\n").unwrap();
+
+        let target = std::env::temp_dir().join("in \"quotes\" and \\ slashes");
+        set_value(
+            &path,
+            "receive_dir",
+            Some(&toml_string(&target.display().to_string())),
+        )
+        .unwrap();
+        set_value(&path, "agent_port_mapping", Some("true")).unwrap();
+        set_value(&path, "agent_port_mapping", Some("false")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# my relay\nrelay = \"none\"\n\nport = 0 # random\n"),
+            "{text}"
+        );
+        assert_eq!(text.matches("agent_port_mapping").count(), 1, "{text}");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.receive_dir.as_deref(), Some(target.as_path()));
+        assert!(!config.agent_port_mapping);
+        assert_eq!(config.relay, Relay::Disabled);
+
+        set_value(&path, "receive_dir", None).unwrap();
+        assert_eq!(Config::load(&path).unwrap().receive_dir, None);
+    }
+
+    #[test]
+    fn ui_is_read_and_defaults_to_the_full_screen_view() {
+        assert_eq!(parse("").unwrap().ui, UiMode::Tui);
+        assert_eq!(parse("ui = \"cli\"").unwrap().ui, UiMode::Cli);
+        assert_eq!(parse("ui = \"TUI\"").unwrap().ui, UiMode::Tui);
+        let err = parse("ui = \"gui\"").unwrap_err();
+        assert!(matches!(err, ConfigError::Ui { .. }), "{err}");
+    }
+
+    #[test]
+    fn set_value_refuses_to_write_a_file_beam_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "port = 7820\n").unwrap();
+        assert!(set_value(&path, "port", Some("\"not a number\"")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "port = 7820\n");
     }
 }

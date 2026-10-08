@@ -6,14 +6,18 @@
 //! The command implementations live in [`cli`] rather than in the binary so
 //! that they can be exercised by tests; see `docs/decisions.md` ADR-0002.
 
+pub mod agent;
 pub mod cli;
 pub mod config;
 pub(crate) mod hex;
+pub mod history;
 pub mod identity;
 pub mod invite;
+pub mod listen_status;
 pub mod listener;
 pub mod pairing;
 pub mod transfer;
 pub mod transport;
+pub mod tui;
 pub mod ui;
 pub mod untrusted;

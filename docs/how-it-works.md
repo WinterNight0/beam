@@ -201,7 +201,16 @@ saves Alice's key                                    saves Bob's key + where Bob
 
 - Six digits, **single use**: the first connection that tries it spends it,
   right or wrong.
-- `listen` makes a new one after every attempt and every 10 minutes.
+- `listen` makes a new one after every attempt and every 10 minutes. It
+  prints the code only once, at start. **`beam whoami` shows the current one**,
+  with when it expires (ADR-0037). `listen` keeps it in `~/.beam/listen.json`,
+  a private file that `whoami` believes only while `listen` holds the lock on
+  `~/.beam/listen.lock`, so a crashed `listen` never leaves a stale code on
+  show.
+- A code that has just been renewed fails exactly like a mistyped one, and
+  beam cannot tell them apart: SPAKE2 reveals nothing about which code was
+  tried. The joiner's error therefore says the code may have expired and how
+  to get the current one.
 - A wrong code pauses pairing for 5 seconds, then 10, doubling up to 5 minutes.
   **Three wrong codes in a row turn pairing off** until `listen` is restarted,
   while transfers from paired devices keep working. This bounds guessing to
@@ -302,7 +311,8 @@ speaks a different version fails the handshake instead of misreading messages.
 | ALPN | Used for |
 |---|---|
 | `beam/pair/1` | pairing (section 4) |
-| `beam/xfer/1` | file transfers (section 7) |
+| `beam/xfer/2` | file transfers, several chunks in flight (section 7) |
+| `beam/xfer/1` | file transfers, one chunk at a time; still accepted, and used with an older beam |
 
 For a transfer, `listen` checks **the key the connection proved** against
 `known_peers`:
@@ -346,6 +356,7 @@ spans about 64 frames.
 Sender (beam send)                                      Receiver (beam listen)
 ──────────────────                                      ──────────────────────
 hashes the whole file (SHA-256)   "Hashing …"
+  and remembers each chunk's hash
 TRANSFER_REQUEST {transfer_id, file_name, size,
                   chunk_size, chunk_count, file_sha256} ──►
                                                         checks: known peer? sane request?
@@ -354,14 +365,17 @@ TRANSFER_REQUEST {transfer_id, file_name, size,
                                           ◄── ACCEPT {transfer_id, have_bitmap}
                                               (or REJECT {reason}: declined, expired,
                                                unknown peer, busy, no space, bad request)
-for each chunk the receiver does not have:
+for each chunk the receiver does not have, up to 4 on the way at once:
+  re-reads it, checks it against the remembered hash
+  (a changed file: CANCEL and stop)
   CHUNK_START {index, len, sha256}                    ──►
   CHUNK_DATA  {index, bytes} × ~64                    ──►
-                                                        hash matches? write it, flush,
-                                                        record it in the bitmap, flush
+                                                        hash matches? write it, record
+                                                        it in the bitmap; every 8
+                                                        chunks: flush to disk
                                           ◄── CHUNK_ACK {index}
-                                              (or CHUNK_NAK → the sender resends,
-                                               up to 3 attempts)
+                                              (or CHUNK_NAK → the sender resends it
+                                               after the others, up to 3 attempts)
 COMPLETE {transfer_id}                                ──►
                                                         re-hashes the whole file
                                           ◄── VERIFYING {done, total} (keep-alives)
@@ -416,7 +430,12 @@ Code: `src/transfer/` (`message.rs`, `frame.rs`, `sender.rs`, `receiver.rs`,
 ## 8. Resuming an interrupted transfer
 
 If a transfer breaks (Wi-Fi drops, a laptop sleeps, someone presses Ctrl+C),
-the chunks already received stay in `~/.beam/tmp/<transfer_id>/`:
+the chunks already received stay in `~/.beam/tmp/<transfer_id>/`. When it was
+Ctrl+C, the other device is told at once: beam closes the connection with its
+own "interrupted" code, and both terminals say which side stopped the transfer
+(ADR-0041).
+
+The partial transfer is kept in these files:
 
 | File | Holds |
 |---|---|
@@ -438,13 +457,51 @@ sender chooses, so nobody can attach to someone else's partial. Then:
    (ADR-0020).
 3. ACCEPT carries the bitmap, and the sender skips the chunks marked present.
 
-**Crash safety:** a chunk's data is flushed to disk *before* its bit is set and
-flushed. After a crash, at worst a chunk that was actually written is fetched
-again. Data is never claimed that is not there (D-10, ADR-0022).
+**Crash safety:** a chunk's data is written *before* its bit is set, and the
+disk is flushed every 8 chunks (32 MiB), after the last chunk, and whenever a
+transfer stops. If beam is killed or crashes, nothing is lost: the operating
+system still writes out what beam gave it. After power loss, the last batch
+may not have reached the disk. That is why the bitmap is only a claim: on
+resume every claimed chunk is re-hashed, and one that did not survive is
+fetched again. A chunk is never trusted without passing its hash (D-10, D-11,
+D-15, ADR-0022, ADR-0039).
 
 Partials are kept after a decline, an expiry or a lost connection, deleted on
 success or when the final hash fails, and expire after seven days.
 `beam transfers` lists them, and `beam transfers --clear` deletes them.
+
+### Receiving without `beam listen`: the background agent
+
+`beam service enable` starts an optional **background agent** at login. It
+runs the same listener as `beam listen`, with three differences:
+
+* it does not pair;
+* router port mapping is off unless turned on;
+* a request waits up to 5 minutes.
+
+When a paired device sends something, the agent shows a desktop notification.
+The person answers in a terminal with `beam inbox`, which shows the same
+Accept prompt. `beam inbox` reaches the agent over `127.0.0.1` and must
+present the token from the private `~/.beam/agent.json` before the agent tells
+it anything. The agent runs as the user, never as a system service. Details,
+the security analysis and the limits: [background-services.md](background-services.md)
+(ADR-0042).
+
+### The full-screen view
+
+Typing `beam` alone opens a full-screen view (ratatui), laid out like
+Discord's Friends page: friends on the left, the selected friend's files in
+the middle, their fingerprint and "last seen" on the right. It sends, answers
+requests (through the background agent, as `beam inbox` does), pairs, and runs
+any other command from a palette. It reuses the same code as the commands:
+`pairing::join`/`wait`, the agent link, `send_on`. Long work runs on
+background threads so the screen stays responsive. Every answer that matters
+starts on the safe choice. `~/.beam/history.jsonl` records what came and
+went. A **Receiving** switch at the top of its Pending tab runs the
+background agent's receiver inside the view while beam is open (ADR-0044);
+sending starts with a file browser of every drive, and the first run offers to
+create the identity (ADR-0045). `beam ui cli` turns the view off. Details:
+[tui.md](tui.md) (ADR-0043).
 
 ---
 
@@ -480,20 +537,27 @@ speed = min( sender's upload,  receiver's download,  the path,  beam's own limit
 - **The path:** on `[Relay]`, every byte makes a detour through the relay.
   n0's public relay is shared and rate-limited, so large relayed transfers are
   slow whatever the two connections can do.
-- **beam's own limits** (measured from the code, not yet changed):
-  - QUIC's per-stream window is **1.25 MB** (the default of iroh's QUIC
-    library). One stream can only have that much unacknowledged data in
-    flight, so speed ≤ 1.25 MB ÷ round-trip time: about 125 MB/s at 10 ms, but
-    about 12.5 MB/s at 100 ms.
-  - **One chunk at a time.** After each 4 MiB chunk, the sender waits for
-    CHUNK_ACK while the receiver hashes, writes and flushes the chunk twice.
-    The line is idle for one round trip plus that disk time, every 4 MiB.
+- **beam's own limits** (ADR-0039 raised two of them):
+  - **QUIC windows.** One stream may have up to **16 MiB** unacknowledged
+    data in flight, and one connection 32 MiB across all its streams. iroh's
+    QUIC library defaults to 1.25 MB per stream, which allowed only about
+    12.5 MB/s at a 100 ms round trip.
+  - **Four chunks in flight** (ADR-0040). The sender keeps up to four 4 MiB
+    chunks on the way before their CHUNK_ACKs arrive, so the line is not idle
+    while it waits. One at a time cost about two round trips per chunk: 34 MB/s
+    at 50 ms, 17 MB/s at 100 ms. Four in flight measured about 108 MB/s and
+    73 MB/s. With an older beam on the other side (`beam/xfer/1`) it is still
+    one at a time.
+  - **Disk flushes in batches.** Received chunks are recorded at once but
+    flushed to disk every 8 chunks (32 MiB), not after each one.
+    A transfer that stops keeps everything it verified; only a crash of the
+    receiver can lose the last unflushed batch, which resume asks for again.
   - **Two full reads outside the progress bar**: the sender hashes the whole
-    file before asking, and the receiver re-hashes it at the end.
+    file before asking, and the receiver re-hashes it at the end. On an SSD
+    each runs at about 1.5 GB/s, so this matters little.
 
-A larger QUIC window, several chunks in flight, and fewer disk flushes are the
-candidate improvements. They are to be planned and measured before any change,
-because two of them touch the protocol or the crash-safety rules.
+What has been measured, with the benchmark that measures it, is in
+[performance-plan.md](performance-plan.md).
 
 ---
 
@@ -501,10 +565,13 @@ because two of them touch the protocol or the crash-safety rules.
 
 ```
 crates/beam/src/
-  main.rs              entry point; hands the arguments to cli::execute
+  main.rs              entry point: plain `beam` → cli::start (the view), else cli::execute
   cli/                 one file per group of commands
     mod.rs             the command tree (clap)
     identity_cmds.rs   init, whoami, peers, rename, remove
+    agent_cmds.rs      agent, inbox, service, receive-dir
+    history_cmds.rs    history
+    ui_cmds.rs         ui (what plain `beam` opens)
     pair_cmds.rs       pair <invite>, pair --wait, the address update
     net_cmds.rs        listen and send over iroh, and their messages
     transfer_cmds.rs   transfers; the hidden TCP test transport
@@ -522,7 +589,10 @@ crates/beam/src/
     endpoint.rs        the iroh endpoint from beam's key; port and relay setup
     dial.rs            dialling a peer; following [Direct P2P]/[Relay]
   transfer/            the protocol, the state machine, chunks, partials, commit
-  config.rs            ~/.beam/config.toml: relay and port
+  agent/               the background agent, its local link, notifications, login start
+  tui/                 the full-screen view: state, drawing, palette, workers
+  history.rs           ~/.beam/history.jsonl: what came and went
+  config.rs            ~/.beam/config.toml: relay, port, receive folder, ui
   untrusted.rs         makes text from the other side safe for the terminal
   ui.rs                formatting helpers
 crates/beam/tests/     command, integration, security and two-process tests

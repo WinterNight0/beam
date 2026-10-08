@@ -21,6 +21,23 @@ pub const PUBLIC_KEY_NAME: &str = "id_ed25519.pub";
 pub const KNOWN_PEERS_NAME: &str = "known_peers";
 pub const TMP_NAME: &str = "tmp";
 pub const CONFIG_NAME: &str = "config.toml";
+/// What a running `beam listen` offers, for `beam whoami` (ADR-0037).
+pub const LISTEN_STATUS_NAME: &str = "listen.json";
+/// Held locked by a running `beam listen`; `listen.json` counts only while it is.
+pub const LISTEN_LOCK_NAME: &str = "listen.lock";
+/// What a running background agent offers `beam inbox`: its local port and
+/// the token that proves a client is this user (ADR-0042). Private.
+pub const AGENT_STATUS_NAME: &str = "agent.json";
+/// Held locked by a running background agent; `agent.json` counts only while
+/// it is.
+pub const AGENT_LOCK_NAME: &str = "agent.lock";
+/// What the background agent did, for when nobody was watching.
+pub const AGENT_LOG_NAME: &str = "agent.log";
+/// What came and went, one JSON line per transfer (ADR-0043). Private: it
+/// names files and peers.
+pub const HISTORY_NAME: &str = "history.jsonl";
+/// Held while `history.jsonl` is rewritten.
+pub const HISTORY_LOCK_NAME: &str = "history.lock";
 
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -62,7 +79,11 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    fn io(action: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+    pub(crate) fn io(
+        action: &'static str,
+        path: impl Into<PathBuf>,
+        source: std::io::Error,
+    ) -> Self {
         Self::Io {
             action,
             path: path.into(),
@@ -127,6 +148,68 @@ impl Store {
     /// The path of the `known_peers` database.
     pub fn known_peers_path(&self) -> PathBuf {
         self.dir.join(KNOWN_PEERS_NAME)
+    }
+
+    /// Where a running `beam listen` publishes its invite and pairing code.
+    pub fn listen_status_path(&self) -> PathBuf {
+        self.dir.join(LISTEN_STATUS_NAME)
+    }
+
+    /// The lock a running `beam listen` holds.
+    pub fn listen_lock_path(&self) -> PathBuf {
+        self.dir.join(LISTEN_LOCK_NAME)
+    }
+
+    /// Writes `listen.json` atomically. Private: it holds the live pairing
+    /// code (ADR-0037).
+    pub fn save_listen_status(&self, json: &str) -> Result<(), StoreError> {
+        self.ensure_dirs()?;
+        write_atomic(
+            &self.listen_status_path(),
+            json.as_bytes(),
+            Visibility::Private,
+        )
+    }
+
+    /// Where a running background agent publishes how to reach it.
+    pub fn agent_status_path(&self) -> PathBuf {
+        self.dir.join(AGENT_STATUS_NAME)
+    }
+
+    /// The lock a running background agent holds.
+    pub fn agent_lock_path(&self) -> PathBuf {
+        self.dir.join(AGENT_LOCK_NAME)
+    }
+
+    /// The background agent's log.
+    pub fn agent_log_path(&self) -> PathBuf {
+        self.dir.join(AGENT_LOG_NAME)
+    }
+
+    /// The transfer history (ADR-0043).
+    pub fn history_path(&self) -> PathBuf {
+        self.dir.join(HISTORY_NAME)
+    }
+
+    pub fn history_lock_path(&self) -> PathBuf {
+        self.dir.join(HISTORY_LOCK_NAME)
+    }
+
+    /// Writes `history.jsonl` atomically. Private: it names files and peers.
+    pub fn save_history(&self, text: &str) -> Result<(), StoreError> {
+        self.ensure_dirs()?;
+        write_atomic(&self.history_path(), text.as_bytes(), Visibility::Private)
+    }
+
+    /// Writes `agent.json` atomically. Private: it holds the token that lets
+    /// a local client answer transfer requests (ADR-0042).
+    pub fn save_agent_status(&self, json: &str) -> Result<(), StoreError> {
+        self.ensure_dirs()?;
+        write_atomic(
+            &self.agent_status_path(),
+            json.as_bytes(),
+            Visibility::Private,
+        )
     }
 
     /// The directory for in-progress transfers (used from M2 onwards).
