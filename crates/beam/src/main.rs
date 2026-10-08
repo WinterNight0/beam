@@ -18,7 +18,12 @@ fn main() -> ExitCode {
             out: &mut out,
             err: &mut err,
         };
-        beam::cli::execute(std::env::args_os().skip(1), &mut streams)
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        if args.is_empty() {
+            beam::cli::start(&mut streams)
+        } else {
+            beam::cli::execute(args, &mut streams)
+        }
     };
 
     let _ = out.flush();

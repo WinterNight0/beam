@@ -17,6 +17,7 @@ use super::terminal::TerminalReporter;
 use super::transfer_cmds::{EitherReporter, ReceiveJson, SendJson, reporter_for};
 use super::{App, CommandError, Io};
 use crate::config::Config;
+use crate::history;
 use crate::identity::{Fingerprint, encode_public_key};
 use crate::invite;
 use crate::listen_status::Board;
@@ -180,6 +181,15 @@ impl App {
             options.chunk_size = chunk_size;
         }
 
+        let size = std::fs::metadata(file).map_or(0, |m| m.len());
+        let file_name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // How it ended, for `history.jsonl` (ADR-0043).
+        let ended: std::sync::Mutex<Option<(history::Outcome, Option<String>)>> =
+            std::sync::Mutex::new(None);
+
         let runtime = self.runtime()?;
         let result = runtime.block_on(async {
             if !self.json {
@@ -192,9 +202,11 @@ impl App {
             // The connection, once there is one, so Ctrl+C can tell the peer.
             let live = std::sync::Mutex::new(None);
             let outcome = async {
-                let connection = dial_transfer(&endpoint, peer_addr)
-                    .await
-                    .map_err(|e| unreachable_message(&peer_name, &peer_key, e))?;
+                let connection = dial_transfer(&endpoint, peer_addr).await.map_err(|e| {
+                    *ended.lock().expect("not poisoned") =
+                        Some((history::Outcome::Failed, Some("not reachable".to_string())));
+                    unreachable_message(&peer_name, &peer_key, e)
+                })?;
                 *live.lock().expect("not poisoned") = Some(connection.clone());
                 if !self.json {
                     writeln!(io.out, "Sending {} to {peer_name}", file.display())?;
@@ -203,6 +215,7 @@ impl App {
                 let mut reporter = reporter_for(self.json);
                 let sent = send_on(&connection, &mut options, &mut reporter).await;
                 reporter.finish();
+                *ended.lock().expect("not poisoned") = Some(history::send_outcome(&sent));
                 sent.map_err(|e| refused_message(&peer_name, e))
             };
             // Ctrl+C: tell the receiver, so it does not wait for a timeout,
@@ -214,6 +227,8 @@ impl App {
                     if let Some(connection) = &connection {
                         interrupt(connection);
                     }
+                    *ended.lock().expect("not poisoned") =
+                        Some(history::stopped_outcome(connection.is_some()));
                     (Err(interrupted_message(&peer_name, connection.is_some())), true)
                 }
             };
@@ -259,6 +274,20 @@ impl App {
             Ok::<(), CommandError>(())
         });
         runtime.shutdown_timeout(Duration::from_secs(1));
+        if let Some((outcome, note)) = ended.into_inner().expect("not poisoned") {
+            history::record(
+                &self.store,
+                &history::Entry::now(
+                    history::Direction::Sent,
+                    &peer_name,
+                    &Fingerprint::of(&peer_key).hex(),
+                    &file_name,
+                    size,
+                    outcome,
+                    note,
+                ),
+            );
+        }
         result
     }
 }
@@ -291,7 +320,7 @@ fn interrupted_message(peer: &str, told: bool) -> CommandError {
 }
 
 /// Why `send` could not reach the peer, in words that say what to do.
-fn unreachable_message(
+pub(crate) fn unreachable_message(
     peer: &str,
     key: &ed25519_dalek::VerifyingKey,
     error: DialError,
@@ -322,7 +351,7 @@ fn unreachable_message(
 }
 
 /// A refusal from the peer, said the way a person would say it.
-fn refused_message(peer: &str, error: TransferError) -> CommandError {
+pub(crate) fn refused_message(peer: &str, error: TransferError) -> CommandError {
     match error {
         TransferError::PeerInterrupted => CommandError::Message(format!(
             "{peer} stopped beam on their side (Ctrl+C), so the transfer was cancelled.\n       \

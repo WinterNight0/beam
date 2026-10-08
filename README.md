@@ -57,6 +57,9 @@ folder. So the real fix is putting beam's folder on PATH.)
 ## Use
 
 ```
+beam                           # open the full-screen view (friends, details, agent)
+beam ui cli                    # make plain `beam` print the help instead (`beam ui tui` undoes it)
+
 beam init                      # generate this device's keypair (once per machine)
 beam whoami                    # show your fingerprint
 beam peers                     # list paired peers
@@ -67,6 +70,8 @@ beam listen                    # wait for transfers and pairing: shows invite + 
 beam send alice project.zip    # send a file to a paired peer
 beam transfers                 # list partly received transfers
 beam transfers --clear         # discard them
+beam history                   # what came and went, newest first
+beam history --clear           # delete that record
 
 beam pair <INVITE> --name bob  # pair with a listening device, typing its code
 beam pair --wait --name alice  # pair without also receiving files
@@ -81,6 +86,12 @@ The background agent is optional. With it on, paired devices can send while
 `beam listen` is closed: you get a notification and answer in `beam inbox`.
 It never accepts anything by itself, and it does not pair. See
 [docs/background-services.md](docs/background-services.md).
+
+**The full-screen view.** `beam` on its own opens a view like Discord's
+Friends page: your friends, their files, what is waiting for you, pairing,
+and a command palette (`:` or Ctrl+P) for everything else. Press `s` to send
+to a friend; answer requests in the Pending tab. In the view, **Ctrl+C copies
+and Ctrl+Q quits**. `beam ui cli` turns it off. See [docs/tui.md](docs/tui.md).
 
 `listen` saves into the current directory unless given `--out <dir>`. Its
 pairing code works once and changes every ten minutes. It is shown once, when

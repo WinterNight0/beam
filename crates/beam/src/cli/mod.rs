@@ -5,12 +5,14 @@
 
 mod agent_cmds;
 pub mod desk;
+mod history_cmds;
 mod identity_cmds;
-mod net_cmds;
+pub(crate) mod net_cmds;
 mod pair_cmds;
 mod stubs;
 mod terminal;
 mod transfer_cmds;
+mod ui_cmds;
 
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
@@ -31,7 +33,10 @@ const LONG_ABOUT: &str = "\
 beam sends files directly between two computers.
 
 A peer must be paired before it can send you anything, and every incoming
-transfer has to be accepted by hand. There is no auto-accept.";
+transfer has to be accepted by hand. There is no auto-accept.
+
+`beam` with nothing after it opens the full-screen view; `beam ui cli`
+makes it print this help instead.";
 
 /// The streams a command reads from and writes to.
 ///
@@ -219,6 +224,20 @@ enum Command {
         yes: bool,
     },
 
+    /// Show what came and went
+    ///
+    /// Every transfer that reached a person, newest first: sent, saved,
+    /// declined, cancelled or failed. Kept in ~/.beam/history.jsonl, private,
+    /// newest 1000.
+    History {
+        /// Delete the history instead of showing it
+        #[arg(long)]
+        clear: bool,
+        /// Do not ask for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// Run the background agent in this terminal
     ///
     /// The agent receives files from paired devices without `beam listen`
@@ -262,6 +281,16 @@ enum Command {
         default: bool,
     },
 
+    /// Choose what plain `beam` opens: the full-screen view or this help
+    ///
+    /// tui (the default): `beam` with nothing after it opens the full-screen
+    /// view. cli: it prints the help, and you type every command. Commands
+    /// work the same either way. Without a value, shows the current choice.
+    Ui {
+        #[arg(value_enum)]
+        mode: Option<ui_cmds::UiChoice>,
+    },
+
     /// Show the beam version
     Version,
 }
@@ -294,6 +323,63 @@ pub(crate) struct App {
 /// The command tree, for tests that need to inspect the CLI's own shape.
 pub fn command() -> clap::Command {
     Cli::command()
+}
+
+/// Runs plain `beam`, typed with nothing after it, and returns the exit code.
+///
+/// On a terminal, with `ui = "tui"` (the default), that is the full-screen
+/// view. Otherwise — `ui = "cli"`, or output going to a pipe or a file — it
+/// is the help, as it always was (ADR-0043). Anything typed after `beam`
+/// goes to [`execute`] and never opens the view.
+pub fn start(io: &mut Io<'_>) -> i32 {
+    use std::io::IsTerminal;
+
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && let Ok(dir) = Store::default_dir()
+    {
+        let store = Store::new(dir);
+        match crate::config::Config::load(&store.config_path()) {
+            Ok(config) if config.ui == crate::config::UiMode::Tui => {
+                return match crate::tui::run(&store) {
+                    Ok(()) => EXIT_OK,
+                    Err(e) => {
+                        let _ = writeln!(io.err, "beam: {e}");
+                        EXIT_ERROR
+                    }
+                };
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = writeln!(io.err, "beam: {e}");
+            }
+        }
+    }
+    execute(std::iter::empty::<OsString>(), io)
+}
+
+/// Whether `args` (without the leading `beam`) is a command the CLI would
+/// run, or why not, in one line. The full-screen view's command palette
+/// uses it, so it accepts exactly what the command line does (ADR-0043).
+pub fn check(args: &[String]) -> Result<(), String> {
+    let argv = std::iter::once("beam".to_string()).chain(args.iter().cloned());
+    match Cli::try_parse_from(argv) {
+        Ok(cli) if cli.command.is_some() => Ok(()),
+        Ok(_) => Err("type a command, such as `peers`".to_string()),
+        Err(err) => match err.kind() {
+            ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => Ok(()),
+            _ => {
+                let text = err.render().to_string();
+                let line = text
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("not a beam command");
+                Err(line.trim_start_matches("error: ").trim().to_string())
+            }
+        },
+    }
 }
 
 /// Runs the command tree and returns the process exit code.
@@ -399,6 +485,7 @@ impl App {
                 None => self.send(&peer, &file, chunk_size, loopback, io),
             },
             Command::Transfers { clear, id, yes } => self.transfers(clear, id.as_deref(), yes, io),
+            Command::History { clear, yes } => self.history(clear, yes, io),
             Command::Agent { loopback } => self.agent(loopback, io),
             Command::Inbox => self.inbox(io),
             Command::Service { action } => match action {
@@ -410,6 +497,7 @@ impl App {
                 ServiceCommand::PortMapping { state } => self.port_mapping(state, io),
             },
             Command::ReceiveDir { path, default } => self.receive_dir(path, default, io),
+            Command::Ui { mode } => self.ui(mode, io),
             Command::Version => stubs::version(io),
         }
     }

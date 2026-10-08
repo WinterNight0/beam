@@ -376,6 +376,32 @@ fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
             outcome.stderr
         );
     }
+
+    // The attempt is in the history, as a failure to reach alice (ADR-0043).
+    let history = beam::history::read(&store);
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0].direction, beam::history::Direction::Sent);
+    assert_eq!(history[0].outcome, beam::history::Outcome::Failed);
+    assert_eq!(history[0].file, "note.txt");
+    assert_eq!(
+        history[0].fingerprint,
+        Store::new(&dir)
+            .load_known_peers()
+            .unwrap()
+            .lookup("alice")
+            .unwrap()
+            .fingerprint()
+            .hex()
+    );
+    let shown = run(&dir, "", &["history"]);
+    assert!(
+        shown.stdout.contains("sent to alice") && shown.stdout.contains("failed"),
+        "{}",
+        shown.stdout
+    );
+    let cleared = run(&dir, "", &["history", "--clear", "--yes"]);
+    assert_eq!(cleared.code, EXIT_OK, "{}", cleared.stderr);
+    assert!(beam::history::read(&store).is_empty());
 }
 
 /// With the relay off and no address saved there is nowhere to look; beam says
@@ -926,4 +952,47 @@ fn an_ambiguous_transfer_id_is_refused_rather_than_guessed() {
         run(&dir, "", &["transfers"]).stdout.contains("one.zip"),
         "an ambiguous id deleted something anyway"
     );
+}
+
+#[test]
+fn beam_ui_switches_what_plain_beam_opens_and_keeps_the_rest_of_the_config() {
+    let (_tmp, dir) = beam_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    fs::write(&config, "# mine\nport = 0\n").unwrap();
+
+    let shown = run(&dir, "", &["ui"]);
+    assert_eq!(shown.code, EXIT_OK, "{}", shown.stderr);
+    assert!(
+        shown.stdout.contains("opens the full-screen view"),
+        "{}",
+        shown.stdout
+    );
+
+    let cli = run(&dir, "", &["ui", "cli"]);
+    assert_eq!(cli.code, EXIT_OK, "{}", cli.stderr);
+    assert!(cli.stdout.contains("now prints the help"), "{}", cli.stdout);
+    let text = fs::read_to_string(&config).unwrap();
+    assert_eq!(text, "# mine\nport = 0\nui = \"cli\"\n");
+
+    let json = run(&dir, "", &["--json", "ui"]);
+    let value: Value = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(value["ui"], "cli");
+
+    let tui = run(&dir, "", &["ui", "tui"]);
+    assert_eq!(tui.code, EXIT_OK, "{}", tui.stderr);
+    assert_eq!(fs::read_to_string(&config).unwrap(), "# mine\nport = 0\n");
+
+    let bad = run(&dir, "", &["ui", "gui"]);
+    assert_eq!(bad.code, EXIT_ERROR);
+}
+
+#[test]
+fn arguments_never_open_the_full_screen_view() {
+    // `--beam-dir` alone is an argument: the help, not the view.
+    let (_tmp, dir) = beam_dir();
+    let outcome = run(&dir, "", &[]);
+    assert_eq!(outcome.code, EXIT_OK, "{}", outcome.stderr);
+    assert!(outcome.stdout.contains("Usage"), "{}", outcome.stdout);
+    assert!(outcome.stdout.contains("beam ui cli"), "{}", outcome.stdout);
 }

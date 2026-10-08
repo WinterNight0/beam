@@ -30,6 +30,7 @@ hmac = "0.13.0"
 # Pinned exactly: iroh is the transport, and a minor bump changes how beam
 # behaves on a network. Bumping it is its own reviewed commit. ADR-0025.
 iroh = "=1.2.0"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

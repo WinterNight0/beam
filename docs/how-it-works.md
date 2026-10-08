@@ -487,6 +487,18 @@ it anything. The agent runs as the user, never as a system service. Details,
 the security analysis and the limits: [background-services.md](background-services.md)
 (ADR-0042).
 
+### The full-screen view
+
+Typing `beam` alone opens a full-screen view (ratatui), laid out like
+Discord's Friends page: friends on the left, the selected friend's files in
+the middle, their fingerprint and "last seen" on the right. It sends, answers
+requests (through the background agent, as `beam inbox` does), pairs, and runs
+any other command from a palette. It reuses the same code as the commands:
+`pairing::join`/`wait`, the agent link, `send_on`. Long work runs on
+background threads so the screen stays responsive. Every answer that matters
+starts on the safe choice. `~/.beam/history.jsonl` records what came and
+went. `beam ui cli` turns the view off. Details: [tui.md](tui.md) (ADR-0043).
+
 ---
 
 ## 9. Who sees what
@@ -570,7 +582,10 @@ crates/beam/src/
     endpoint.rs        the iroh endpoint from beam's key; port and relay setup
     dial.rs            dialling a peer; following [Direct P2P]/[Relay]
   transfer/            the protocol, the state machine, chunks, partials, commit
-  config.rs            ~/.beam/config.toml: relay and port
+  agent/               the background agent, its local link, notifications, login start
+  tui/                 the full-screen view: state, drawing, palette, workers
+  history.rs           ~/.beam/history.jsonl: what came and went
+  config.rs            ~/.beam/config.toml: relay, port, receive folder, ui
   untrusted.rs         makes text from the other side safe for the terminal
   ui.rs                formatting helpers
 crates/beam/tests/     command, integration, security and two-process tests

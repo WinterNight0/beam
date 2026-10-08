@@ -1,5 +1,5 @@
 //! `~/.beam/config.toml`: the relay, the port `listen` uses, where received
-//! files go, and the background agent's port mapping.
+//! files go, the background agent's port mapping, and what plain `beam` opens.
 //!
 //! Both are network choices rather than identity, so they live in a file a
 //! person edits by hand — TOML, not JSON, for that reason. A missing file
@@ -27,6 +27,10 @@
 //! # NAT-PMP, PCP). Off unless turned on, after a warning, with
 //! # `beam service port-mapping on` (ADR-0042).
 //! agent_port_mapping = false
+//!
+//! # What `beam` with nothing after it opens: "tui" (the full-screen view,
+//! # the default) or "cli" (the help, as before). Set with `beam ui`.
+//! ui = "cli"
 //! ```
 
 use std::fmt;
@@ -71,6 +75,26 @@ impl fmt::Display for Relay {
     }
 }
 
+/// What plain `beam`, with no arguments, opens (ADR-0043).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiMode {
+    /// The full-screen terminal view.
+    #[default]
+    Tui,
+    /// The help text; every command is typed out.
+    Cli,
+}
+
+impl UiMode {
+    /// The value as written in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Cli => "cli",
+        }
+    }
+}
+
 /// The settings beam reads from `config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -85,6 +109,8 @@ pub struct Config {
     pub receive_dir: Option<PathBuf>,
     /// Whether the background agent may ask the router to forward its port.
     pub agent_port_mapping: bool,
+    /// What plain `beam` opens.
+    pub ui: UiMode,
 }
 
 /// Why the config file could not be used.
@@ -107,6 +133,8 @@ pub enum ConfigError {
     Advertise { path: PathBuf, value: String },
     #[error("{path}: receive_dir must be a full path, not {value:?}")]
     ReceiveDir { path: PathBuf, value: String },
+    #[error("{path}: ui must be \"tui\" or \"cli\", not {value:?}")]
+    Ui { path: PathBuf, value: String },
 }
 
 /// The file as written. Unknown keys are an error, so a typo such as
@@ -123,6 +151,7 @@ struct RawConfig {
     advertise: Option<Vec<String>>,
     receive_dir: Option<String>,
     agent_port_mapping: Option<bool>,
+    ui: Option<String>,
 }
 
 impl Default for Config {
@@ -133,6 +162,7 @@ impl Default for Config {
             advertise: Vec::new(),
             receive_dir: None,
             agent_port_mapping: false,
+            ui: UiMode::Tui,
         }
     }
 }
@@ -192,6 +222,18 @@ impl Config {
             config.receive_dir = Some(dir);
         }
         config.agent_port_mapping = raw.agent_port_mapping.unwrap_or(false);
+        if let Some(value) = raw.ui {
+            config.ui = match value.trim().to_ascii_lowercase().as_str() {
+                "tui" => UiMode::Tui,
+                "cli" => UiMode::Cli,
+                _ => {
+                    return Err(ConfigError::Ui {
+                        path: path.to_path_buf(),
+                        value,
+                    });
+                }
+            };
+        }
         Ok(config)
     }
 }
@@ -433,6 +475,15 @@ mod tests {
 
         set_value(&path, "receive_dir", None).unwrap();
         assert_eq!(Config::load(&path).unwrap().receive_dir, None);
+    }
+
+    #[test]
+    fn ui_is_read_and_defaults_to_the_full_screen_view() {
+        assert_eq!(parse("").unwrap().ui, UiMode::Tui);
+        assert_eq!(parse("ui = \"cli\"").unwrap().ui, UiMode::Cli);
+        assert_eq!(parse("ui = \"TUI\"").unwrap().ui, UiMode::Tui);
+        let err = parse("ui = \"gui\"").unwrap_err();
+        assert!(matches!(err, ConfigError::Ui { .. }), "{err}");
     }
 
     #[test]

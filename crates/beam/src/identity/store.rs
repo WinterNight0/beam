@@ -33,6 +33,11 @@ pub const AGENT_STATUS_NAME: &str = "agent.json";
 pub const AGENT_LOCK_NAME: &str = "agent.lock";
 /// What the background agent did, for when nobody was watching.
 pub const AGENT_LOG_NAME: &str = "agent.log";
+/// What came and went, one JSON line per transfer (ADR-0043). Private: it
+/// names files and peers.
+pub const HISTORY_NAME: &str = "history.jsonl";
+/// Held while `history.jsonl` is rewritten.
+pub const HISTORY_LOCK_NAME: &str = "history.lock";
 
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -179,6 +184,21 @@ impl Store {
     /// The background agent's log.
     pub fn agent_log_path(&self) -> PathBuf {
         self.dir.join(AGENT_LOG_NAME)
+    }
+
+    /// The transfer history (ADR-0043).
+    pub fn history_path(&self) -> PathBuf {
+        self.dir.join(HISTORY_NAME)
+    }
+
+    pub fn history_lock_path(&self) -> PathBuf {
+        self.dir.join(HISTORY_LOCK_NAME)
+    }
+
+    /// Writes `history.jsonl` atomically. Private: it names files and peers.
+    pub fn save_history(&self, text: &str) -> Result<(), StoreError> {
+        self.ensure_dirs()?;
+        write_atomic(&self.history_path(), text.as_bytes(), Visibility::Private)
     }
 
     /// Writes `agent.json` atomically. Private: it holds the token that lets

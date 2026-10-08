@@ -31,6 +31,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::config::Relay;
+use crate::history::{self, Direction, Outcome};
 use crate::identity::{Fingerprint, Identity, Peer, Store};
 use crate::invite::Invite;
 use crate::pairing::rotation::{NewCodeReason, Notice, Policy, Rotation, Unavailable};
@@ -38,8 +39,8 @@ use crate::pairing::{
     Confirm, Network, Pairing, PairingCode, Timeouts, attempt_kind, refuse_connection, serve,
 };
 use crate::transfer::{
-    Prompt, ReceiveOptions, ReceiveSummary, RejectReason, Reporter, TransferId, receive_file,
-    turn_away,
+    Prompt, PromptRequest, ReceiveOptions, ReceiveSummary, RejectReason, Reporter, TransferId,
+    receive_file, turn_away,
 };
 use crate::transport::dial::{interrupt, peer_interrupted, watch_route};
 use crate::transport::endpoint::{
@@ -527,18 +528,25 @@ where
     options.proven_sender = Some(peer_key);
 
     let mut reporter = (shared.reporter)();
+    let asked = Arc::new(Mutex::new(None));
+    let prompt = Remembering {
+        inner: shared.prompt.clone(),
+        asked: Arc::clone(&asked),
+    };
     let result = {
         let mut seen = shared.seen.lock().await;
         receive_file(
             tokio::io::join(recv, send),
             &known,
             &options,
-            shared.prompt.clone(),
+            prompt,
             &mut reporter,
             &mut seen,
         )
         .await
     };
+    let asked = asked.lock().expect("not poisoned").take();
+    remember_in_history(shared, &connection, peer, asked, &result);
     drop(reporter);
     forget(shared, &connection);
     // The transfer is over, whatever the peer does next: free the slot now,
@@ -555,6 +563,75 @@ where
         }
     }
     linger_then_close(&connection).await;
+}
+
+/// The listener's prompt, noting what was asked and what the answer was, so
+/// the history can say which file was declined.
+#[derive(Clone)]
+struct Remembering<Q> {
+    inner: Q,
+    asked: Asked,
+}
+
+/// The request shown, and the answer once given.
+type Asked = Arc<Mutex<Option<(PromptRequest, Option<bool>)>>>;
+
+impl<Q: Prompt> Prompt for Remembering<Q> {
+    fn confirm(&mut self, request: &PromptRequest) -> std::io::Result<bool> {
+        *self.asked.lock().expect("not poisoned") = Some((request.clone(), None));
+        let answer = self.inner.confirm(request);
+        if let Ok(yes) = &answer
+            && let Some((_, said)) = self.asked.lock().expect("not poisoned").as_mut()
+        {
+            *said = Some(*yes);
+        }
+        answer
+    }
+}
+
+/// Writes the receiver's line in `history.jsonl` (ADR-0043): only for a
+/// request that reached a person, so a peer cannot fill it with requests
+/// refused before the prompt.
+fn remember_in_history<Q, R>(
+    shared: &Shared<Q, R>,
+    connection: &Connection,
+    peer: Fingerprint,
+    asked: Option<(PromptRequest, Option<bool>)>,
+    result: &Result<ReceiveSummary, crate::transfer::TransferError>,
+) {
+    let entry = match (result, asked) {
+        (Ok(summary), _) => history::Entry::now(
+            Direction::Received,
+            &summary.peer_name,
+            &summary.fingerprint,
+            &summary.final_name,
+            summary.bytes,
+            Outcome::Done,
+            summary.resumed.then(|| "resumed".to_string()),
+        ),
+        (Err(_), None) => return,
+        (Err(e), Some((request, answer))) => {
+            let (outcome, note) = if shared.stopping.load(Ordering::SeqCst) {
+                (Outcome::Cancelled, Some("you stopped beam".to_string()))
+            } else if answer == Some(false) {
+                (Outcome::Declined, None)
+            } else if peer_interrupted(connection) {
+                (Outcome::Cancelled, Some("they stopped beam".to_string()))
+            } else {
+                (Outcome::Failed, Some(e.to_string()))
+            };
+            history::Entry::now(
+                Direction::Received,
+                &request.peer_name,
+                &peer.to_string(),
+                &request.file_name,
+                request.size,
+                outcome,
+                note,
+            )
+        }
+    };
+    history::record(&shared.store, &entry);
 }
 
 /// No longer counts `connection` as a transfer in progress.

@@ -518,6 +518,23 @@ invite by chat and the code by another channel; the other runs `beam pair
 | F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
 | S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
 
+## Implemented (post-M6): the full-screen view and history (ADR-0043)
+
+The full list, by layer, and the manual steps are in
+[tui.md §8](tui.md). Test names below are in `crates/beam/src/tui/` unless a
+file is given.
+
+| Requirement | Test |
+|---|---|
+| F-29 plain `beam` opens the view; arguments never do | `tests/cli.rs::arguments_never_open_the_full_screen_view`; `cli::start` falls back to help off a terminal (manual: `beam \| more`) |
+| F-30 `beam ui cli\|tui` | `tests/cli.rs::beam_ui_switches_what_plain_beam_opens_and_keeps_the_rest_of_the_config`, `config::ui_is_read_and_defaults_to_the_full_screen_view` |
+| F-31 / S-42 command palette | `palette::tests::*`, `app::tests::a_whole_command_runs_where_it_belongs_and_is_remembered`, `a_wrong_command_says_why_and_stays_open`, `nothing_typed_in_the_palette_can_accept_a_transfer`, `tests::a_command_run_here_uses_this_views_home_and_shows_its_output` |
+| F-32 Add friend, fingerprint check starts on No | `pairing::tests::two_views_pair_through_the_real_protocol_and_both_save`, `a_no_on_either_side_saves_nothing_on_both`, `app::tests::the_fingerprint_check_starts_on_no`, `the_code_pop_up_takes_digits_and_never_sends_a_malformed_code`, `a_relay_change_starts_on_no`, `tests::pair_checks_the_invite_and_the_name_before_any_network` |
+| F-33 Pending and the Accept pop-up (starts on Decline) | `inbox::tests::with_an_agent::accepting_in_the_view_saves_the_file`, `declining_in_the_view_saves_nothing`, `pending::tests::*`, `view::tests::the_accept_pop_up_shows_who_what_how_big_and_the_fingerprint` |
+| F-34 / S-43 history and last seen | `history::tests::*` (`src/history.rs`), `tests/cli.rs::send_to_a_peer_that_is_not_listening_says_how_to_re_pair` (a real `send` writes its line; `beam history`, `--clear`), the agent tests above (receiver's line), `view::tests::a_friends_panel_lists_their_files_newest_first_and_when_last_seen` |
+| F-35 sending from the view | `sending::tests::a_send_from_the_view_waits_for_the_yes_then_arrives`, `a_decline_is_said_plainly_and_nothing_arrives`, `cancelling_while_they_decide_tells_them_and_is_recorded`, `send::tests::*` |
+| Keys, mouse, terminal | `tests::ctrl_c_copies_ctrl_q_quits_and_other_ctrl_keys_are_ignored`, `left_clicks_and_the_wheel_count_and_mouse_moves_do_not`, `view::tests::clicking_where_a_friend_was_drawn_selects_them`, `a_tiny_terminal_does_not_panic`, `input::tests::*` |
+
 ## Implemented (post-M6): background agent (ADR-0042)
 
 The full list, and the manual steps, are in

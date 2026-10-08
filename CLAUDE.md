@@ -13,6 +13,7 @@ routed through any server.
 ## Core user experience
 
 ```
+beam                           # full-screen view (ADR-0043); `beam ui cli` turns it off
 beam init                      # generate device keypair (once per machine)
 beam listen                    # wait for transfers; shows invite + pairing code
 beam pair <INVITE> --name alice  # first-time pairing using invite + pairing code
@@ -25,6 +26,7 @@ beam whoami                    # show own ID + fingerprint
 beam service enable            # optional background agent (ADR-0042)
 beam inbox                     # accept/decline what the agent holds
 beam receive-dir <folder>      # where received files go
+beam history                   # what came and went (ADR-0043)
 ```
 
 ## Non-negotiable rules
@@ -188,6 +190,22 @@ own workspace crates only if compile times demand it.
   `systemd --user`; never a system service. `beam receive-dir` sets `receive_dir`
   (Windows default: real Downloads folder; Linux: start folder). `listen` and the
   agent exclude each other. See `docs/background-services.md`.
+- **Post-M6 (ADR-0043)** Full-screen view (`src/tui/`, ratatui 0.30 +
+  crossterm via its re-export): plain `beam` on a terminal opens it unless
+  `ui = "cli"` (`beam ui cli|tui`); any argument means the normal CLI
+  (`cli::start` vs `cli::execute`). Discord Friends layout. `tui::app` is pure
+  state (unit tested), `tui::view` draws (TestBackend tests) and records click
+  areas. Ctrl+C copies, Ctrl+Q quits (as in Fresh). Steps: 1 view + toggle,
+  2 mouse/text boxes/rename/remove, 3 command palette (`:`/Ctrl+P, checked by
+  `cli::check`; `palette::place` = here / terminal (own process) / pop-up),
+  4 add friend (`tui::pairing` runs `pairing::join`/`wait` on a thread; code
+  pop-up → fingerprint check starting on No; port falls back so the agent never
+  pairs), 5 pending (`tui::inbox` = the `beam inbox` link; requests never pop
+  up by themselves; Accept pop-up starts on Decline), 6 history (`src/history.rs`,
+  private `history.jsonl`, written by `send` and the listener; `beam history`;
+  last seen = newest answered line), 7 send (`tui::sending` = `beam send` on a
+  thread, shared messages/history; one at a time; hide/cancel; quit asks),
+  8 docs (`docs/tui.md`) (done). No online dots.
 - **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.

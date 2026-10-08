@@ -2193,3 +2193,174 @@ to ask in, and running as SYSTEM or root would be dangerous.
   token learns nothing, no pairing, strangers refused, stop, one per home);
   unit tests in `agent::{status, ipc, notify, service}` and `config`; a
   manual real-process run on Windows (`background-services.md` §5).
+
+## ADR-0043 — Full-screen view: plain `beam` opens a TUI
+
+**Status:** accepted, step 1 of 7 (post-M6, branch `main-QoL`).
+
+**Context.** With the background agent (ADR-0042), beam is something a person
+keeps around rather than runs once. Typing `peers`, `inbox` and `send` one at
+a time hides what is going on. The team wants a full-screen view in the style
+of Discord's Friends page: friends on the left, each friend's transfers in the
+middle, details on the right. Fresh (a terminal editor) was the reference for
+how such a program is built in Rust.
+
+**Decisions taken with the team (2026-10-05):**
+- `beam` with nothing after it opens the view. Anything after it (`--help`,
+  `send …`, even `--beam-dir x`) is the normal CLI, unchanged.
+- A toggle stays for people who want only the CLI: `beam ui cli|tui`
+  (`ui` in `config.toml`, default `tui`).
+- Dependencies `ratatui` and `crossterm` approved (rule 4).
+- No live "online" dots: there is no server to know, and probing peers would
+  leak presence. The view shows "last seen" from local history (step 4).
+- Transfer history is kept, as a log of what came and went (step 4).
+- Pairing from the view uses a temporary port while that screen is open, so
+  the agent still never pairs (step 6).
+- (Second round) A command palette at the bottom, opened with `:` or Ctrl+P,
+  so every beam feature is usable from the view. Commands with no screen of
+  their own yet "step out": the view hides, the normal CLI runs with its
+  normal prompts, and Enter returns. Mouse first, and a text cursor in every
+  input box. Add friend becomes an invite box, then a pairing-code pop-up.
+- Keys as in Fresh: **Ctrl+C copies, Ctrl+Q quits**.
+
+### Decision
+
+* **ratatui 0.30 with only its crossterm backend** (`default-features =
+  false`), the same pair Fresh uses. crossterm comes through ratatui's
+  re-export, so the two versions can never disagree. Fresh's code is GPL-3.0
+  and is not copied; beam is MIT.
+* **Plain `beam` opens the view only on a terminal.** If stdin or stdout is
+  not a terminal (a pipe, a script, a test), or `ui = "cli"`, it prints the
+  help as before. `cli::start` makes that choice; `cli::execute` never opens
+  the view, so every existing test and script is unaffected.
+* **State and drawing are split.** `tui::app` turns a key into a new state
+  and never touches the terminal; `tui::view` draws a state; `tui` owns the
+  terminal. The state is unit tested, and the screens are tested with
+  ratatui's in-memory `TestBackend`.
+* **The terminal is always restored**: on a key, an error, or a panic.
+  `ratatui::init` installs a hook for raw mode and the screen; beam's own hook
+  also turns mouse capture and bracketed paste off first.
+* **Ctrl+C copies, Ctrl+Q quits.** In raw mode Ctrl+C is an ordinary key, not
+  a signal, which is how Fresh uses it for copy. `q` also quits when no text
+  box is open; Esc only closes pop-ups. ADR-0041 still holds for `beam send`
+  and `beam listen` on the CLI.
+* **Copy without a dependency:** the OS tool (`clip.exe`, `pbcopy`, `wl-copy`,
+  `xclip`, `xsel`), else an OSC 52 sequence to the terminal. Only text beam
+  made (fingerprints, invites) is copied.
+* **Mouse:** clicks pick tabs, friends, buttons and the cursor position in a
+  text box; the wheel scrolls the list. Drawing records where each clickable
+  thing landed (`app::Areas`), so hit-testing uses the real layout. Capturing
+  the mouse turns off the terminal's own selection; Shift+drag still selects,
+  and the help says so.
+* **Pop-ups that change something start on the safe choice**: Remove starts
+  on Keep. Pasted text arrives whole (bracketed paste) and is cleaned to one
+  line.
+* **The command palette accepts exactly what the CLI does.** A typed line is
+  split like a shell line (quotes keep spaces; backslashes are ordinary, for
+  Windows paths) and checked by `cli::check`, the CLI's own clap parser. A
+  partial line runs the best match if it is a whole command, or fills it in
+  (`send` → `send alice `) and waits. Tab completes friends and file paths.
+* **Where a palette command runs** (`palette::place`):
+  - *here*, in-process with captured output shown in a pop-up, for commands
+    that only print (`peers`, `whoami`, `service status|start|stop|…`,
+    `receive-dir`, `ui`, `--help`). They get empty input, which every beam
+    prompt reads as no.
+  - *terminal*, as a separate `beam` process after the view steps aside, for
+    commands that ask or keep running (`send`, `pair`, `listen`, `inbox`,
+    `init`, `transfers --clear`, `service port-mapping on`). Their prompts and
+    warnings are the reviewed CLI text, unchanged. A separate process keeps
+    their Ctrl+C their own (ADR-0041); a tokio Ctrl+C listener keeps it from
+    also ending the view while they run.
+  - the view's own pop-ups for `rename` and `remove` (`remove -y` still asks).
+* **Nothing in the palette can accept a transfer**: there is no such command,
+  and the check rejects anything the CLI would.
+* **Add friend runs the real pairing code** (`tui::pairing`): `pairing::join`
+  and `pairing::wait` on a background thread, with the view answering their
+  two questions (the code, and whether the fingerprints match) over a
+  channel. The protocol is unchanged: the code is typed before connecting and
+  checked for form before it is sent, so a typo is never a guess; the key
+  saved is the one the connection proved; a question left unanswered is a no.
+  Closing a pairing pop-up drops the worker, which cancels the attempt.
+* **The fingerprint check starts on No**, so Enter alone never pairs.
+* **Before any network**, Pair checks the invite, refuses this device's own,
+  and refuses a taken name. An invite for a friend already paired only
+  updates where to find them; if it changes their relay, a pop-up asks first
+  and starts on Keep (ADR-0038).
+* **Show my invite** binds the configured port, which falls back to a random
+  one when the agent or `listen` holds it, so the agent itself still never
+  pairs. The new friend is named after their device's suggestion
+  (`choose_name`), as with `listen`; rename changes it.
+* **Pending talks to the agent as `beam inbox` does** (`tui::inbox`): loopback,
+  the token from the private `agent.json`, the same messages. The agent keeps
+  the last word: one answer per request, the first wins, a late one is
+  refused (S-39). The view reconnects at each refresh, so an agent started
+  from the palette appears within seconds.
+* **A request never opens a pop-up by itself**, so a request arriving while
+  someone types cannot catch a stray Enter. It shows at once instead: a count
+  on the tab, a red "N waiting" in the header, a line in the status bar, and
+  a WAITING row in that friend's middle panel. Enter or a click opens it.
+* **The Accept pop-up shows what `listen` shows** (S-6): this device's name
+  for the sender, their fingerprint, the file, its size, what is already here
+  on a resume, and the time left. It **starts on Decline**; `d` declines; Esc
+  closes it and leaves the request waiting, and expiry is a no.
+* **History** (`src/history.rs`, `~/.beam/history.jsonl`): one JSON line per
+  transfer that reached a person — sent, saved, declined, cancelled, failed —
+  with the peer's nickname *and fingerprint* (so a renamed friend keeps their
+  files), file name, size and a short note. `beam send` writes the sender's
+  line; the listener writes the receiver's, so `listen` and the agent both
+  do. A request refused before any prompt is not written, so a stranger
+  cannot fill the file. Private, newest 1000, rewritten atomically under a
+  lock (`std::fs::File::lock`), and never able to fail a transfer.
+  `beam history [--clear]` shows or deletes it.
+* **Last seen** is the newest history line with that friend that got an
+  answer (not a failure to reach them). Times are relative ("2 h ago"), which
+  needs no time zone. The friend's middle panel lists their files, newest
+  first.
+* **Sending from the view** (`tui::sending`) is `beam send` on a background
+  thread: the same dial, `send_on`, accept wait (outlasting the agent's five
+  minutes), error messages (`net_cmds::unreachable_message` /
+  `refused_message`, now shared) and history line (`history::send_outcome`,
+  shared). Progress comes from the engine's `Reporter` and is drawn: looking
+  for them, reading the file, waiting for their yes, sending with a bar and
+  `[Direct P2P]`/`[Relay]`, them checking it.
+* `s` on a friend, or `:send alice <file>` in the palette, opens a file box
+  with Tab completion; a file dragged onto the terminal pastes its path and
+  the quotes are removed. One send at a time. Esc hides the pop-up and a
+  header pill keeps the progress; `s` brings it back. Cancel closes the
+  connection the ADR-0041 way, so the receiver is told and keeps what
+  arrived. Leaving beam mid-send asks first (starts on Stay); leaving anyway
+  cancels and waits up to 3 s for the receiver to be told. `send` with a
+  hidden developer flag still steps out to the terminal.
+* **Peer text is cleaned before it is drawn** (`untrusted`, ADR-0034), as on
+  the CLI; `known_peers` can be edited by hand.
+* **The view reads `~/.beam` again every 2 s**, so a peer paired or an agent
+  started in another terminal appears without a key press.
+
+### Steps
+
+1. Dependencies, `beam ui`, the view with friends, details and agent status. *(done)*
+2. Mouse, text boxes with a cursor, Ctrl+C copy / Ctrl+Q quit, rename and
+   remove pop-ups, a Discord-like look. *(done)*
+3. Command palette (`:` / Ctrl+P): typed commands parsed by the CLI's own
+   parser, a filtered list, Tab completion, output in a pop-up, "step out"
+   for the rest. *(done)*
+4. Add friend: invite box, pairing-code pop-up, fingerprint check (starts on
+   No); Show my invite on a temporary port. *(done)*
+5. Pending requests from the agent and the Accept pop-up (starts on Decline).
+   *(done)*
+6. History file and "last seen". *(done)*
+7. Send from the view, with progress. *(done)*
+8. `docs/tui.md` and the remaining doc updates. *(done)*
+
+Full description, security analysis (V-1..V-12) and limits: `docs/tui.md`.
+
+### Consequences
+
+* 39 new crates in `Cargo.lock`; none has a known advisory (OSV.dev,
+  2026-10-05). The binary grows by the size of the view.
+* `beam` alone no longer prints help on a terminal. The help says how to get
+  that back (`beam ui cli`), and `beam --help` always works.
+* Tests: `tui::app` (cursor, tabs, quitting, help, refresh), `tui::view`
+  (friends page, narrow terminal, no identity, pending, help, tiny terminal),
+  `tui` (key translation), `config` (`ui`), `tests/cli.rs` (`beam ui`, and
+  arguments never open the view).

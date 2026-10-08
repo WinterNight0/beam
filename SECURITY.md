@@ -78,6 +78,8 @@ across the workspace (`unsafe_code = "forbid"`).
 | `listen.lock` | nothing; held locked while `listen` runs | Not sensitive. |
 | `agent.json` | while the background agent runs: its local port and **the token** that lets `beam inbox` answer requests | **Private** (0600). Believed only while `agent.lock` is held; removed on a clean stop (ADR-0042). |
 | `agent.log` | what the background agent did: requests, answers, results | Names peers and files. |
+| `history.jsonl` | one line per transfer that reached a person: when, which way, the peer's nickname and fingerprint, file name, size, how it ended (ADR-0043) | **Private** (0600): names peers and files. Newest 1000 kept; `beam history --clear` deletes it. A request refused before any prompt (a stranger, a busy listener) is not written, so nobody outside `known_peers` can fill it. |
+| `history.lock` | nothing; held while `history.jsonl` is rewritten | Not sensitive. |
 | `config.toml` | relay, port, advertised addresses, receive folder, agent port mapping | Not secret. |
 | `tmp/<id>/` | partly received files | As sensitive as the files themselves. |
 
@@ -113,7 +115,12 @@ across the workspace (`unsafe_code = "forbid"`).
    receive without `beam listen` open. It never accepts by itself: answer in
    `beam inbox`. Leave its router port mapping off unless you need it. See
    [docs/background-services.md](docs/background-services.md).
-8. **For maximum privacy**, use `relay = "none"`, or a relay you run. Without
+8. **In the full-screen view, the safe answer is the one highlighted.**
+   Accept, the pairing fingerprint check, Remove and a relay change all
+   start on No; a request never opens by itself. Move to Yes only on
+   purpose. In the view, **Ctrl+C copies and Ctrl+Q quits**. See
+   [docs/tui.md](docs/tui.md).
+9. **For maximum privacy**, use `relay = "none"`, or a relay you run. Without
    a relay, only direct connections work; the testing guide in
    [docs/deploy.md](docs/deploy.md) shows how.
 
@@ -141,6 +148,7 @@ These are accepted on purpose, with their reasons, in
 | Checked | Result |
 |---|---|
 | All 393 crates in `Cargo.lock` against [OSV.dev](https://osv.dev) (RustSec advisories plus GitHub security advisories) | **No known vulnerabilities.** One informational notice: RUSTSEC-2024-0436, `paste` is unmaintained. It is used only at compile time, comes in through iroh's Linux network monitoring, and does not ship in the binary. No action needed. |
+| The 39 crates added on 2026-10-05 for the full-screen view (ratatui 0.30.2, crossterm 0.29.0 and what they use; ADR-0043) against OSV.dev | **No known vulnerabilities.** |
 | The `spike/` prototype lockfiles | No vulnerabilities; the same `paste` notice in two of them. These are research code and do not ship. |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) catalogue (actively exploited vulnerabilities; version 2026.09.30, 1,730 entries) | **No entry** for any component beam uses. |
 | Rust toolchain (1.98.1) | Newer than the fixes for every past Rust standard-library CVE. |

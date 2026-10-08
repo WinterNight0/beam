@@ -14,7 +14,7 @@ pub const HEADER: &str = "# beam known_peers v1\n\
                           # format: <name>  ed25519 <base64 public key>  added=<RFC3339>\n";
 
 /// The longest nickname we will store.
-const MAX_NAME_LEN: usize = 32;
+pub const MAX_NAME_LEN: usize = 32;
 
 /// Why an operation on the peer database failed.
 #[derive(Debug, thiserror::Error)]
