@@ -10,6 +10,12 @@ It is **off unless you turn it on**. This page covers how to use it, how it
 works, what was done to keep it safe, and its limits. The decision record is
 ADR-0042 in [decisions.md](decisions.md).
 
+**Using the full-screen view?** Its Pending tab answers the agent's requests
+too, with the same rules as `beam inbox` ([tui.md](tui.md) §4.2). And if you
+only want to receive while beam is open, you may not need the agent at all:
+the **Receiving** switch at the top of Pending (`o`) runs the same receiver
+inside the view until you close it (ADR-0044, tui.md §4.2a).
+
 ---
 
 ## 1. Using it

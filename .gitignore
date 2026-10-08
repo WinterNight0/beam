@@ -23,6 +23,11 @@ id_ed25519.pub
 known_peers
 listen.json
 listen.lock
+agent.json
+agent.lock
+agent.log
+history.jsonl
+history.lock
 *.pem
 
 # local secrets

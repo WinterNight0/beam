@@ -55,6 +55,8 @@ beam history                   # what came and went (ADR-0043)
 - Build: cargo workspace; `make check` = `cargo fmt --check` + `cargo clippy -D warnings`
   + `cargo test`. `unsafe_code = "forbid"` workspace-wide.
 - CLI: `clap` (derive).
+- Full-screen view: `ratatui` 0.30 with its `crossterm` backend (through ratatui's
+  re-export), approved for ADR-0043. Plain `beam` on a terminal opens it.
 - Identity keys: Ed25519 (`ed25519-dalek`), PKCS#8 PEM via the `pkcs8` feature.
 - Pairing: `spake2` (PAKE). Check that it is maintained before adopting; propose
   alternatives if not.
@@ -217,7 +219,8 @@ own workspace crates only if compile times demand it.
   dragged paths, `Fs` injectable for tests).
 - **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
-- Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.
+- Stretch (only if time allows): bandwidth limit, folder transfer. (The TUI and
+  transfer history are done: ADR-0043..0045.)
 
 ## Testing expectations
 

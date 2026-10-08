@@ -497,7 +497,11 @@ any other command from a palette. It reuses the same code as the commands:
 `pairing::join`/`wait`, the agent link, `send_on`. Long work runs on
 background threads so the screen stays responsive. Every answer that matters
 starts on the safe choice. `~/.beam/history.jsonl` records what came and
-went. `beam ui cli` turns the view off. Details: [tui.md](tui.md) (ADR-0043).
+went. A **Receiving** switch at the top of its Pending tab runs the
+background agent's receiver inside the view while beam is open (ADR-0044);
+sending starts with a file browser of every drive, and the first run offers to
+create the identity (ADR-0045). `beam ui cli` turns the view off. Details:
+[tui.md](tui.md) (ADR-0043).
 
 ---
 
@@ -561,10 +565,13 @@ What has been measured, with the benchmark that measures it, is in
 
 ```
 crates/beam/src/
-  main.rs              entry point; hands the arguments to cli::execute
+  main.rs              entry point: plain `beam` → cli::start (the view), else cli::execute
   cli/                 one file per group of commands
     mod.rs             the command tree (clap)
     identity_cmds.rs   init, whoami, peers, rename, remove
+    agent_cmds.rs      agent, inbox, service, receive-dir
+    history_cmds.rs    history
+    ui_cmds.rs         ui (what plain `beam` opens)
     pair_cmds.rs       pair <invite>, pair --wait, the address update
     net_cmds.rs        listen and send over iroh, and their messages
     transfer_cmds.rs   transfers; the hidden TCP test transport

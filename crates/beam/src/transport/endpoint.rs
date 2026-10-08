@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn only_internet_reachable_addresses_count_as_public() {
-        for public in ["8.8.8.8", "202.28.63.1", "2001:4860::8888"] {
+        for public in ["8.8.8.8", "1.1.1.1", "2001:4860::8888"] {
             assert!(is_public(public.parse().unwrap()), "{public}");
         }
         for local in [

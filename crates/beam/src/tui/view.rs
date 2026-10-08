@@ -2274,7 +2274,7 @@ mod tests {
     fn app(friends: &[&str], agent: Agent) -> App {
         App::new(Snapshot {
             me: Some(Me {
-                name: "winter-pc".to_string(),
+                name: "my-laptop".to_string(),
                 short_id: "111 222 333".to_string(),
                 fingerprint: HEX.to_string(),
             }),
@@ -2302,7 +2302,7 @@ mod tests {
         let mut app = app(&["alice", "bob"], Agent::Stopped);
         app.on_key(Key::Down);
         let screen = render(&mut app, 120, 30);
-        assert!(screen.contains("winter-pc"), "{screen}");
+        assert!(screen.contains("my-laptop"), "{screen}");
         assert!(screen.contains("not receiving"), "{screen}");
         assert!(screen.contains("FRIENDS — 2"), "{screen}");
         assert!(screen.contains(" A  alice"), "{screen}");

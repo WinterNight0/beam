@@ -2323,6 +2323,7 @@ how such a program is built in Rust.
   shared). Progress comes from the engine's `Reporter` and is drawn: looking
   for them, reading the file, waiting for their yes, sending with a bar and
   `[Direct P2P]`/`[Relay]`, them checking it.
+* *(The file box below was replaced by a file browser in ADR-0045.)*
 * `s` on a friend, or `:send alice <file>` in the palette, opens a file box
   with Tab completion; a file dragged onto the terminal pastes its path and
   the quotes are removed. One send at a time. Esc hides the pop-up and a

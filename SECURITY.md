@@ -138,7 +138,7 @@ These are accepted on purpose, with their reasons, in
 | R-5 | The hidden TCP test transport is unencrypted and does not prove keys. |
 | R-6 | A crashed or silent sender can hold `listen`'s single transfer slot for 15–60 s. |
 | R-7 | Notices can print while a question is open (it is redrawn). |
-| R-9 | The optional background agent keeps the device reachable all day: the relay sees when it is online, and with port mapping turned on its port can be found. It does not pair, and only paired keys may ask (`docs/background-services.md`). |
+| R-9 | The optional background agent keeps the device reachable all day (the view's Receiving switch does the same while beam is open): the relay sees when it is online, and with port mapping turned on its port can be found. Neither pairs, and only paired keys may ask (`docs/background-services.md`, `docs/tui.md`). |
 | **R-8** | **Open.** With a fixed port and router port mapping, a running `listen` can be found by scanning, and anyone can use up its pairing codes or learn its public key. Fixing it trades away usability or connectivity, so it is planned rather than patched (ADR-0038). |
 
 ## 7. Vulnerability status

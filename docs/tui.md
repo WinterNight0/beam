@@ -46,7 +46,7 @@ beam ui              # which one plain `beam` opens now
 ## 2. The screen
 
 ```
- ◆ beam  WINTER-PC 111 222 333              ⇡ 63 % alice  ● 1 waiting  ● receiving
+ ◆ beam  MY-LAPTOP 111 222 333              ⇡ 63 % alice  ● 1 waiting  ● receiving
    Friends   Pending 1   Add friend
 ╭ FRIENDS — 3 ──────╮╭ @ alice ─────────────────────────────╮╭ Details ───────────╮
 │▌ A  alice         ││ → report.pdf  sending 63 %  s to see ││  A  alice          │
@@ -93,6 +93,7 @@ agent started in another terminal shows up without a key press.
 | Tab, ← →, `1` `2` `3`, a click | switch tab |
 | **Enter** | answer a waiting request from the selected friend (or on Pending) |
 | `s` | send a file to the selected friend; while one is going, show it |
+| `o` | Receiving on/off: let friends send while beam is open (section 4.2a) |
 | `r` | rename the selected friend |
 | `x`, Delete | remove the selected friend |
 | **Ctrl+C** | **copy** the fingerprint shown (or the invite, or a command's output) |
@@ -347,6 +348,7 @@ runtime, talking to the view through channels:
 | `pairing.rs` | the same `pairing::join` / `pairing::wait` as `beam pair` | the code; whether the fingerprints match | invite and code, "type the code", "do they match?", the result |
 | `inbox.rs` | the `beam inbox` link to the agent: loopback, token from `agent.json` | accept or decline request *n* | requests, closed, progress, finished, gone |
 | `sending.rs` | the same dial, `send_on` and history line as `beam send` | cancel | each stage and its progress, the result |
+| `receiving.rs` | the background agent's receiver (`agent::run`), while the Receiving switch is on | stop | started, stopped (and why) |
 
 The view never waits on them: it checks their channels ten times a second
 while they work, so the screen stays responsive. Dropping a worker cancels
@@ -442,7 +444,7 @@ deliberate as typing `y` at the command line.
 
 ### Automated (`cargo test`)
 
-About a hundred tests, in four layers:
+About 130 tests, in four layers:
 
 * **Behaviour, without a terminal** (`tui::app`, `pending`, `send`, `add`,
   `palette`, `input`): every key and click rule on this page, including each
@@ -502,6 +504,10 @@ answer it. Look for the red badge, and press Enter.
 **Is answering in the view the same as `beam inbox`?** Yes: the same link to
 the agent, the same token, the same rule that the first answer counts. You
 can have both open; whichever answers first decides.
+
+**How do I receive without the background agent?** Press `o` (the Receiving
+switch at the top of Pending). It lasts while beam is open, and is off again
+the next time beam starts.
 
 **Where are my transfers?** In the friend's panel, in `:history`, and in
 `~/.beam/history.jsonl`. `beam history --clear` deletes the record (not the

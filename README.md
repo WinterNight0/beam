@@ -90,8 +90,10 @@ It never accepts anything by itself, and it does not pair. See
 **The full-screen view.** `beam` on its own opens a view like Discord's
 Friends page: your friends, their files, what is waiting for you, pairing,
 and a command palette (`:` or Ctrl+P) for everything else. Press `s` to send
-to a friend; answer requests in the Pending tab. In the view, **Ctrl+C copies
-and Ctrl+Q quits**. `beam ui cli` turns it off. See [docs/tui.md](docs/tui.md).
+to a friend (a file browser opens); press `o` to start **Receiving** while
+beam is open, and answer requests in the Pending tab. The first run offers to
+create this device's identity. In the view, **Ctrl+C copies and Ctrl+Q
+quits**. `beam ui cli` turns it off. See [docs/tui.md](docs/tui.md).
 
 `listen` saves into the current directory unless given `--out <dir>`. Its
 pairing code works once and changes every ten minutes. It is shown once, when
