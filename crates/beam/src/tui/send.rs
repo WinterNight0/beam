@@ -1,16 +1,16 @@
 //! Sending from the view (ADR-0043, step 7): pick a file for a friend, watch
 //! it go, hide it or cancel it.
 //!
-//! `s` on a friend (or `:send alice file` in the palette) opens a file box
-//! with Tab completion; a file dragged onto the terminal pastes its path,
-//! quotes and all, and the quotes are taken off. Sending then runs in
+//! `s` on a friend opens the file browser ([`super::browse`], ADR-0045);
+//! `:send alice file` in the palette skips it. A file dragged onto the
+//! terminal pastes its path, quotes and all, and the quotes are taken off.
+//! Sending then runs in
 //! [`super::sending`], one file at a time. The pop-up that follows it can be
 //! hidden (Esc): the header keeps a "⇡ 45 %" pill, and `s` brings it back.
 //! Leaving beam mid-send asks first, starting on No.
 
 use super::app::{App, Choice, Effect, Key, Modal, Target};
-use super::input::Input;
-use super::palette::MAX_LINE;
+use super::browse::{Browser, Chosen, Pane, Row};
 use super::sending::SendUpdate;
 use crate::transfer::Progress;
 use crate::transport::PathKind;
@@ -55,181 +55,134 @@ impl Sending {
     }
 }
 
-/// How many paths the file box lists.
-pub const FILE_ROWS: usize = 8;
-
 impl App {
-    /// `s`: the send pop-up if a send is running, else a file box for the
-    /// selected friend.
+    /// `s`: the send pop-up if a send is running, else the file browser for
+    /// the selected friend, where it was last left.
     pub(super) fn open_send(&mut self) {
         if self.sending.as_ref().is_some_and(Sending::running) {
             self.modal = Some(Modal::SendStatus);
             return;
         }
         if let Some(friend) = self.selected_friend() {
-            self.modal = Some(Modal::PickFile {
-                peer: friend.name.clone(),
-                input: Input::new(MAX_LINE),
-                error: None,
-                selected: 0,
-            });
+            let start = self.last_dir.clone().unwrap_or_else(self.fs.start);
+            let browser = Browser::open(&self.fs, friend.name.clone(), start);
+            self.modal = Some(Modal::Browse(Box::new(browser)));
         }
     }
 
-    /// Paths that complete what is typed in the file box.
-    pub fn file_suggestions(&self) -> Vec<String> {
-        match &self.modal {
-            Some(Modal::PickFile { input, .. }) => (self.paths)(&unquote(input.text()), false),
-            _ => Vec::new(),
-        }
-    }
-
-    pub(super) fn on_pick_file_key(&mut self, modal: Modal, key: Key) -> Option<Effect> {
-        let Modal::PickFile {
-            peer,
-            mut input,
-            mut error,
-            mut selected,
-        } = modal
-        else {
-            return None;
-        };
-        let suggestions = (self.paths)(&unquote(input.text()), false);
-        match key {
-            Key::Esc => return None,
-            Key::Enter => {
-                let path = unquote(input.text());
-                // Nothing typed, or a folder half-typed: take the highlighted
-                // line first.
-                let chosen = suggestions.get(selected).cloned();
-                if let Some(chosen) =
-                    chosen.filter(|c| path.is_empty() || *c != path && selected > 0)
+    /// Keys in the browser. It was taken out of `self`; putting it back
+    /// keeps it open.
+    pub(super) fn on_browse_key(&mut self, mut b: Box<Browser>, key: Key) -> Option<Effect> {
+        let fs = self.fs;
+        let typing = !b.filter.text().is_empty();
+        match (b.pane, key) {
+            (_, Key::Esc) => {
+                self.last_dir = Some(b.dir.clone());
+                return None;
+            }
+            (_, Key::Tab | Key::BackTab) => {
+                b.pane = match b.pane {
+                    Pane::Places => Pane::Files,
+                    Pane::Files => Pane::Places,
+                };
+            }
+            (_, Key::Up) => b.move_by(-1),
+            (_, Key::Down) => b.move_by(1),
+            (_, Key::PageUp) => b.move_by(-10),
+            (_, Key::PageDown) => b.move_by(10),
+            (Pane::Places, Key::Enter | Key::Right) => b.enter_place(&fs),
+            (Pane::Places, Key::Home) => b.place_selected = 0,
+            (Pane::Places, Key::End) => b.place_selected = b.places.len().saturating_sub(1),
+            (Pane::Places, Key::Char(c)) => {
+                // Typing goes to the folder's filter.
+                b.pane = Pane::Files;
+                b.filter.insert(c);
+                b.filtered();
+            }
+            (Pane::Files, Key::Enter) => {
+                if let Chosen::File(path) = b.enter(&fs) {
+                    return self.start_send(b, path);
+                }
+            }
+            (Pane::Files, Key::Backspace | Key::Left) if !typing => b.up(&fs),
+            (Pane::Files, Key::Right) if !typing => {
+                if matches!(b.rows().get(b.selected), Some(Row::Entry(i)) if b.entries[*i].is_dir)
+                    && let Chosen::File(path) = b.enter(&fs)
                 {
-                    input.set_text(&chosen);
-                    if !chosen.ends_with(['/', '\\']) {
-                        return self.start_send(peer, chosen, input);
-                    }
-                    selected = 0;
-                } else if path.is_empty() {
-                    error =
-                        Some("Type a file's path, or drag a file onto this window.".to_string());
-                } else {
-                    return self.start_send(peer, path, input);
+                    return self.start_send(b, path);
                 }
             }
-            Key::Tab => {
-                if let Some(chosen) = suggestions.get(selected) {
-                    input.set_text(chosen);
-                    selected = 0;
-                    error = None;
-                }
+            (Pane::Files, Key::Home) if !typing => b.selected = 0,
+            (Pane::Files, Key::End) if !typing => {
+                b.selected = b.rows().len().saturating_sub(1);
             }
-            Key::Up => selected = selected.saturating_sub(1),
-            Key::Down => selected = (selected + 1).min(suggestions.len().saturating_sub(1)),
-            Key::Char(c) => {
-                input.insert(c);
-                selected = 0;
-                error = None;
+            (Pane::Files, Key::Char(c)) => {
+                b.filter.insert(c);
+                b.filtered();
             }
-            key => {
+            (Pane::Files, key) => {
                 if let Some(edit) = super::app::edit_for(key) {
-                    input.edit(edit);
-                    selected = 0;
-                    error = None;
+                    b.filter.edit(edit);
+                    b.filtered();
                 }
             }
+            _ => {}
         }
-        self.modal = Some(Modal::PickFile {
-            peer,
-            input,
-            error,
-            selected,
-        });
+        self.modal = Some(Modal::Browse(b));
         None
     }
 
-    /// Asks for the send; the file box stays up until it starts, so a path
-    /// that is not a file can be fixed.
-    fn start_send(&mut self, peer: String, path: String, mut input: Input) -> Option<Effect> {
-        input.set_text(&path);
-        self.modal = Some(Modal::PickFile {
-            peer: peer.clone(),
-            input,
-            error: None,
-            selected: 0,
-        });
-        Some(Effect::StartSend { peer, path })
+    /// A click in the browser: a place jumps there; a line is picked, and a
+    /// second click on it opens it (or sends it).
+    pub(super) fn on_browse_click(
+        &mut self,
+        mut b: Box<Browser>,
+        hit: Option<Target>,
+    ) -> Option<Effect> {
+        let fs = self.fs;
+        match hit {
+            Some(Target::Place(index)) => {
+                b.place_selected = index;
+                b.enter_place(&fs);
+            }
+            Some(Target::Suggestion(index)) => {
+                if b.pane == Pane::Files && b.selected == index {
+                    if let Chosen::File(path) = b.enter(&fs) {
+                        return self.start_send(b, path);
+                    }
+                } else {
+                    b.pane = Pane::Files;
+                    b.selected = index;
+                }
+            }
+            Some(Target::Button(Choice::Yes)) => return self.on_browse_key(b, Key::Enter),
+            Some(Target::Button(Choice::No)) => {
+                self.last_dir = Some(b.dir.clone());
+                return None;
+            }
+            _ => {}
+        }
+        self.modal = Some(Modal::Browse(b));
+        None
     }
 
-    pub(super) fn on_pick_file_click(
-        &mut self,
-        modal: Modal,
-        hit: Option<(ratatui::layout::Rect, Target)>,
-        column: u16,
-    ) -> Option<Effect> {
-        match (modal, hit) {
-            (
-                Modal::PickFile {
-                    peer,
-                    mut input,
-                    error,
-                    selected,
-                },
-                Some((_, Target::Suggestion(index))),
-            ) => {
-                // A click picks, as Enter on that line would.
-                let Some(chosen) = self.paths_for(&input).get(index).cloned() else {
-                    self.modal = Some(Modal::PickFile {
-                        peer,
-                        input,
-                        error,
-                        selected,
-                    });
-                    return None;
-                };
-                input.set_text(&chosen);
-                if chosen.ends_with(['/', '\\']) {
-                    self.modal = Some(Modal::PickFile {
-                        peer,
-                        input,
-                        error: None,
-                        selected: 0,
-                    });
-                    return None;
-                }
-                self.start_send(peer, chosen, input)
-            }
-            (
-                Modal::PickFile {
-                    peer,
-                    mut input,
-                    error,
-                    selected,
-                },
-                Some((area, Target::Input)),
-            ) => {
-                input.click(column.saturating_sub(area.x), area.width);
-                self.modal = Some(Modal::PickFile {
-                    peer,
-                    input,
-                    error,
-                    selected,
-                });
-                None
-            }
-            (modal @ Modal::PickFile { .. }, Some((_, Target::Button(Choice::Yes)))) => {
-                self.on_pick_file_key(modal, Key::Enter)
-            }
-            (Modal::PickFile { .. }, Some((_, Target::Button(Choice::No)))) => None,
-            (modal, _) => {
-                self.modal = Some(modal);
-                None
-            }
+    /// Scrolling over the browser moves through the side it is over.
+    pub(super) fn on_browse_wheel(&mut self, up: bool) {
+        if let Some(Modal::Browse(b)) = &mut self.modal {
+            b.move_by(if up { -3 } else { 3 });
         }
     }
 
-    fn paths_for(&self, input: &Input) -> Vec<String> {
-        (self.paths)(&unquote(input.text()), false)
+    /// Asks for the send; the browser stays up until it starts, so a problem
+    /// can be shown there.
+    fn start_send(&mut self, b: Box<Browser>, path: std::path::PathBuf) -> Option<Effect> {
+        let peer = b.peer.clone();
+        self.last_dir = Some(b.dir.clone());
+        self.modal = Some(Modal::Browse(b));
+        Some(Effect::StartSend {
+            peer,
+            path: path.display().to_string(),
+        })
     }
 
     /// Keys in the send pop-up.
@@ -365,15 +318,10 @@ mod tests {
             history: Vec::new(),
             owner: Owner::Background,
             listen_elsewhere: false,
+            needs_setup: false,
             problem: None,
         });
-        app.paths = |partial, _| {
-            ["notes/", "report.pdf"]
-                .iter()
-                .filter(|p| p.starts_with(partial))
-                .map(|p| p.to_string())
-                .collect()
-        };
+        app.fs = crate::tui::browse::tests::fake();
         app
     }
 
@@ -388,40 +336,78 @@ mod tests {
     }
 
     #[test]
-    fn s_opens_a_file_box_and_enter_sends_what_is_typed() {
+    fn s_opens_the_browser_and_enter_goes_in_then_sends() {
         let mut app = app();
         app.on_key(Key::Char('s'));
-        app.on_event(Event::Paste("\"report.pdf\"".into()));
+        assert!(matches!(app.modal, Some(Modal::Browse(_))));
+        assert_eq!(app.on_key(Key::Enter), None, "docs opens");
+        let Some(Effect::StartSend { peer, path }) = app.on_key(Key::Enter) else {
+            panic!("a.txt is sent")
+        };
+        assert_eq!(peer, "alice");
         assert_eq!(
-            app.on_key(Key::Enter),
-            Some(Effect::StartSend {
-                peer: "alice".into(),
-                path: "report.pdf".into()
-            })
+            std::path::PathBuf::from(path),
+            std::path::PathBuf::from("/home/me/docs").join("a.txt")
         );
     }
 
     #[test]
-    fn tab_completes_and_a_folder_waits_for_more() {
+    fn typing_filters_backspace_goes_up_and_a_dragged_path_is_sent() {
         let mut app = app();
         app.on_key(Key::Char('s'));
-        app.on_key(Key::Char('n'));
-        app.on_key(Key::Tab);
-        match &app.modal {
-            Some(Modal::PickFile { input, .. }) => assert_eq!(input.text(), "notes/"),
-            other => panic!("{other:?}"),
+        app.on_key(Key::Enter); // into docs
+        app.on_key(Key::Backspace);
+        let Some(Modal::Browse(b)) = &app.modal else {
+            panic!()
+        };
+        assert_eq!(b.dir, std::path::PathBuf::from("/home/me"));
+
+        for c in "note".chars() {
+            app.on_key(Key::Char(c));
         }
-        // Enter on an empty box takes the first line, a folder: no send yet.
-        let mut app = app_with_box();
+        assert!(
+            matches!(app.on_key(Key::Enter), Some(Effect::StartSend { path, .. }) if path.ends_with("notes.txt"))
+        );
+
+        // A dragged-in path that is not there says so.
+        let mut app = app_with_browser();
+        app.on_event(Event::Paste("\"/nowhere/x.zip\"".into()));
         assert_eq!(app.on_key(Key::Enter), None);
-        app.on_key(Key::Down);
-        assert!(matches!(
-            app.on_key(Key::Enter),
-            Some(Effect::StartSend { .. })
-        ));
+        let Some(Modal::Browse(b)) = &app.modal else {
+            panic!()
+        };
+        assert!(b.error.as_deref().unwrap().contains("Nothing at"));
     }
 
-    fn app_with_box() -> App {
+    #[test]
+    fn esc_closes_and_the_browser_reopens_where_it_was_left() {
+        let mut app = app();
+        app.on_key(Key::Char('s'));
+        app.on_key(Key::Enter); // into docs
+        app.on_key(Key::Esc);
+        assert!(app.modal.is_none());
+        app.on_key(Key::Char('s'));
+        let Some(Modal::Browse(b)) = &app.modal else {
+            panic!()
+        };
+        assert_eq!(b.dir, std::path::PathBuf::from("/home/me/docs"));
+    }
+
+    #[test]
+    fn tab_goes_to_the_places_and_enter_jumps() {
+        let mut app = app();
+        app.on_key(Key::Char('s'));
+        app.on_key(Key::Tab);
+        app.on_key(Key::Down);
+        app.on_key(Key::Enter);
+        let Some(Modal::Browse(b)) = &app.modal else {
+            panic!()
+        };
+        assert_eq!(b.dir, std::path::PathBuf::from("/"));
+        assert_eq!(b.pane, Pane::Files);
+    }
+
+    fn app_with_browser() -> App {
         let mut app = app();
         app.on_key(Key::Char('s'));
         app

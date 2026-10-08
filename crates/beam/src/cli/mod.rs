@@ -6,7 +6,7 @@
 mod agent_cmds;
 pub mod desk;
 mod history_cmds;
-mod identity_cmds;
+pub(crate) mod identity_cmds;
 pub(crate) mod net_cmds;
 mod pair_cmds;
 mod stubs;

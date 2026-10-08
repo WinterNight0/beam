@@ -364,6 +364,7 @@ mod tests {
             history: Vec::new(),
             owner: Owner::Background,
             listen_elsewhere: false,
+            needs_setup: false,
             problem: None,
         })
     }

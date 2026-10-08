@@ -10,6 +10,7 @@ use std::time::Instant;
 use ratatui::layout::{Position, Rect};
 
 use super::add::{self, AddForm, Field};
+use super::browse::{Browser, Fs};
 use super::inbox::RequestView;
 use super::input::{Edit, Input};
 use super::palette::{self, Palette, Place, Suggestion};
@@ -152,6 +153,8 @@ pub enum Effect {
     StartReceiving,
     /// Turn it off; a sender mid-transfer is told (ADR-0041).
     StopReceiving,
+    /// First run: make this device's identity, as `beam init` does.
+    CreateIdentity,
 }
 
 /// How an [`Effect`] turned out.
@@ -173,6 +176,8 @@ pub enum Done {
     PairingStarted,
     /// A send started.
     SendStarted { peer: String, file: String },
+    /// The identity was just made (first run).
+    IdentityCreated { short_id: String },
     /// The invite is for a friend already paired, and moves them to another
     /// relay: ask first (ADR-0038).
     AskRelay {
@@ -221,6 +226,8 @@ pub enum Agent {
 pub struct Snapshot {
     /// `None` until `beam init` has been run.
     pub me: Option<Me>,
+    /// No identity file at all: the first run, which offers to make one.
+    pub needs_setup: bool,
     pub friends: Vec<Friend>,
     pub agent: Agent,
     /// What came and went, oldest first, its strings cleaned for drawing.
@@ -237,13 +244,17 @@ impl Snapshot {
     /// Reads the identity, the paired peers and the agent's status.
     pub fn load(store: &Store) -> Self {
         let mut problem = None;
+        let mut needs_setup = false;
         let me = match store.load_identity() {
             Ok(identity) => Some(Me {
                 name: untrusted::name(identity.comment()),
                 short_id: identity.short_id().grouped(),
                 fingerprint: identity.fingerprint().hex(),
             }),
-            Err(StoreError::NoIdentity) => None,
+            Err(StoreError::NoIdentity) => {
+                needs_setup = true;
+                None
+            }
             Err(e) => {
                 problem = Some(untrusted::text(&e.to_string()));
                 None
@@ -313,6 +324,7 @@ impl Snapshot {
         );
         Self {
             me,
+            needs_setup,
             friends,
             agent,
             history,
@@ -377,14 +389,8 @@ pub enum Modal {
         own: String,
         focus: Choice,
     },
-    /// Which file to send to `peer`, with completion.
-    PickFile {
-        peer: String,
-        input: Input,
-        error: Option<String>,
-        /// Index into the path list under the box.
-        selected: usize,
-    },
+    /// Which file to send: the browser (ADR-0045).
+    Browse(Box<Browser>),
     /// How the send in [`App::sending`] is going.
     SendStatus,
     /// A file is still going out or coming in: leave anyway? Starts on `No`.
@@ -430,6 +436,8 @@ pub enum Target {
     Field(Field),
     /// A waiting request in the Pending tab, by index.
     Request(usize),
+    /// A place on the browser's left, by index.
+    Place(usize),
     /// The Receiving switch at the top of Pending.
     ReceiveSwitch,
 }
@@ -477,6 +485,10 @@ pub struct App {
     pub history: Vec<String>,
     /// Lists files for completion; tests swap in their own.
     pub paths: fn(&str, bool) -> Vec<String>,
+    /// The disk, for the file browser; tests swap in their own.
+    pub fs: Fs,
+    /// Where the browser was last left.
+    pub last_dir: Option<std::path::PathBuf>,
     /// The Add friend form.
     pub add: AddForm,
     /// A friend to select once they appear (just paired), by fingerprint.
@@ -493,6 +505,8 @@ pub struct App {
     pub sending: Option<Sending>,
     /// The Receiving switch (ADR-0044).
     pub switch: Switch,
+    /// The first-run card's highlighted button: starts on "Create it".
+    pub setup_focus: Choice,
     pub quit: bool,
 }
 
@@ -512,6 +526,8 @@ impl App {
             palette: None,
             history: Vec::new(),
             paths: palette::list_paths,
+            fs: Fs::real(),
+            last_dir: None,
             add: AddForm::default(),
             pending_select: None,
             pending: Vec::new(),
@@ -520,6 +536,7 @@ impl App {
             link: Link::Off,
             sending: None,
             switch: Switch::Off,
+            setup_focus: Choice::Yes,
             quit: false,
         }
     }
@@ -575,13 +592,16 @@ impl App {
                     palette.input.paste(&text);
                     palette.typed();
                 } else if let Some(
-                    Modal::Rename { input, error, .. }
-                    | Modal::EnterCode { input, error }
-                    | Modal::PickFile { input, error, .. },
+                    Modal::Rename { input, error, .. } | Modal::EnterCode { input, error },
                 ) = &mut self.modal
                 {
                     input.paste(&text);
                     *error = None;
+                } else if let Some(Modal::Browse(b)) = &mut self.modal {
+                    b.pane = super::browse::Pane::Files;
+                    b.filter = Input::new(palette::MAX_LINE);
+                    b.filter.paste(&text);
+                    b.filtered();
                 } else if self.modal.is_none() && self.form_has_keys() {
                     self.paste_into_form(&text);
                 }
@@ -617,9 +637,8 @@ impl App {
             }
             Done::Failed(reason) => match &mut self.modal {
                 // Stay open, so the name (or the path) can be fixed.
-                Some(Modal::Rename { error, .. } | Modal::PickFile { error, .. }) => {
-                    *error = Some(reason);
-                }
+                Some(Modal::Rename { error, .. }) => *error = Some(reason),
+                Some(Modal::Browse(b)) => b.error = Some(reason),
                 // A pairing that could not start: say why under the form.
                 None if self.tab == Tab::AddFriend => self.add.error = Some(reason),
                 _ => {
@@ -628,6 +647,13 @@ impl App {
                 }
             },
             Done::Nothing => {}
+            Done::IdentityCreated { short_id } => {
+                self.flash = Some(format!(
+                    "This device is ready (Short ID {short_id}). Next: add a friend."
+                ));
+                self.tab = Tab::AddFriend;
+                self.add.focus = Some(Field::Invite);
+            }
             Done::SendStarted { peer, file } => {
                 self.sending = Some(Sending {
                     peer,
@@ -676,7 +702,7 @@ impl App {
         }
         match self.modal.take() {
             Some(modal @ Modal::Accept { .. }) => self.on_accept_key(modal, key),
-            Some(modal @ Modal::PickFile { .. }) => self.on_pick_file_key(modal, key),
+            Some(Modal::Browse(b)) => self.on_browse_key(b, key),
             Some(Modal::SendStatus) => self.on_send_status_key(key),
             Some(Modal::ConfirmQuit { focus }) => {
                 self.on_confirm_quit_key(focus, key);
@@ -685,9 +711,29 @@ impl App {
             Some(Modal::ConfirmStop { focus }) => self.on_confirm_stop_key(focus, key),
             Some(modal) if add::is_pairing(&modal) => self.on_pair_modal_key(modal, key),
             Some(modal) => self.on_modal_key(modal, key),
+            None if self.snapshot.needs_setup => self.on_setup_key(key),
             None if self.form_has_keys() => self.on_form_key(key),
             None => self.on_page_key(key),
         }
+    }
+
+    /// The first-run card: create this device's identity, or leave.
+    fn on_setup_key(&mut self, key: Key) -> Option<Effect> {
+        match key {
+            Key::Enter if self.setup_focus == Choice::Yes => return Some(Effect::CreateIdentity),
+            Key::Enter | Key::Char('n') => self.request_quit(),
+            Key::Char('y') => return Some(Effect::CreateIdentity),
+            Key::Left | Key::Right | Key::Tab | Key::BackTab => {
+                self.setup_focus = match self.setup_focus {
+                    Choice::Yes => Choice::No,
+                    Choice::No => Choice::Yes,
+                };
+            }
+            Key::Char(':') | Key::Palette => self.open_palette(),
+            Key::Char('?') => self.modal = Some(Modal::Help),
+            _ => {}
+        }
+        None
     }
 
     pub(super) fn open_palette(&mut self) {
@@ -1037,6 +1083,10 @@ impl App {
         match kind {
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
                 let up = kind == MouseKind::ScrollUp;
+                if matches!(self.modal, Some(Modal::Browse(_))) {
+                    self.on_browse_wheel(up);
+                    return None;
+                }
                 if self.palette.is_some() {
                     return self.on_key(if up { Key::Up } else { Key::Down });
                 }
@@ -1081,6 +1131,10 @@ impl App {
                     (None, Some((area, Target::Field(field)))) => {
                         return self.click_field(field, column.saturating_sub(area.x), area.width);
                     }
+                    (None, Some((_, Target::Button(answer)))) if self.snapshot.needs_setup => {
+                        self.setup_focus = answer;
+                        return self.on_setup_key(Key::Enter);
+                    }
                     (None, Some((_, Target::ReceiveSwitch))) => return self.toggle_receiving(),
                     (Some(Modal::ConfirmStop { .. }), Some((_, Target::Button(answer)))) => {
                         if answer == Choice::Yes {
@@ -1091,8 +1145,8 @@ impl App {
                         self.pending_selected = index;
                         self.open_accept(index);
                     }
-                    (Some(modal @ Modal::PickFile { .. }), hit) => {
-                        return self.on_pick_file_click(modal, hit, column);
+                    (Some(Modal::Browse(b)), hit) => {
+                        return self.on_browse_click(b, hit.map(|(_, target)| target));
                     }
                     (Some(Modal::SendStatus), hit) => {
                         return self.on_send_status_click(hit.map(|(_, target)| target));
@@ -1188,6 +1242,7 @@ mod tests {
             history: Vec::new(),
             owner: Owner::Background,
             listen_elsewhere: false,
+            needs_setup: false,
             problem: None,
         }
     }
@@ -1789,6 +1844,37 @@ mod tests {
                 invite: "beam1x".into()
             })
         );
+    }
+
+    fn first_run() -> App {
+        let mut app = three();
+        app.snapshot.needs_setup = true;
+        app
+    }
+
+    #[test]
+    fn the_first_run_offers_to_create_the_identity_and_enter_does_it() {
+        let mut app = first_run();
+        assert_eq!(app.on_key(Key::Enter), Some(Effect::CreateIdentity));
+        app.effect_done(Done::IdentityCreated {
+            short_id: "111 222 333".into(),
+        });
+        assert_eq!(app.tab, Tab::AddFriend, "next: add a friend");
+        assert_eq!(app.add.focus, Some(Field::Invite));
+        assert!(app.flash.as_deref().unwrap().contains("111 222 333"));
+    }
+
+    #[test]
+    fn not_now_leaves_and_keys_do_nothing_else_meanwhile() {
+        let mut app = first_run();
+        for key in [Key::Char('s'), Key::Char('o'), Key::Char('3'), Key::Down] {
+            assert_eq!(app.on_key(key), None, "{key:?}");
+        }
+        assert_eq!(app.tab, Tab::Friends);
+        app.on_key(Key::Right);
+        assert_eq!(app.setup_focus, Choice::No);
+        assert_eq!(app.on_key(Key::Enter), None);
+        assert!(app.quit);
     }
 
     #[test]

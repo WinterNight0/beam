@@ -211,6 +211,10 @@ own workspace crates only if compile times demand it.
   (`tui::receiving`, `in_view` in `agent.json`): pairing off, 5 min, agent port
   mapping, notifications; agent lock so listen/agent refuse; off at every start,
   stops with the view; asks before stopping a transfer.
+- **Post-M6 (ADR-0045)** First-run welcome card in the view (no identity →
+  "Create it now?", Create it = `beam init`, never replaces); `s` opens a file
+  browser (`tui::browse`: places + every drive, natural sort, filter, typed or
+  dragged paths, `Fs` injectable for tests).
 - **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): TUI (`ratatui`), transfer history, bandwidth limit, folder transfer.

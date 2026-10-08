@@ -257,7 +257,7 @@ pub(super) fn write_json<T: Serialize>(io: &mut Io<'_>, value: &T) -> Result<(),
 
 /// A best-effort machine name for the public key comment. It is cosmetic, so a
 /// missing value is not an error.
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     for key in ["COMPUTERNAME", "HOSTNAME"] {
         if let Ok(name) = std::env::var(key)
             && !name.trim().is_empty()

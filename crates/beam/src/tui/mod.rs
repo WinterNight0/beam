@@ -22,6 +22,7 @@
 
 mod add;
 pub mod app;
+mod browse;
 mod clipboard;
 mod inbox;
 pub mod input;
@@ -310,6 +311,7 @@ fn carry_out(store: &Store, effect: Effect) -> Done {
             clipboard::Copied::Terminal => format!("Copied {what} (through the terminal)."),
         }),
         Effect::Run { args, .. } => return run_here(store, &args),
+        Effect::CreateIdentity => return create_identity(store),
         Effect::UpdateLocation { invite } => return update_location(store, &invite),
         // Pairing effects need the worker, which the event loop holds.
         Effect::StartJoin { .. }
@@ -327,6 +329,29 @@ fn carry_out(store: &Store, effect: Effect) -> Done {
     match result {
         Ok(message) => Done::Message(message),
         Err(reason) => Done::Failed(reason),
+    }
+}
+
+/// First run: makes this device's identity exactly as `beam init` does,
+/// named after the computer. Never replaces one that exists.
+fn create_identity(store: &Store) -> Done {
+    if store.has_identity() {
+        return Done::Message("This device already has its identity.".to_string());
+    }
+    let made = crate::identity::Identity::generate(&crate::cli::identity_cmds::hostname())
+        .map_err(|e| e.to_string())
+        .and_then(|identity| {
+            store
+                .save_identity(&identity, false)
+                .map(|()| identity.short_id().grouped())
+                .map_err(|e| e.to_string())
+        });
+    match made {
+        Ok(short_id) => Done::IdentityCreated { short_id },
+        Err(e) => Done::Failed(format!(
+            "Could not create the identity: {}",
+            untrusted::text(&e)
+        )),
     }
 }
 
@@ -791,6 +816,26 @@ mod tests {
         let carols = invite_for(carol.verifying_key());
         let err = start_join(&store, &carols, "bob").err().unwrap();
         assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn the_first_run_makes_an_identity_once_and_never_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("beam"));
+        let Done::IdentityCreated { short_id } = create_identity(&store) else {
+            panic!("not created")
+        };
+        let identity = store.load_identity().unwrap();
+        assert_eq!(identity.short_id().grouped(), short_id);
+        assert!(Snapshot::load(&store).me.is_some());
+        assert!(!Snapshot::load(&store).needs_setup);
+
+        assert!(matches!(create_identity(&store), Done::Message(_)));
+        assert_eq!(
+            store.load_identity().unwrap().fingerprint(),
+            identity.fingerprint(),
+            "the key is never replaced"
+        );
     }
 
     #[test]

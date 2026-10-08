@@ -27,6 +27,12 @@ beam ui tui          # bring the view back
 beam ui              # which one plain `beam` opens now
 ```
 
+* **The first time**, before this device has its identity, the view shows a
+  **Welcome to beam** card: "This device doesn't have its beam identity yet
+  … Create it now?" with **Create it** (highlighted) and **Not now**. Create
+  it does what `beam init` does (the keys are made here, named after the
+  computer, and the private key never leaves it), then opens Add friend.
+  Not now leaves beam. An existing identity is never replaced.
 * Plain `beam` opens the view **only on a real terminal**. If its output goes
   to a pipe or a file (a script), it prints the help as it always did.
 * **Anything after `beam`** (a command, `--help`, even `--beam-dir x`) is the
@@ -103,7 +109,7 @@ buttons, and put the cursor where you click in a text box. While beam has the
 mouse, the terminal's own drag-to-select is off; **hold Shift while dragging**
 to select text anyway.
 
-**Text boxes** (palette, rename, invite, name, code, file) take typing,
+**Text boxes** (palette, rename, invite, name, code, browser filter) take typing,
 ← →, Home/End, Ctrl+← → by word, Backspace, Delete, Ctrl+Backspace or Ctrl+W
 for a whole word, and paste. Thai, accents and emoji move as one character
 each.
@@ -114,11 +120,37 @@ each.
 
 ### 4.1 Sending a file
 
-1. Select the friend and press **`s`** (or type `:send alice report.pdf`).
-2. Type the file's path; **Tab** completes it, and the matching files and
-   folders are listed underneath. Or **drag the file onto the terminal
-   window**: its path is pasted and the quotes Windows adds are removed.
-3. **Enter.** A pop-up follows the send:
+1. Select the friend and press **`s`** (or type `:send alice report.pdf` to
+   skip straight to sending).
+2. A **file browser** opens where you last left it (the first time, in the
+   folder beam was started from):
+
+   ```
+   ╭ Send a file to alice ───────────────────────────────────────────────╮
+   │ PLACES        E:\Projects\reports                                    │
+   │  Home         ╭ type to filter, or a path ──────────────────────────╮ │
+   │  Desktop      │ q3                                                  │ │
+   │  Documents    ╰─────────────────────────────────────────────────────╯ │
+   │  Downloads    ▌q3-report.pdf                    2.0 MiB  2 days ago  │
+   │  This folder   q3-slides.pptx                  14.1 MiB  yesterday   │
+   │ DRIVES                                                               │
+   │  C:  D:  E:                                         Send    Cancel   │
+   ```
+
+   * **Left:** your usual folders, then **every drive** (on Linux and macOS:
+     `/` and mounted disks). **Tab** switches sides; Enter or a click jumps.
+   * **Right:** the folder. Folders come first, then files, in natural order
+     (`report-2` before `report-10`), with sizes and how old each file is.
+     Hidden and system files stay hidden; type a `.` to see dot files.
+   * **Type** to filter. **Enter** opens a folder or sends the file;
+     **Backspace** (with nothing typed) or ← goes up a folder; `..` does too.
+     A click picks a line; a second click opens or sends it. The wheel scrolls.
+   * **Type or paste a path** (anything with a slash, a drive like `D:`, or
+     `~`) and Enter goes straight there. **Dragging a file onto the window**
+     pastes its path, without the quotes Windows adds: Enter sends it.
+   * A folder that cannot be opened says why, and the browser stays where it
+     was.
+3. Once a file is chosen, a pop-up follows the send:
    - looking for alice…
    - reading the file (on a big file this takes a moment)
    - waiting for alice to accept: **nothing is sent until they say yes**
@@ -282,7 +314,8 @@ crates/beam/src/tui/
   pending.rs    the Pending tab, the Accept pop-up and the Receiving switch
   receiving.rs  the agent's receiver, run while the switch is on
   inbox.rs      the link to the background agent, as `beam inbox` has it
-  send.rs       the file box and the send pop-up
+  send.rs       opening the browser, and the send pop-up
+  browse.rs     the file browser: places and drives, folders, filter, the disk
   sending.rs    `beam send` on a background thread
   clipboard.rs  Ctrl+C
 crates/beam/src/history.rs   history.jsonl
@@ -381,6 +414,9 @@ deliberate as typing `y` at the command line.
 ## 7. Limitations
 
 * **One file at a time, and no folders.** Zip a folder first.
+* **The browser shows at most 5000 entries** of one folder; type to find the
+  rest. Network places that are not mapped to a drive letter are not listed
+  (type or paste their path instead).
 * **The Receiving switch lasts only while beam is open.** To receive when it
   is closed, use the background agent (`beam service enable`). With
   `beam listen` running instead, its requests are answered in that terminal.

@@ -2414,3 +2414,47 @@ view itself.
   stops cleanly; a friend sends and the view accepts end to end),
   `tui::pending` (toggle, confirmations, refusing to fight the agent or
   `listen`), `tui::view` (the strip, its states, the header badge).
+
+## ADR-0045 — First-run welcome, and a file browser for sending
+
+**Status:** accepted (post-M6, branch `main-QoL`). User-facing description:
+`docs/tui.md` §1 and §4.1.
+
+**Context.** Two rough edges in the full-screen view, found in use:
+- on a device with no identity, the view only said to leave and run
+  `beam init`, a technical word, in another command;
+- choosing a file to send meant typing its path (with completion); people
+  expect to browse, like an editor's "open folder" dialog with every drive.
+
+### Decision
+
+* **Welcome card on the first run.** When there is no identity file at all
+  (not when one exists but cannot be read), the view shows "Welcome to beam …
+  Create it now?" with **Create it** (highlighted) and **Not now**. Create it
+  runs exactly what `beam init` does (`Identity::generate` named after the
+  computer, `save_identity` without force), so an existing identity can never
+  be replaced from here; then the view opens Add friend. Not now leaves beam,
+  since nothing else works yet. The word "init" is not shown.
+* **A file browser behind `s`** (`tui::browse`): places and every drive on
+  the left (Windows drive letters that exist; elsewhere `/`, `/media`,
+  `/run/media`, `/mnt`, `/Volumes`), the folder on the right, folders first in
+  natural order, with sizes and ages; hidden and system files hidden unless
+  the filter starts with `.`. Typing filters; Enter opens or sends; Backspace
+  goes up and keeps the cursor on the folder just left; a typed or dragged
+  path goes straight there. It reopens where it was left. The disk is reached
+  only through an `Fs` of plain functions, so the browser is tested against
+  a made-up tree. It replaces the earlier path box; `:send alice <file>` is
+  unchanged.
+* No new dependency: drives are found by checking `A:\`..`Z:\`, and Windows
+  hidden/system attributes come from `std::os::windows::fs::MetadataExt`.
+
+### Consequences
+
+* A first-time user is never sent to a second command to get started.
+* Sending starts with a familiar browser; typing a path still works.
+* Tests: `tui::app` (first run: Enter creates and moves to Add friend; Not
+  now leaves; other keys do nothing), `tui::tests` (creates once, never
+  replaces), `tui::view` (welcome card, no technical words), `tui::browse`
+  (sorting, hidden files, filter, enter/up, places, typed paths, unreadable
+  folders, fallback start, the real disk), `tui::send` (open, send, Esc and
+  reopen where left, places), `tui::view` (the browser drawn).

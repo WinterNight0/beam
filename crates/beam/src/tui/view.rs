@@ -17,11 +17,12 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 
 use super::add::{Field, countdown};
 use super::app::{Agent, App, Areas, Choice, Friend, Modal, Tab, Target};
+use super::browse::{Browser, Pane, Row};
 use super::inbox::RequestView;
 use super::input::Input;
 use super::palette::{Place, Suggestion};
 use super::pending::{Link, Switch, Taken};
-use super::send::{FILE_ROWS, Sending, Stage};
+use super::send::{Sending, Stage};
 
 /// Discord's blurple, for the selection and the active tab.
 const ACCENT: Color = Color::Rgb(88, 101, 242);
@@ -67,6 +68,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, header, app);
     draw_tabs(frame, tabs, app);
     match (app.snapshot.me.is_some(), app.tab) {
+        (false, _) if app.snapshot.needs_setup => draw_setup(frame, body, app),
         (false, _) => draw_no_identity(frame, body),
         (true, Tab::Friends) => draw_friends(frame, body, app),
         (true, Tab::Pending) => draw_pending(frame, body, app),
@@ -128,24 +130,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             focus,
             ..
         }) => draw_accept(frame, area, &mut app.areas, &request, expires, focus),
-        Some(Modal::PickFile {
-            peer,
-            input,
-            error,
-            selected,
-        }) => {
-            let paths = app.file_suggestions();
-            draw_pick_file(
-                frame,
-                area,
-                &mut app.areas,
-                &peer,
-                &input,
-                error.as_deref(),
-                &paths,
-                selected,
-            );
-        }
+        Some(Modal::Browse(browser)) => draw_browse(frame, area, &mut app.areas, &browser),
         Some(Modal::SendStatus) => {
             if let Some(sending) = app.sending.clone() {
                 draw_send_status(frame, area, &mut app.areas, &sending);
@@ -464,6 +449,49 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
         app.areas.add(chip, Target::Tab(tab));
         x += width + 1;
     }
+}
+
+/// The first run: this device has no identity yet. Offer to make it.
+fn draw_setup(frame: &mut Frame, area: Rect, app: &mut App) {
+    let card = centered(area, 70, 14);
+    frame.render_widget(Clear, card);
+    let block = popup_block(" Welcome to beam ");
+    let inner = block.inner(card);
+    frame.render_widget(block, card);
+    let [text, _, buttons] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let lines = vec![
+        Line::from("This device doesn't have its beam identity yet.".bold()),
+        Line::from(""),
+        Line::from(
+            "It is what your friends will know this computer by: a pair of keys, made once, \
+             here.",
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("• ", Style::new().fg(ACCENT)),
+            Span::raw("The private key never leaves this computer."),
+        ]),
+        Line::from(vec![
+            Span::styled("• ", Style::new().fg(ACCENT)),
+            Span::raw("After that, add a friend and you can send files to each other."),
+        ]),
+        Line::from(""),
+        Line::from("Create it now?".bold()),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
+    draw_buttons(
+        frame,
+        buttons,
+        &mut app.areas,
+        ("Create it", "Not now"),
+        app.setup_focus,
+        false,
+    );
 }
 
 fn draw_no_identity(frame: &mut Frame, area: Rect) {
@@ -944,76 +972,191 @@ fn bar(done: u64, total: u64, width: u16) -> Line<'static> {
     ])
 }
 
-/// Which file to send, with the paths that complete what is typed.
-#[allow(clippy::too_many_arguments)]
-fn draw_pick_file(
-    frame: &mut Frame,
-    area: Rect,
-    areas: &mut Areas,
-    peer: &str,
-    input: &Input,
-    error: Option<&str>,
-    paths: &[String],
-    selected: usize,
-) {
-    let rows = paths.len().min(FILE_ROWS);
-    let popup = centered(area, 72, 10 + rows as u16);
+/// The file browser (ADR-0045): places and drives on the left, the folder
+/// on the right, a filter on top of it.
+fn draw_browse(frame: &mut Frame, area: Rect, areas: &mut Areas, b: &Browser) {
+    let popup = centered(
+        area,
+        area.width.saturating_sub(4).min(104),
+        area.height.saturating_sub(2).min(30),
+    );
     frame.render_widget(Clear, popup);
-    let block = popup_block(format!(" Send a file to {peer} "));
+    let block = popup_block(format!(" Send a file to {} ", b.peer));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [note, field, problem, list, _, buttons] = Layout::vertical([
+    let [body, _, buttons] = Layout::vertical([
+        Constraint::Min(3),
         Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(rows as u16),
-        Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(inner);
+    let [left, _, right] = Layout::horizontal([
+        Constraint::Length(22),
+        Constraint::Length(1),
+        Constraint::Min(20),
+    ])
+    .areas(body);
+
+    // Places, then drives.
+    let places_focused = b.pane == Pane::Places;
+    let mut y = left.y;
     frame.render_widget(
-        Line::from("Type its path (Tab completes), or drag the file onto this window.".fg(MUTED)),
-        note,
-    );
-    draw_input(frame, field, areas, input);
-    if let Some(error) = error {
-        frame.render_widget(Line::from(error.to_string().fg(DANGER)), problem);
-    }
-    let offset = (selected + 1).saturating_sub(rows);
-    for (row, (index, path)) in paths.iter().enumerate().skip(offset).take(rows).enumerate() {
-        let rect = Rect::new(list.x, list.y + row as u16, list.width, 1);
-        let chosen = index == selected;
-        let folder = path.ends_with(['/', '\\']);
-        let style = if chosen {
-            Style::new().bg(SELECTED)
+        heading(if places_focused {
+            "▸ PLACES"
         } else {
-            Style::new()
+            "PLACES"
+        }),
+        Rect::new(left.x, y, left.width, 1),
+    );
+    y += 1;
+    let mut drives_shown = false;
+    for (i, place) in b.places.iter().enumerate() {
+        if place.drive && !drives_shown {
+            drives_shown = true;
+            if y < left.bottom() {
+                frame.render_widget(heading("DRIVES"), Rect::new(left.x, y + 1, left.width, 1));
+            }
+            y += 2;
+        }
+        if y >= left.bottom() {
+            break;
+        }
+        let rect = Rect::new(left.x, y, left.width, 1);
+        let chosen = i == b.place_selected;
+        let style = match (chosen, places_focused) {
+            (true, true) => Style::new().bg(ACCENT).fg(Color::White).bold(),
+            (true, false) => Style::new().bg(SELECTED),
+            _ => Style::new(),
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(if chosen { "▌" } else { " " }, Style::new().fg(ACCENT)),
-                Span::styled(
-                    untrusted_path(path),
-                    if folder {
-                        Style::new().fg(ACCENT)
-                    } else {
-                        Style::new()
-                    },
-                ),
-            ]))
-            .style(style),
-            rect,
-        );
+        let label = untrusted_path(&place.label);
+        frame.render_widget(Paragraph::new(format!(" {label}")).style(style), rect);
+        areas.add(rect, Target::Place(i));
+        y += 1;
+    }
+
+    // The folder.
+    let [path_row, filter_box, problem, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(right);
+    let shown = untrusted_path(&b.dir.display().to_string());
+    let width = path_row.width as usize;
+    let count = shown.chars().count();
+    let shown = if count > width && width > 1 {
+        let tail: String = shown.chars().skip(count - (width - 1)).collect();
+        format!("…{tail}")
+    } else {
+        shown
+    };
+    frame.render_widget(Line::from(shown.bold()), path_row);
+    let filter_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Line::from(" type to filter, or a path ".fg(MUTED)))
+        .border_style(Style::new().fg(if places_focused { BORDER } else { ACCENT }));
+    let filter_inner = filter_block.inner(filter_box);
+    frame.render_widget(filter_block, filter_box);
+    frame.render_widget(
+        Paragraph::new(b.filter.text().to_string())
+            .scroll((0, b.filter.scroll(filter_inner.width))),
+        filter_inner,
+    );
+    if !places_focused && filter_inner.width > 0 {
+        frame.set_cursor_position((
+            filter_inner.x + b.filter.cursor_column(filter_inner.width),
+            filter_inner.y,
+        ));
+    }
+    if let Some(error) = &b.error {
+        frame.render_widget(Line::from(error.clone().fg(DANGER)), problem);
+    } else if let Some(path) = b.typed_path() {
+        let what = if path.is_dir() {
+            "Enter goes to this folder"
+        } else if path.is_file() {
+            "Enter sends this file"
+        } else {
+            "Nothing there yet"
+        };
+        frame.render_widget(Line::from(what.fg(MUTED)), problem);
+    }
+
+    let rows = b.rows();
+    let height = list.height as usize;
+    let offset = (b.selected + 1).saturating_sub(height);
+    let now = crate::history::unix_now();
+    if rows.is_empty() && b.typed_path().is_none() {
+        let empty = if b.filter.text().is_empty() {
+            "This folder is empty."
+        } else {
+            "Nothing here matches."
+        };
+        frame.render_widget(Line::from(empty.fg(MUTED)), list);
+    }
+    for (line, (index, row)) in rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .enumerate()
+    {
+        let rect = Rect::new(list.x, list.y + line as u16, list.width, 1);
+        let chosen = index == b.selected;
+        let base = match (chosen, places_focused) {
+            (true, false) => Style::new().bg(SELECTED),
+            _ => Style::new(),
+        };
+        let bar = if chosen && !places_focused {
+            Span::styled("▌", Style::new().fg(ACCENT))
+        } else {
+            Span::raw(" ")
+        };
+        let (name, detail) = match row {
+            Row::Up => (
+                Span::styled("..", Style::new().fg(ACCENT).bold()),
+                Span::styled("up one folder", Style::new().fg(MUTED)),
+            ),
+            Row::Entry(i) => {
+                let entry = &b.entries[*i];
+                let name = untrusted_path(&entry.name);
+                if entry.is_dir {
+                    (
+                        Span::styled(
+                            format!("{name}{}", std::path::MAIN_SEPARATOR),
+                            Style::new().fg(ACCENT).bold(),
+                        ),
+                        Span::raw(""),
+                    )
+                } else {
+                    let when = entry
+                        .modified
+                        .map(|at| crate::history::ago(at, now))
+                        .unwrap_or_default();
+                    (
+                        Span::raw(name),
+                        Span::styled(
+                            format!("{:>10}  {when:>12}", crate::ui::format_bytes(entry.size)),
+                            Style::new().fg(MUTED),
+                        ),
+                    )
+                }
+            }
+        };
+        let detail_width = (detail.width() as u16).min(rect.width / 2);
+        let [l, r] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(detail_width)]).areas(rect);
+        frame.render_widget(Paragraph::new(Line::from(vec![bar, name])).style(base), l);
+        frame.render_widget(Paragraph::new(Line::from(detail)).style(base), r);
         areas.add(rect, Target::Suggestion(index));
     }
-    draw_buttons(
-        frame,
-        buttons,
-        areas,
-        ("Send", "Cancel"),
-        Choice::Yes,
-        false,
-    );
+
+    let go = match rows.get(b.selected) {
+        _ if b.typed_path().is_some_and(|p| p.is_file()) => "Send",
+        Some(Row::Entry(i)) if !b.entries[*i].is_dir => "Send",
+        _ => "Open",
+    };
+    draw_buttons(frame, buttons, areas, (go, "Cancel"), Choice::Yes, false);
 }
 
 /// A file name from this disk can still hold control characters.
@@ -1773,16 +1916,23 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             &[("←→", "choose"), ("Enter", "confirm"), ("Esc", "keep")]
         }
         (Some(Modal::Help), _) => &[("any key", "close")],
+        (None, _) if app.snapshot.needs_setup => &[
+            ("←→", "choose"),
+            ("Enter", "confirm"),
+            ("y", "create it"),
+            ("Ctrl+Q", "quit"),
+        ],
         (Some(Modal::EnterCode { .. }), _) => &[("Enter", "pair"), ("Esc", "cancel")],
         (Some(Modal::Busy { .. }), _) => &[("Esc", "cancel")],
         (Some(Modal::ShowInvite { .. }), _) => &[("Ctrl+C", "copy invite"), ("Esc", "cancel")],
         (Some(Modal::ConfirmPair { .. } | Modal::RelayChange { .. }), _) => {
             &[("←→", "choose"), ("Enter", "confirm"), ("Esc", "no")]
         }
-        (Some(Modal::PickFile { .. }), _) => &[
-            ("Tab", "complete"),
-            ("↑↓", "choose"),
-            ("Enter", "send"),
+        (Some(Modal::Browse(_)), _) => &[
+            ("Enter", "open / send"),
+            ("Backspace", "up"),
+            ("Tab", "places"),
+            ("type", "filter"),
             ("Esc", "cancel"),
         ],
         (Some(Modal::SendStatus), _) => &[("Esc", "hide"), ("x", "cancel the send")],
@@ -2142,6 +2292,7 @@ mod tests {
             history: Vec::new(),
             owner: Owner::Background,
             listen_elsewhere: false,
+            needs_setup: false,
             problem: None,
         })
     }
@@ -2221,11 +2372,32 @@ mod tests {
     }
 
     #[test]
-    fn no_identity_says_to_run_init() {
+    fn an_unreadable_identity_says_to_run_init() {
         let mut app = app(&[], Agent::Stopped);
         app.snapshot.me = None;
         let screen = render(&mut app, 100, 20);
         assert!(screen.contains("beam init"), "{screen}");
+    }
+
+    #[test]
+    fn the_first_run_shows_a_welcome_with_create_it_highlighted() {
+        let mut app = app(&[], Agent::Stopped);
+        app.snapshot.me = None;
+        app.snapshot.needs_setup = true;
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("Welcome to beam"), "{screen}");
+        assert!(screen.contains("Create it now?"), "{screen}");
+        assert!(
+            screen.contains(" Create it ") && screen.contains(" Not now "),
+            "{screen}"
+        );
+        assert!(!screen.contains("init"), "no technical words:\n{screen}");
+        assert!(
+            app.areas
+                .targets
+                .iter()
+                .any(|(_, t)| *t == Target::Button(Choice::Yes))
+        );
     }
 
     #[test]
@@ -2466,15 +2638,32 @@ mod tests {
     }
 
     #[test]
-    fn sending_shows_a_file_box_then_a_progress_pop_up_and_a_header_pill() {
+    fn sending_shows_the_browser_then_a_progress_pop_up_and_a_header_pill() {
         let mut app = app(&["alice"], Agent::Stopped);
-        app.paths = |_, _| vec!["report.pdf".into(), "notes/".into()];
+        app.fs = crate::tui::browse::tests::fake();
         app.on_key(Key::Char('s'));
         let screen = render(&mut app, 120, 30);
         assert!(screen.contains("Send a file to alice"), "{screen}");
         assert!(
-            screen.contains("report.pdf") && screen.contains("notes/"),
+            screen.contains("PLACES") && screen.contains("DRIVES"),
             "{screen}"
+        );
+        assert!(screen.contains("Home"), "{screen}");
+        assert!(screen.contains("up one folder"), "{screen}");
+        assert!(
+            screen.contains("docs") && screen.contains("notes.txt"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains(".secret"),
+            "hidden files stay hidden:\n{screen}"
+        );
+        assert!(screen.contains("1.0 KiB"), "{screen}");
+        assert!(
+            app.areas
+                .targets
+                .iter()
+                .any(|(_, t)| *t == Target::Place(1))
         );
 
         app.effect_done(crate::tui::app::Done::SendStarted {
