@@ -21,13 +21,14 @@ official `archlinux:base-devel` image) for every push and pull request
 
 | Level | Where | What it covers |
 |-------|-------|----------------|
-| Unit | `#[cfg(test)]` modules inside `crates/beam/src/` | derivations, parsing, framing, chunk arithmetic, state machine transitions, path safety |
+| Unit | `#[cfg(test)]` modules inside each crate's `src/` (`beam-core`, `beam-model`, `beam`) | derivations, parsing, framing, chunk arithmetic, state machine transitions, path safety |
 | Command | `crates/beam/tests/cli.rs` | whole commands driven through `cli::execute` with in-memory streams and a temporary `--beam-dir` |
-| Integration | `crates/beam/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
-| Failure | `crates/beam/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
-| Security | `tests/transfer.rs::accept_rules`, `tests/cli.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
-| Resume | `crates/beam/tests/resume.rs` | partial transfers: what carries over, what is re-fetched, and what survives a failure |
+| Integration | `crates/beam-core/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
+| Failure | `crates/beam-core/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
+| Security | `crates/beam-core/tests/transfer.rs::accept_rules`, `hostile_peer.rs`, `crates/beam/tests/cli.rs`, `injection.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
+| Resume | `crates/beam-core/tests/resume.rs` | partial transfers: what carries over, what is re-fetched, and what survives a failure |
 | End to end | `crates/beam/tests/end_to_end.rs` | two real `beam` processes, talking over a real socket, with the prompt answered only once it has actually appeared — including killing one of them mid-transfer |
+| Layers | `crates/beam-core/tests/layers.rs`, `crates/beam-model/tests/layers.rs` | which layer may use which (ADR-0048) |
 | Manual | `docs/test-plan.md` | the few things one machine cannot honestly automate: a real second volume, a real full disk |
 
 Command-level tests never spawn a process and never touch the real `~/.beam`:
@@ -197,6 +198,23 @@ than once, and both would have failed in CI eventually.
   about data arriving *while the prompt is open* depend on the data winning. A
   prompt returning in nanoseconds sometimes beat it. Those tests now use a
   prompt that takes 300 ms, as a person does.
+- **The kill-and-resume tests failed under load, and the cause was in beam
+  (2026-10-12).** `end_to_end.rs`'s three kill-and-resume tests passed alone
+  but failed about one run in five when many ran at once, after a 30 s wait
+  for "two chunks on disk". Assumed at first to be the file finishing before
+  the cut; a stress run (8 to 12 copies at a time) and the receiver's own
+  output showed otherwise: `replace …\state.json: Access is denied`. On
+  Windows, replacing a file fails while another program has it open, and
+  the test reads `state.json` to count chunks, so under load a read and a
+  replace met and the **transfer failed**. Antivirus scanners, indexers and
+  backup tools open new files the same way, so real transfers could fail
+  too. Fixed in beam, not in the test: `beam-core/src/replace.rs` retries a
+  refused replace for about a second, on Windows only, for `state.json`, the
+  `~/.beam` files and the final move into place
+  (`replace::tests::a_replace_waits_out_a_program_that_holds_the_file_for_a_moment`,
+  `a_file_that_stays_held_still_fails_after_about_a_second`). The same stress
+  run then passed 180 of 180, against 58 of 72 before. The wait in the test
+  now prints the receiver's output if it ever fails again.
 
 ## Implemented (M4)
 

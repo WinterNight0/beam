@@ -82,10 +82,10 @@ modern without effort; Slint is the runner-up.
 
 ## Next steps, if accepted
 
-1. ADR-0048 records the choice.
-2. Split the workspace: `beam-core` (library), `beam` (CLI/TUI), `beam-gui`.
-   No user-visible change.
-3. Move the TUI's background workers and the shared model out of `tui/` so
-   the GUI uses the same code (one place for the safe defaults).
-4. Build the GUI first version; release it separately (tag `gui-v*`), bundled
-   with the `beam` it was built with.
+1. ADR-0049 records the choice.
+2. ~~Split the workspace~~ and ~~move the shared flows and model out of
+   `tui/`~~: done by the restructure, ADR-0048 (`beam-core` with
+   `actions/`, `beam-model`, `beam`). The GUI uses the same code, and the
+   same safe defaults (`beam_model::Ask`).
+3. Build the GUI first version as `crates/beam-gui`; release it separately
+   (tag `gui-v*`), bundled with the `beam` it was built with.

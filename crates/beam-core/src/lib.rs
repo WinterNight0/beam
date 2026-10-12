@@ -26,6 +26,7 @@ pub mod invite;
 pub mod listen_status;
 pub mod listener;
 pub mod pairing;
+pub(crate) mod replace;
 pub mod text;
 pub mod transfer;
 pub mod transport;

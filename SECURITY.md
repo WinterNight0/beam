@@ -177,6 +177,7 @@ These are accepted on purpose, with their reasons, in
 | 2026-10-02 | F-3: an invite could name any `http://` or local relay URL, making beam connect to local services or talk to a relay in plain text | Low | **Fixed**: invites accept only `https://` relays on public hosts (ADR-0038) |
 | 2026-10-02 | F-4: CI token had default permissions; actions referenced by movable tags; no automatic dependency audit | Low | **Fixed**: read-only token, actions pinned to commits, `cargo audit` job |
 | 2026-10-12 | F-5: in the full-screen view, the message for a failed send was drawn without cleaning. It can quote network error text, including the reason a peer gives for closing a connection, so a hostile paired device could put control characters on the screen. `beam send` was not affected (it cleans when it prints) | Low | **Fixed**: the messages now come back cleaned from the one place every front end takes them (`actions::messages`); `actions::messages::tests::messages_come_back_cleaned` |
+| 2026-10-12 | Hardening (ADR-0048): a relay move for a paired friend relied on each front end asking first (ADR-0038). Now the one save every front end uses refuses a relay change without the person's yes, and every yes/no question is built to start on No | — | **Done**: `actions::pair::tests::a_relay_change_is_not_saved_without_a_yes`, `beam_model::ask::tests::every_question_starts_on_no` |
 | M6 | Impersonation, terminal injection, hostile-peer limits | — | Fixed and tested in M6; `threat-model.md` |
 
 ## 8. Reporting a vulnerability

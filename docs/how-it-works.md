@@ -6,6 +6,11 @@ computer. It is written for someone who can program but has not read beam's
 code. Each part names the module that implements it and the decision record
 (ADR, in [decisions.md](decisions.md)) that explains why it is built that way.
 
+Code paths are given inside their crate: `src/cli/…` and `src/tui/…` are in
+`crates/beam` (the front ends), everything else is in `crates/beam-core`
+(the core and the shared actions). Section 11 shows the three crates and
+why they are split (ADR-0048).
+
 Contents:
 
 1. [The big picture](#1-the-big-picture)
@@ -563,20 +568,32 @@ What has been measured, with the benchmark that measures it, is in
 
 ## 11. Where everything lives in the code
 
+beam is built in four layers, in three crates (ADR-0048). Each layer may use
+only the ones below it, and the build enforces that: the core's crate does
+not even list a terminal or GUI library, so it cannot print or draw.
+
 ```
-crates/beam/src/
-  main.rs              entry point: plain `beam` → cli::start (the view), else cli::execute
-  cli/                 one file per group of commands
-    mod.rs             the command tree (clap)
-    identity_cmds.rs   init, whoami, peers, rename, remove
-    agent_cmds.rs      agent, inbox, service, receive-dir
-    history_cmds.rs    history
-    ui_cmds.rs         ui (what plain `beam` opens)
-    pair_cmds.rs       pair <invite>, pair --wait, the address update
-    net_cmds.rs        listen and send over iroh, and their messages
-    transfer_cmds.rs   transfers; the hidden TCP test transport
-    desk.rs            one question on screen at a time; notices redraw it
-    terminal.rs        keyboard and progress output
+  front ends   crates/beam         the `beam` program: CLI and full-screen view
+                                   (a GUI will be another crate here)
+       │ uses
+  model        crates/beam-model   what a screen shows; every yes/no question
+                                   starts on No
+       │ uses
+  actions      crates/beam-core    one copy of each flow a person runs
+  core         (actions/ + rest)   identity, pairing, transfers, transport,
+                                   listener, agent: where the rules are kept
+```
+
+Why: the rules that keep beam safe (Accept before any byte, only known
+peers, a changed key aborts) are enforced in the core, whatever a front end
+does. The flows around them (which friend's key to dial, asking before a
+relay move, cleaning text from the network) are written once, in the
+actions, so the CLI, the view and a future GUI cannot drift apart. The
+model holds the screen's state and the safe default of every question, so
+the view and a GUI behave the same.
+
+```
+crates/beam-core/src/
   identity/            keys, fingerprint, Short ID, known_peers, ~/.beam store
   invite.rs            the invite format; saving and reading where a peer is
   pairing/
@@ -590,12 +607,41 @@ crates/beam/src/
     dial.rs            dialling a peer; following [Direct P2P]/[Relay]
   transfer/            the protocol, the state machine, chunks, partials, commit
   agent/               the background agent, its local link, notifications, login start
-  tui/                 the full-screen view: state, drawing, palette, workers
   history.rs           ~/.beam/history.jsonl: what came and went
   config.rs            ~/.beam/config.toml: relay, port, receive folder, ui
-  untrusted.rs         makes text from the other side safe for the terminal
-  ui.rs                formatting helpers
-crates/beam/tests/     command, integration, security and two-process tests
+  untrusted.rs         makes text from the other side safe for a screen
+  text.rs              sizes, percentages and ages in words
+  actions/             the flows, once for every front end
+    send.rs            find the friend, dial, send, stop, history line
+    pair.rs            pairing; "already paired" and the relay-move rule
+    receive.rs         the agent's settings, for beam agent and the switch
+    inbox.rs           the link to a running agent; cleaned requests
+    messages.rs        what beam says when a send cannot go ahead
+crates/beam-core/tests/  integration and security tests of the core;
+                       layers.rs (the layers), no_n0_discovery.rs (S-17)
+
+crates/beam-model/src/
+  ask.rs               Ask<Q>: a yes/no question, highlighting No
+  snapshot.rs          what ~/.beam holds, cleaned: me, friends, last seen
+  requests.rs          requests waiting, the file arriving, the Receiving switch
+  sending.rs           the send in progress, in stages
+
+crates/beam/src/
+  main.rs              entry point: plain `beam` → cli::start (the view), else cli::execute
+  cli/                 one file per group of commands
+    mod.rs             the command tree (clap)
+    identity_cmds.rs   init, whoami, peers, rename, remove
+    agent_cmds.rs      agent, inbox, service, receive-dir
+    history_cmds.rs    history
+    ui_cmds.rs         ui (what plain `beam` opens)
+    pair_cmds.rs       pair <invite>, pair --wait, the address update
+    net_cmds.rs        listen and send over iroh
+    transfer_cmds.rs   transfers; the hidden TCP test transport
+    desk.rs            one question on screen at a time; notices redraw it
+    terminal.rs        keyboard and progress output
+  tui/                 the full-screen view: keys, drawing, palette, workers
+  ui.rs                terminal tables and y/N prompts
+crates/beam/tests/     command, two-process and terminal-injection tests
 docs/                  requirements, decisions (ADRs), test plan, threat model
 ```
 

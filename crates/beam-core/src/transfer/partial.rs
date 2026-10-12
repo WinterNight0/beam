@@ -654,7 +654,7 @@ fn write_state_file(dir: &Path, state: &PartialState, durable: bool) -> Result<(
             .sync_all()
             .map_err(|e| PartialError::io("flush", &path, e))?;
     }
-    temp.persist(&path)
+    crate::replace::persist(temp, &path)
         .map_err(|e| PartialError::io("replace", &path, e.error))?;
     Ok(())
 }

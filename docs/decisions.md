@@ -2533,3 +2533,83 @@ mouse captured its own selection is off.
   `tui::app::tests::ctrl_v_reads_the_clipboard_only_where_something_is_typed`,
   `m_gives_the_mouse_to_the_terminal_and_back_but_is_a_letter_when_typing`; the
   clipboard read was run once on Windows (exit 0, about 0.3 s).
+
+## ADR-0048 — Four layers in three crates: core, actions, model, front ends
+
+**Status:** accepted (2026-10-12). Branch `RE-Arrange-Structure`, patches #1–#7.
+Prepares the GUI (SPIKE-002; its library choice will be ADR-0049).
+
+**Context.** beam had one crate. Its core was already clean of the
+terminal in most places, but three things reached up a layer (the transfer
+engine borrowed terminal formatting helpers, the view borrowed from the
+CLI, the agent printed by itself), and the flows a person runs were written
+twice: `beam send` and the view's Send were about 90 % the same code, and so
+were the two pairing flows and the two "update where a friend is" paths. A
+GUI would have made each a third copy. The rules that keep beam safe sit in
+the core, but the code *around* them (which friend's key, the relay
+question, the safe default of a pop-up) was repeated in every copy, where
+one copy could drift.
+
+### Decision
+
+Four layers, each allowed to use only the ones below it:
+
+| Layer | Crate | Holds |
+|---|---|---|
+| L1 core | `beam-core` | identity, pairing, transfer engine, transport, listener, agent, history, config, `untrusted`, `text` |
+| L2 actions | `beam-core`, `actions/` | one copy of each flow a person runs: `send`, `pair` (and "already paired"), `receive` (agent / Receiving switch settings), `inbox`, and every failed-send message |
+| L3 model | `beam-model` | what a screen shows: `Snapshot` (me, friends, last seen), `requests` (pending, Receiving switch), `sending`, and `ask` |
+| L4 front ends | `beam` (CLI + full-screen view); later `beam-gui` | words, keys, clicks, layout |
+
+* **The build enforces the layers.** `beam-core` lists no terminal or GUI
+  library and does not depend on `beam-model` or `beam`, so it cannot print,
+  draw or call a front end. `beam-model` depends on `beam-core` only.
+  Inside `beam-core`, where core and actions share a crate,
+  `tests/layers.rs` refuses any core module that names `actions` (or a
+  crate above), and any new file not placed in a layer.
+* **`Ask<Q>`**: every yes/no question that could accept a file, pair, remove
+  a friend, move a friend's relay or cut off a transfer is an `Ask`, whose
+  only constructor highlights **No** and whose highlight is private. A
+  front end, the GUI included, cannot open one on Yes.
+* **Safe entry points only.** `actions::pair::save_location` refuses a
+  relay change unless the caller says the person agreed (ADR-0038); the
+  failed-send messages come back already cleaned (ADR-0034), so no front end
+  can forget to clean them.
+* **Front ends keep their words.** Actions and model report *what happened*
+  (an error variant, a `Happened`, a `Toggle`); each front end words it, so
+  every CLI and view message reads exactly as before.
+* **Dependency versions are set once**, in the workspace `Cargo.toml`, so the
+  exact pins on `iroh` and `spake2` cannot differ between crates.
+* **Tests live with what they test**: core-only integration tests in
+  `crates/beam-core/tests`, CLI ones in `crates/beam/tests`. The S-17
+  no-discovery test scans every crate in the workspace.
+
+How it was done: safety-net tests first (a send reaches only the chosen
+friend, through the CLI and the view; the Receiving switch never pairs),
+then the layer violations, then the shared actions, then the crate split
+(pure `git mv`, then explicit `beam_core::` paths), then the model, each a
+reviewed patch with every test passing.
+
+### Consequences
+
+* A feature is written once and used by every front end. The order for a
+  new one is in CLAUDE.md ("Adding a feature"); `docs/parity.md` says which
+  front end offers what.
+* The view lost about 240 lines of duplicated flow, and the CLI/view pop-ups
+  their hand-written `focus` fields.
+* Found and fixed on the way: SECURITY.md **F-5** (the view drew a failed
+  send's message uncleaned) and the relay-change rule moved from "every
+  front end asks" to "the save refuses without a yes".
+* The GUI spike no longer pulls in the terminal libraries (its lockfile lost
+  about 440 lines).
+* Cost: three crates to keep in step, and a public API in `beam-core` and
+  `beam-model` that must stay small and safe; a type that leaves the core is
+  a promise.
+* The old Go `Makefile` (ADR-0010) is replaced: `make check` runs fmt-check,
+  clippy and test over the workspace, as CI does.
+* Found while making the suite reliable for the merge: on Windows, replacing
+  a file fails while another program has it open (an antivirus scan, an
+  indexer, a test reading `state.json`), which failed transfers. Every
+  replace now goes through `beam-core/src/replace.rs`, which retries that
+  one error for about a second on Windows only; see the test plan's "flaky
+  tests".

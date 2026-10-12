@@ -129,7 +129,7 @@ pub fn check_space(
 /// within one volume, and a crash part-way through leaves a temporary file
 /// rather than a half-written download wearing the destination's name.
 pub async fn commit(part: &Path, destination: &Path) -> std::io::Result<()> {
-    match tokio::fs::rename(part, destination).await {
+    match crate::replace::rename(part, destination).await {
         Ok(()) => Ok(()),
         Err(e) if is_cross_volume(&e) => commit_by_copy(part, destination).await,
         Err(e) => Err(e),
@@ -167,7 +167,7 @@ pub async fn commit_by_copy(part: &Path, destination: &Path) -> std::io::Result<
         return Err(e);
     }
 
-    if let Err(e) = tokio::fs::rename(&staging_path_owned, destination).await {
+    if let Err(e) = crate::replace::rename(&staging_path_owned, destination).await {
         let _ = tokio::fs::remove_file(&staging_path_owned).await;
         return Err(e);
     }

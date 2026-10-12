@@ -139,6 +139,7 @@ convenience loses.
 | N-6 | Nicknames are local labels. There is no global username registry, and a peer is not notified when it is renamed. |
 | N-8 | Throughput is measured with `tests/throughput.rs` (release build) before and after any change meant to affect it, and the numbers are recorded in `docs/performance-plan.md` (ADR-0039). |
 | N-7 | Free space is checked before the Accept prompt, on the volume holding partials and — when it differs — the destination volume, counting only the bytes still missing plus a small margin. Too little space is refused clearly rather than discovered part-way through. |
+| N-9 | The code is layered (ADR-0048): the core keeps every security rule and uses no terminal or GUI library; each flow a person runs is written once (`beam-core/src/actions`) for every front end; every yes/no question that could accept, pair, remove, move a relay or stop a transfer starts on No by construction (`beam_model::Ask`). The build and `tests/layers.rs` enforce it. |
 
 ## 5. Implementation language
 

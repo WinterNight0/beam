@@ -337,8 +337,15 @@ crates/beam/src/tui/
   browse.rs     the file browser: places and drives, folders, filter, the disk
   sending.rs    `beam send` on a background thread
   clipboard.rs  Ctrl+C
-crates/beam/src/history.rs   history.jsonl
+crates/beam-core/src/actions/    the flows the workers run (send, pair, receive, inbox)
+crates/beam-model/src/           what the view shows and the safe default of each question
+crates/beam-core/src/history.rs  history.jsonl
 ```
+
+The workers run the shared actions; the state of Pending, the Receiving
+switch, the send in progress and every yes/no pop-up comes from
+`beam-model`, which a GUI will share (ADR-0048). What stays here is the
+terminal's own: keys, mouse, the palette, drawing and wording.
 
 Drawing uses **ratatui** with its **crossterm** backend, the same pair as the
 Fresh editor; crossterm comes through ratatui so the two cannot disagree.

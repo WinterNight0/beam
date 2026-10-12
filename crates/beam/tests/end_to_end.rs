@@ -97,6 +97,14 @@ impl Watched {
         }
     }
 
+    /// Everything the process printed so far, for a failure message.
+    fn drain(&mut self) -> String {
+        while let Ok(byte) = self.bytes.try_recv() {
+            self.seen.push(byte as char);
+        }
+        self.seen.clone()
+    }
+
     /// Reads until `needle` has appeared, or gives up.
     fn wait_for(&mut self, needle: &str) {
         let deadline = Instant::now() + PATIENCE;
@@ -416,7 +424,7 @@ mod killed {
             listener.wait_for("[y/N]: ");
             listener.answer("y");
 
-            wait_for_partial_progress(&work);
+            wait_for_partial_progress(&work, &mut listener);
 
             match victim {
                 Victim::Sender => {
@@ -512,8 +520,11 @@ mod killed {
         interrupt_and_resume(Victim::Receiver);
     }
 
-    /// Waits until a partial reports at least two stored chunks.
-    pub(super) fn wait_for_partial_progress(work: &Path) {
+    /// Waits until a partial reports at least two stored chunks. If none
+    /// do, says what the receiver printed: that is where a failed transfer
+    /// explains itself (it once read "replace state.json: Access is denied",
+    /// which is how a Windows file-lock problem was found).
+    pub(super) fn wait_for_partial_progress(work: &Path, listener: &mut Watched) {
         let deadline = Instant::now() + PATIENCE;
         while Instant::now() < deadline {
             if partial_chunks(work) >= 2 {
@@ -521,7 +532,11 @@ mod killed {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("no chunks reached the disk within {PATIENCE:?}");
+        panic!(
+            "no chunks reached the disk within {PATIENCE:?}. The receiver printed:
+{}",
+            listener.drain()
+        );
     }
 
     /// How many chunks the partials under `work` claim, read straight from the
@@ -882,7 +897,7 @@ mod over_iroh {
         let mut first = send(&demo, &["--chunk-size", "65536"]);
         listener.wait_for("[y/N]: ");
         listener.answer("y");
-        super::killed::wait_for_partial_progress(&work);
+        super::killed::wait_for_partial_progress(&work, &mut listener);
         let _ = first.child.kill();
         let _ = first.child.wait();
 

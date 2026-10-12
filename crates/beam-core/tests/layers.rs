@@ -22,6 +22,7 @@ const CORE: &[&str] = &[
     "listen_status.rs",
     "listener.rs",
     "pairing",
+    "replace.rs",
     "text.rs",
     "transfer",
     "transport",
