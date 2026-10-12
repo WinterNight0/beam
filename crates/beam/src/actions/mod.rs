@@ -6,4 +6,8 @@
 //! never uses it. Nothing here prints, draws or reads a key: a front end is
 //! handed plain text and events, and decides how to show them.
 
+pub mod inbox;
 pub mod messages;
+pub mod pair;
+pub mod receive;
+pub mod send;

@@ -1,7 +1,8 @@
 //! The Receiving switch (ADR-0044): the background agent's receiver, run
 //! inside the view for as long as the switch is on.
 //!
-//! It is [`agent::run`] unchanged — pairing off, a five-minute Accept window,
+//! It is [`actions::receive`](crate::actions::receive), which is
+//! [`agent::run`](crate::agent::run) unchanged — pairing off, a five-minute Accept window,
 //! router port mapping only if `beam service port-mapping on`, a desktop
 //! notification per request — with `in_view` set, so `beam service status`
 //! and `beam whoami` say who is receiving. It takes the agent's lock, so
@@ -14,11 +15,8 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use crate::agent::status::{self, Running};
-use crate::agent::{self, AgentOptions};
-use crate::config::Config;
+use crate::actions::receive::{self, Place};
 use crate::identity::Store;
-use crate::pairing::Network;
 use crate::transport::endpoint::Bind;
 use crate::untrusted;
 
@@ -86,55 +84,27 @@ fn run(
     stopped: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let fail = |e: &dyn std::fmt::Display| untrusted::lines(&e.to_string());
-    let identity = store.load_identity().map_err(|e| fail(&e))?;
-    let config = Config::load(&store.config_path()).map_err(|e| fail(&e))?;
-    let (receive_dir, _) = agent::receive_dir(config.receive_dir.as_deref());
-    let shown_dir = untrusted::name(&receive_dir.display().to_string());
-    let options = AgentOptions {
-        network: Network {
-            relay: config.relay,
-            bind,
-            port: config.port,
-            advertise: config.advertise,
-        },
-        receive_dir,
-        accept_timeout: agent::AGENT_ACCEPT_TIMEOUT,
-        port_mapping: config.agent_port_mapping,
-        notify,
-        echo: None,
-        in_view: true,
-    };
+    let receiver =
+        receive::prepare(store, Place::InView, bind, notify, None).map_err(|e| fail(&e))?;
+    let shown_dir = untrusted::name(&receiver.receive_dir().display().to_string());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| fail(&e))?;
-    let result = runtime.block_on(async {
-        let receiving = agent::run(identity, store.clone(), options, async {
-            // A drop counts as "stop" too: the view went away.
+    let result = runtime.block_on(receive::run(
+        store,
+        receiver,
+        // A drop counts as "stop" too: the view went away.
+        async {
             let _ = stopped.await;
-        });
-        tokio::pin!(receiving);
-        // Say "on" once it is really listening: its status file names this
-        // process and carries its invite.
-        loop {
-            tokio::select! {
-                result = &mut receiving => return result,
-                () = tokio::time::sleep(Duration::from_millis(50)) => {
-                    if let Running::Yes(status) = status::read(store)
-                        && status.in_view
-                        && status.pid == std::process::id()
-                        && status.invite.is_some()
-                    {
-                        let _ = updates.send(RecvUpdate::Started {
-                            receive_dir: shown_dir.clone(),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-        receiving.await
-    });
+        },
+        // Say "on" once it is really receiving.
+        || {
+            let _ = updates.send(RecvUpdate::Started {
+                receive_dir: shown_dir,
+            });
+        },
+    ));
     runtime.shutdown_timeout(Duration::from_secs(1));
     result.map_err(|e| fail(&e))
 }
@@ -142,6 +112,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::status::{self, Running};
     use crate::tui::inbox::tests::with_an_agent::home;
 
     fn next(on: &InView) -> RecvUpdate {

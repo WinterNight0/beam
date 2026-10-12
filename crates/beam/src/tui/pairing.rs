@@ -21,12 +21,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::config::Config;
-use crate::identity::{Peer, Store};
-use crate::invite::{self, Invite};
+use crate::actions::{
+    self,
+    pair::{PairFailure, PairRequest},
+};
+use crate::identity::Store;
+use crate::invite::Invite;
 use crate::pairing::{
-    CodeSlot, Confirm, ConfirmRequest, Event, Network, PairError, PairingCode, PairingError,
-    Timeouts, join, wait,
+    Confirm, ConfirmRequest, Event, PairError, PairingCode, PairingError, Timeouts,
 };
 use crate::transport::endpoint::Bind;
 use crate::untrusted;
@@ -162,21 +164,11 @@ fn run(
     cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(String, String), String> {
     let fail = |e: &dyn std::fmt::Display| untrusted::lines(&e.to_string());
-    let identity = store.load_identity().map_err(|e| fail(&e))?;
-    let known = store.load_known_peers().map_err(|e| fail(&e))?;
-    let config = Config::load(&store.config_path()).map_err(|e| fail(&e))?;
-    let network = Network {
-        relay: config.relay,
-        bind,
-        port: config.port,
-        advertise: config.advertise,
-    };
-    let timeouts = Timeouts::default();
     let answers = Arc::new(Mutex::new(answers));
     let confirm = ViewConfirm {
         updates: updates.clone(),
         answers: Arc::clone(&answers),
-        timeout: timeouts.decision,
+        timeout: Timeouts::default().decision,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -186,13 +178,6 @@ fn run(
     let (name, invite) = match &role {
         Role::Join { invite, name } => (Some(name.as_str()), Some(&**invite)),
         Role::Wait => (None, None),
-    };
-    let pairing = crate::pairing::Pairing {
-        identity: &identity,
-        known: &known,
-        name,
-        network: &network,
-        timeouts,
     };
     let send_event = |event: Event<'_>| {
         let update = match event {
@@ -210,57 +195,35 @@ fn run(
         };
         let _ = updates.send(update);
     };
-
-    let result = runtime.block_on(async {
-        let pairing_run = async {
-            match invite {
-                None => {
-                    let code = PairingCode::generate()
-                        .map_err(|e| PairError::Io(std::io::Error::other(e)))?;
-                    wait(
-                        &pairing,
-                        CodeSlot::new(code, timeouts.code_ttl),
-                        confirm,
-                        send_event,
-                    )
-                    .await
-                }
-                Some(invite) => {
-                    let ask_code = || {
-                        let updates = updates.clone();
-                        let answers = Arc::clone(&answers);
-                        async move {
-                            tokio::task::spawn_blocking(move || read_code(&updates, &answers))
-                                .await
-                                .map_err(std::io::Error::other)?
-                        }
-                    };
-                    join(&pairing, invite, ask_code, confirm, send_event).await
-                }
-            }
-        };
-        tokio::select! {
-            result = pairing_run => result,
-            _ = cancelled => Err(PairError::Io(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "cancelled",
-            ))),
+    let ask_code = || {
+        let updates = updates.clone();
+        let answers = Arc::clone(&answers);
+        async move {
+            tokio::task::spawn_blocking(move || read_code(&updates, &answers))
+                .await
+                .map_err(std::io::Error::other)?
         }
-    });
+    };
+    let request = PairRequest { invite, name, bind };
+    let result = runtime.block_on(actions::pair::pair(
+        store,
+        request,
+        confirm,
+        ask_code,
+        send_event,
+        // Dropping the worker counts too: the view went away.
+        async {
+            let _ = cancelled.await;
+        },
+    ));
     // A question still waiting must not hold the thread: the view has gone.
     runtime.shutdown_background();
 
-    let paired = result.map_err(|e| not_paired(&e, invite.is_none()))?;
-    // Read the file again: it may have changed while the question was up.
-    let mut known = store.load_known_peers().map_err(|e| fail(&e))?;
-    let mut peer = Peer::new(paired.name.clone(), paired.key);
-    if let Some(invite) = invite {
-        invite::remember(&mut peer, invite, &network.relay);
+    match result {
+        Ok(friend) => Ok((friend.name, friend.fingerprint.hex())),
+        Err(PairFailure::NotPaired(e)) => Err(not_paired(&e, invite.is_none())),
+        Err(other) => Err(fail(&other)),
     }
-    let fingerprint = peer.fingerprint().hex();
-    known.add(peer).map_err(|e| fail(&e))?;
-    store.save_known_peers(&known).map_err(|e| fail(&e))?;
-    Ok((paired.name, fingerprint))
 }
 
 /// Asks the view for the code. The view checks its form before answering,

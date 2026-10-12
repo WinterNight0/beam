@@ -332,14 +332,14 @@ fn connect_inbox(store: &Store, link: &mut Option<inbox::InboxLink>, app: &mut A
     if link.is_some() {
         return;
     }
-    match crate::agent::status::read(store) {
-        crate::agent::status::Running::Yes(status) => {
-            *link = Some(inbox::InboxLink::connect(status.port, status.token));
+    match crate::actions::inbox::find(store) {
+        Ok(address) => {
+            *link = Some(inbox::InboxLink::connect(address.port, address.token));
             if !matches!(app.link, pending::Link::Lost(_)) {
                 app.link = pending::Link::Connecting;
             }
         }
-        _ => app.link = pending::Link::Off,
+        Err(_) => app.link = pending::Link::Off,
     }
 }
 
@@ -365,7 +365,8 @@ fn carry_out(store: &Store, effect: Effect) -> Done {
         }),
         Effect::Run { args, .. } => return run_here(store, &args),
         Effect::CreateIdentity => return create_identity(store),
-        Effect::UpdateLocation { invite } => return update_location(store, &invite),
+        // Only sent after a yes on the relay pop-up (ADR-0038).
+        Effect::UpdateLocation { invite } => return update_location(store, &invite, true),
         // Pairing effects need the worker, which the event loop holds.
         Effect::StartJoin { .. }
         | Effect::StartWait
@@ -428,26 +429,25 @@ fn start_join(store: &Store, text: &str, name: &str) -> Result<Joining, String> 
     if invite.key == identity.verifying_key() {
         return Err("That is this device's own invite. Ask them for theirs.".to_string());
     }
-    let known = store.load_known_peers().map_err(|e| fail(&e))?;
-    if let Some(peer) = known.lookup_key(&invite.key) {
-        let config = crate::config::Config::load(&store.config_path()).map_err(|e| fail(&e))?;
-        let old = peer.attr(crate::invite::RELAY_ATTR).map(str::to_string);
-        let new = crate::invite::relay_attr(&invite, &config.relay);
-        if old != new {
+    if let Some(location) =
+        crate::actions::pair::already_paired(store, &invite).map_err(|e| fail(&e))?
+    {
+        if location.changes_relay() {
             let describe = |relay: &Option<String>| match relay {
                 Some(url) => untrusted::text(url),
-                None => format!("your own relay ({})", config.relay),
+                None => format!("your own relay ({})", location.own_relay),
             };
             return Ok(Joining::Done(Done::AskRelay {
-                name: untrusted::name(&peer.name),
-                fingerprint: peer.fingerprint().hex(),
-                old: describe(&old),
-                new: describe(&new),
+                name: untrusted::name(&location.name),
+                fingerprint: location.fingerprint.hex(),
+                old: describe(&location.relay_now),
+                new: describe(&location.relay_after),
                 invite: text.to_string(),
             }));
         }
-        return Ok(Joining::Done(update_location(store, text)));
+        return Ok(Joining::Done(update_location(store, text, false)));
     }
+    let known = store.load_known_peers().map_err(|e| fail(&e))?;
     crate::pairing::check_name(&known, name).map_err(|e| fail(&e))?;
     Ok(Joining::Started(pairing::Worker::join(
         store.clone(),
@@ -457,29 +457,20 @@ fn start_join(store: &Store, text: &str, name: &str) -> Result<Joining, String> 
 }
 
 /// Saves where an already-paired friend is now. Never touches the key.
-fn update_location(store: &Store, text: &str) -> Done {
+fn update_location(store: &Store, text: &str, relay_change_agreed: bool) -> Done {
     let fail = |e: &dyn std::fmt::Display| Done::Failed(untrusted::lines(&e.to_string()));
     let invite: crate::invite::Invite = match text.parse() {
         Ok(invite) => invite,
         Err(e) => return fail(&e),
     };
-    let config = match crate::config::Config::load(&store.config_path()) {
-        Ok(config) => config,
-        Err(e) => return fail(&e),
-    };
-    let mut known = match store.load_known_peers() {
-        Ok(known) => known,
-        Err(e) => return fail(&e),
-    };
-    let Some(peer) = known.lookup_key_mut(&invite.key) else {
-        return Done::Failed("That friend is no longer paired.".to_string());
-    };
-    let name = untrusted::name(&peer.name);
-    crate::invite::remember(peer, &invite, &config.relay);
-    match store.save_known_peers(&known) {
-        Ok(()) => Done::Message(format!(
-            "{name} is already your friend. Updated where to find them; their key is unchanged."
+    match crate::actions::pair::save_location(store, &invite, relay_change_agreed) {
+        Ok(name) => Done::Message(format!(
+            "{} is already your friend. Updated where to find them; their key is unchanged.",
+            untrusted::name(&name)
         )),
+        Err(crate::actions::pair::PairFailure::NoLongerPaired) => {
+            Done::Failed("That friend is no longer paired.".to_string())
+        }
         Err(e) => fail(&e),
     }
 }

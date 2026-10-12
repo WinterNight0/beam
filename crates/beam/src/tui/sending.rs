@@ -11,14 +11,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use crate::actions::messages;
-use crate::config::Config;
-use crate::history;
-use crate::identity::{Fingerprint, Store, encode_public_key};
-use crate::invite;
-use crate::transfer::{Progress, Reporter, SendOptions};
-use crate::transport::dial::{dial_transfer, interrupt, send_on};
-use crate::transport::endpoint::{self, Bind};
+use crate::actions::{
+    self,
+    send::{SendError, SendRequest, Step},
+};
+use crate::identity::{PeerError, Store};
+use crate::transfer::{Progress, Reporter};
+use crate::transport::endpoint::Bind;
 use crate::{text, untrusted};
 
 /// What the sending thread tells the view.
@@ -93,88 +92,39 @@ fn run(
     updates: &Sender<SendUpdate>,
     cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<String, String> {
-    let fail = |e: &dyn std::fmt::Display| untrusted::lines(&e.to_string());
-    let identity = store.load_identity().map_err(|e| fail(&e))?;
-    let known = store.load_known_peers().map_err(|e| fail(&e))?;
-    let peer = known
-        .lookup(peer_name)
-        .ok_or_else(|| format!("You have no friend named {peer_name}."))?;
-    let (peer_name, peer_key) = (peer.name.clone(), peer.public_key);
-    let config = Config::load(&store.config_path()).map_err(|e| fail(&e))?;
-    let peer_addr = invite::peer_addr(peer, &config.relay);
-    if !path.is_file() {
-        return Err(format!("{} is not a file.", path.display()));
-    }
-    let size = std::fs::metadata(&path).map_or(0, |m| m.len());
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut options = SendOptions::new(&path, encode_public_key(&identity.verifying_key()));
-    // As `beam send`: outlast the longest receiver's question (ADR-0042).
-    options.accept_timeout = crate::agent::AGENT_ACCEPT_TIMEOUT + Duration::from_secs(15);
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| fail(&e))?;
-    let mut ended = None;
-    let result = runtime.block_on(async {
-        let endpoint = endpoint::bind(&identity, &config.relay, bind, 0, &[])
-            .await
-            .map_err(|e| fail(&e))?;
-        let live = std::sync::Mutex::new(None);
-        let attempt = async {
-            let _ = updates.send(SendUpdate::Dialling);
-            let connection = dial_transfer(&endpoint, peer_addr).await.map_err(|e| {
-                ended = Some((history::Outcome::Failed, Some("not reachable".to_string())));
-                messages::unreachable(&peer_name, &peer_key, e)
-            })?;
-            *live.lock().expect("not poisoned") = Some(connection.clone());
-            let sent = send_on(&connection, &mut options, &mut ToView(updates)).await;
-            ended = Some(history::send_outcome(&sent));
-            sent.map_err(|e| messages::refused(&peer_name, e))
-        };
-        let outcome = tokio::select! {
-            outcome = attempt => outcome,
-            _ = cancelled => {
-                let connection = live.lock().expect("not poisoned").take();
-                if let Some(connection) = &connection {
-                    interrupt(connection);
-                }
-                ended = Some(history::stopped_outcome(connection.is_some()));
-                Err(if connection.is_some() {
-                    format!("Cancelled. {peer_name} was told, and keeps what arrived: send the same file again to resume.")
-                } else {
-                    format!("Cancelled before {peer_name} was reached; nothing was sent.")
-                })
+        .map_err(|e| untrusted::lines(&e.to_string()))?;
+    let request = SendRequest {
+        peer: peer_name,
+        file: &path,
+        chunk_size: None,
+        bind,
+    };
+    let result = runtime.block_on(actions::send::send(
+        store,
+        request,
+        &mut ToView(updates),
+        |step| {
+            if let Step::Looking { .. } = step {
+                let _ = updates.send(SendUpdate::Dialling);
             }
-        };
-        endpoint.close().await;
-        outcome
-    });
+        },
+        // Dropping the sender counts too: the view went away.
+        async {
+            let _ = cancelled.await;
+        },
+    ));
     runtime.shutdown_timeout(Duration::from_secs(1));
 
-    if let Some((outcome, note)) = ended {
-        history::record(
-            store,
-            &history::Entry::now(
-                history::Direction::Sent,
-                &peer_name,
-                &Fingerprint::of(&peer_key).hex(),
-                &file_name,
-                size,
-                outcome,
-                note,
-            ),
-        );
-    }
-    let summary = result?;
+    let sent = result.map_err(|e| failed(peer_name, e))?;
+    let summary = sent.summary;
     let saved = summary
         .final_name
         .as_deref()
         .map(untrusted::name)
-        .unwrap_or_else(|| untrusted::name(&file_name));
+        .unwrap_or_else(|| untrusted::name(&sent.file_name));
     let skipped = if summary.bytes_skipped > 0 {
         format!(
             " ({} was already there)",
@@ -184,9 +134,29 @@ fn run(
         String::new()
     };
     Ok(format!(
-        "Sent {} to {peer_name}, saved on their side as {saved}{skipped}.",
-        text::format_bytes(summary.bytes_sent)
+        "Sent {} to {}, saved on their side as {saved}{skipped}.",
+        text::format_bytes(summary.bytes_sent),
+        sent.peer
     ))
+}
+
+/// A send that did not arrive, in the view's words.
+fn failed(peer_name: &str, error: SendError) -> String {
+    match error {
+        SendError::Peer(PeerError::NotFound(_)) => {
+            format!("You have no friend named {peer_name}.")
+        }
+        SendError::NotAFile(path) => format!("{} is not a file.", path.display()),
+        SendError::Stopped { reached: true } => format!(
+            "Cancelled. {peer_name} was told, and keeps what arrived: send the same file again to resume."
+        ),
+        SendError::Stopped { reached: false } => {
+            format!("Cancelled before {peer_name} was reached; nothing was sent.")
+        }
+        // Worded and cleaned by the action already.
+        SendError::Unreachable(message) | SendError::Refused(message) => message,
+        other => untrusted::lines(&other.to_string()),
+    }
 }
 
 #[cfg(test)]

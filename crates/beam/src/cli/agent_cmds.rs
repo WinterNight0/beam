@@ -7,11 +7,12 @@ use std::time::Duration;
 use super::desk::{PromptDesk, Question};
 use super::terminal::{Keyboard, TerminalReporter};
 use super::{App, CommandError, Io};
-use crate::agent::ipc::{AgentMsg, Client, ClientMsg};
+use crate::actions::inbox::{self, ConnectError, FindError, Inbox, InboxEvent};
+use crate::actions::receive::{self, Place, ReceiveError};
+use crate::agent::ipc::{Client, ClientMsg};
 use crate::agent::status::{self, Running};
-use crate::agent::{self, AGENT_ACCEPT_TIMEOUT, AgentOptions, service};
+use crate::agent::{self, service};
 use crate::config::{self, Config};
-use crate::pairing::Network;
 use crate::transfer::{Progress, Reporter};
 use crate::transport::PathKind;
 use crate::transport::endpoint::Bind;
@@ -64,41 +65,31 @@ impl App {
 
     /// `beam agent`: runs the agent in this process until stopped.
     pub(super) fn agent(&self, loopback: bool, io: &mut Io<'_>) -> Result<(), CommandError> {
-        let identity = self.store.load_identity()?;
+        self.store.load_identity()?;
         self.store.load_known_peers()?;
-        let config = self.config()?;
-        let (receive_dir, _) = agent::receive_dir(config.receive_dir.as_deref());
-        let options = AgentOptions {
-            network: Network {
-                relay: config.relay,
-                bind: if loopback { Bind::Loopback } else { Bind::Any },
-                port: config.port,
-                advertise: config.advertise,
-            },
-            receive_dir,
-            accept_timeout: AGENT_ACCEPT_TIMEOUT,
-            port_mapping: config.agent_port_mapping,
-            notify: true,
-            echo: Some(print_line),
-            in_view: false,
-        };
+        let receiver = receive::prepare(
+            &self.store,
+            Place::Background,
+            if loopback { Bind::Loopback } else { Bind::Any },
+            true,
+            Some(print_line),
+        )
+        .map_err(|e| match e {
+            ReceiveError::Store(e) => CommandError::Store(e),
+            ReceiveError::Config(e) => CommandError::Message(e),
+        })?;
         let _ = io;
         let runtime = self.runtime()?;
-        let result = runtime.block_on(agent::run(
-            identity,
-            self.store.clone(),
-            options,
-            stop_signal(),
-        ));
+        let result = runtime.block_on(receive::run(&self.store, receiver, stop_signal(), || {}));
         runtime.shutdown_timeout(Duration::from_secs(1));
         result.map_err(|e| CommandError::Message(e.to_string()))
     }
 
     /// `beam inbox`: answers the agent's requests, at the usual prompt.
     pub(super) fn inbox(&self, io: &mut Io<'_>) -> Result<(), CommandError> {
-        let status = match status::read(&self.store) {
-            Running::Yes(status) => status,
-            Running::No => {
+        let address = match inbox::find(&self.store) {
+            Ok(address) => address,
+            Err(FindError::NotRunning) => {
                 return Err(CommandError::Message(
                     "the background agent is not running. Start it with `beam service start` \
                      (or `beam service enable` to start it at every login), or use \
@@ -106,7 +97,7 @@ impl App {
                         .into(),
                 ));
             }
-            Running::Unreadable => {
+            Err(FindError::Unreadable) => {
                 return Err(CommandError::Message(
                     "the background agent is running, but its status file cannot be read; \
                      restart it with `beam service stop` and `beam service start`"
@@ -116,19 +107,17 @@ impl App {
         };
         let runtime = self.runtime()?;
         let result = runtime.block_on(async {
-            let (mut client, welcome) = Client::connect(status.port, &status.token)
-                .await
-                .map_err(|e| CommandError::Message(format!("could not reach the agent: {e}")))?;
-            let AgentMsg::Welcome { receive_dir, .. } = welcome else {
-                return Err(CommandError::Message(
-                    "the agent did not answer as expected".into(),
-                ));
-            };
+            let (mut link, receive_dir) = Inbox::connect(&address).await.map_err(|e| {
+                CommandError::Message(match e {
+                    ConnectError::Unreachable(e) => format!("could not reach the agent: {e}"),
+                    ConnectError::Unexpected => "the agent did not answer as expected".into(),
+                })
+            })?;
             writeln!(
                 io.out,
                 "Waiting for requests from paired devices. The agent saves files to {}.\n\
                  Ctrl+C leaves the inbox; the agent keeps running.",
-                untrusted::name(&receive_dir)
+                receive_dir
             )?;
             io.out.flush()?;
 
@@ -137,49 +126,50 @@ impl App {
             let (answers_tx, mut answers) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
             loop {
                 tokio::select! {
-                    msg = client.next() => {
-                        let Ok(msg) = msg else {
-                            reporter.finish();
-                            writeln!(io.out, "The agent stopped.")?;
-                            return Ok(());
-                        };
-                        match msg {
-                            AgentMsg::Request { id, request, expires_in } => {
+                    event = link.next() => {
+                        match event {
+                            InboxEvent::Request { id, request, expires_in } => {
                                 // The same prompt, and the same rules, as `beam listen`.
                                 let desk = desk.clone();
                                 let tx = answers_tx.clone();
                                 let question = Question::Transfer(request.into());
-                                let left = Duration::from_secs(expires_in.max(1));
+                                let left = expires_in.max(Duration::from_secs(1));
                                 tokio::task::spawn_blocking(move || {
                                     let accept = desk.ask(question, left);
                                     let _ = tx.send((id, accept));
                                 });
                             }
-                            AgentMsg::Closed { .. } | AgentMsg::Welcome { .. } => {}
-                            AgentMsg::TooLate { .. } => desk.notice(
+                            InboxEvent::Closed { .. } => {}
+                            InboxEvent::TooLate { .. } => desk.notice(
                                 "That request had already closed (answered elsewhere, expired, \
                                  or withdrawn by the sender); the answer did not count.",
                             ),
-                            AgentMsg::Progress { done, total, relay } => {
+                            InboxEvent::Progress { done, total, relay } => {
                                 reporter.report(Progress::Transferring {
                                     done,
                                     total,
                                     path: if relay { PathKind::Relay } else { PathKind::Direct },
                                 });
                             }
-                            AgentMsg::Finished { text, .. } => {
+                            InboxEvent::Finished { text, .. } => {
+                                // Already cleaned by the link.
                                 reporter.finish();
-                                desk.notice(untrusted::text(&text));
+                                desk.notice(text);
                             }
-                            AgentMsg::Stopping => {
+                            InboxEvent::Stopping => {
                                 reporter.finish();
                                 writeln!(io.out, "The agent is stopping.")?;
+                                return Ok(());
+                            }
+                            InboxEvent::Gone => {
+                                reporter.finish();
+                                writeln!(io.out, "The agent stopped.")?;
                                 return Ok(());
                             }
                         }
                     }
                     Some((id, accept)) = answers.recv() => {
-                        if client.send(&ClientMsg::Answer { id, accept }).await.is_err() {
+                        if !link.answer(id, accept).await {
                             writeln!(io.out, "The agent stopped.")?;
                             return Ok(());
                         }

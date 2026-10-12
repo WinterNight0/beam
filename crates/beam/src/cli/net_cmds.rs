@@ -16,18 +16,18 @@ use super::terminal::Keyboard;
 use super::terminal::TerminalReporter;
 use super::transfer_cmds::{EitherReporter, ReceiveJson, SendJson, reporter_for};
 use super::{App, CommandError, Io};
-use crate::actions::messages;
+use crate::actions::{
+    self,
+    send::{SendError, SendRequest, Step},
+};
 use crate::config::Config;
-use crate::history;
-use crate::identity::{Fingerprint, encode_public_key};
-use crate::invite;
+use crate::identity::Fingerprint;
 use crate::listen_status::Board;
 use crate::listener::{ListenEvent, ListenOptions};
 use crate::pairing::rotation::NewCodeReason;
 use crate::pairing::{Network, Policy, Timeouts};
-use crate::transfer::{DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore, SendOptions};
-use crate::transport::dial::{dial_transfer, interrupt, send_on};
-use crate::transport::endpoint::{self, Bind};
+use crate::transfer::{DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore};
+use crate::transport::endpoint::Bind;
 use crate::{text, ui, untrusted};
 
 impl App {
@@ -150,144 +150,105 @@ impl App {
         loopback: bool,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let identity = self.store.load_identity()?;
-        let known_peers = self.store.load_known_peers()?;
-        let peer = known_peers.lookup(peer_name).ok_or_else(|| {
-            CommandError::Peer(crate::identity::PeerError::NotFound(peer_name.to_string()))
-        })?;
-        let peer_name = peer.name.clone();
-        let peer_key = peer.public_key;
-        let network = self.network(loopback)?;
-        let peer_addr = invite::peer_addr(peer, &network.relay);
-        if !file.is_file() {
-            return Err(CommandError::Message(format!(
-                "{} is not a file",
-                file.display()
-            )));
-        }
-        let mut options = SendOptions::new(file, encode_public_key(&identity.verifying_key()));
-        // The receiver decides how long its question stays open: 60 s at
-        // `beam listen`, five minutes at a background agent, whose user first
-        // has to notice a notification (ADR-0042). Each answers "expired"
-        // itself, so the sender only needs to outlast the longest.
-        options.accept_timeout = crate::agent::AGENT_ACCEPT_TIMEOUT + Duration::from_secs(15);
-        if let Some(chunk_size) = chunk_size {
-            if chunk_size == 0 {
-                return Err(CommandError::Message(
-                    "--chunk-size must be at least 1".to_string(),
-                ));
-            }
-            options.chunk_size = chunk_size;
-        }
-
-        let size = std::fs::metadata(file).map_or(0, |m| m.len());
-        let file_name = file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // How it ended, for `history.jsonl` (ADR-0043).
-        let ended: std::sync::Mutex<Option<(history::Outcome, Option<String>)>> =
-            std::sync::Mutex::new(None);
-
+        let json = self.json;
+        let request = SendRequest {
+            peer: peer_name,
+            file,
+            chunk_size,
+            bind: if loopback { Bind::Loopback } else { Bind::Any },
+        };
+        let mut reporter = reporter_for(json);
         let runtime = self.runtime()?;
-        let result = runtime.block_on(async {
-            if !self.json {
-                writeln!(io.out, "Looking for {peer_name}...")?;
-                io.out.flush()?;
-            }
-            let endpoint = endpoint::bind(&identity, &network.relay, network.bind, 0, &[])
-                .await
-                .map_err(|e| CommandError::Message(e.to_string()))?;
-            // The connection, once there is one, so Ctrl+C can tell the peer.
-            let live = std::sync::Mutex::new(None);
-            let outcome = async {
-                let connection = dial_transfer(&endpoint, peer_addr).await.map_err(|e| {
-                    *ended.lock().expect("not poisoned") =
-                        Some((history::Outcome::Failed, Some("not reachable".to_string())));
-                    CommandError::Message(messages::unreachable(&peer_name, &peer_key, e))
-                })?;
-                *live.lock().expect("not poisoned") = Some(connection.clone());
-                if !self.json {
-                    writeln!(io.out, "Sending {} to {peer_name}", file.display())?;
-                    io.out.flush()?;
-                }
-                let mut reporter = reporter_for(self.json);
-                let sent = send_on(&connection, &mut options, &mut reporter).await;
-                reporter.finish();
-                *ended.lock().expect("not poisoned") = Some(history::send_outcome(&sent));
-                sent.map_err(|e| CommandError::Message(messages::refused(&peer_name, e)))
-            };
-            // Ctrl+C: tell the receiver, so it does not wait for a timeout,
-            // and say so here (ADR-0041).
-            let (outcome, stopped) = tokio::select! {
-                outcome = outcome => (outcome, false),
-                () = interrupted() => {
-                    let connection = live.lock().expect("not poisoned").take();
-                    if let Some(connection) = &connection {
-                        interrupt(connection);
-                    }
-                    *ended.lock().expect("not poisoned") =
-                        Some(history::stopped_outcome(connection.is_some()));
-                    (Err(interrupted_message(&peer_name, connection.is_some())), true)
-                }
-            };
-            if stopped && !self.json {
-                // End the progress line before the message.
-                writeln!(io.out)?;
-            }
-            endpoint.close().await;
-            let summary = outcome?;
-
-            if self.json {
-                super::identity_cmds::write_json(
-                    io,
-                    &SendJson {
-                        transfer_id: summary.transfer_id.to_string(),
-                        peer: peer_name.clone(),
-                        bytes_sent: summary.bytes_sent,
-                        saved_as: summary.final_name.clone(),
-                    },
-                )?;
-            } else {
-                // The name is the receiver's to choose, so it is shown safely.
-                let saved = summary
-                    .final_name
-                    .as_deref()
-                    .map(crate::untrusted::name)
-                    .unwrap_or_else(|| "the peer did not say".to_string());
-                let skipped = if summary.bytes_skipped > 0 {
-                    format!(
-                        " ({} was already there)",
-                        text::format_bytes(summary.bytes_skipped)
-                    )
-                } else {
-                    String::new()
-                };
-                writeln!(
-                    io.out,
-                    "Sent {} to {peer_name}, saved on their side as {saved}{skipped}",
-                    text::format_bytes(summary.bytes_sent)
-                )?;
-            }
-            io.out.flush()?;
-            Ok::<(), CommandError>(())
-        });
-        runtime.shutdown_timeout(Duration::from_secs(1));
-        if let Some((outcome, note)) = ended.into_inner().expect("not poisoned") {
-            history::record(
+        let result = {
+            let out = &mut *io.out;
+            runtime.block_on(actions::send::send(
                 &self.store,
-                &history::Entry::now(
-                    history::Direction::Sent,
-                    &peer_name,
-                    &Fingerprint::of(&peer_key).hex(),
-                    &file_name,
-                    size,
-                    outcome,
-                    note,
-                ),
-            );
+                request,
+                &mut reporter,
+                |step| {
+                    if json {
+                        return;
+                    }
+                    let _ = match step {
+                        Step::Looking { peer } => writeln!(out, "Looking for {peer}..."),
+                        Step::Sending { peer } => {
+                            writeln!(out, "Sending {} to {peer}", file.display())
+                        }
+                    };
+                    let _ = out.flush();
+                },
+                // Ctrl+C: the receiver is told, so it does not wait for a
+                // timeout (ADR-0041).
+                interrupted(),
+            ))
+        };
+        runtime.shutdown_timeout(Duration::from_secs(1));
+
+        let sent = match result {
+            Ok(sent) => {
+                reporter.finish();
+                sent
+            }
+            Err(SendError::Stopped { reached }) => {
+                if !json {
+                    // End the progress line before the message.
+                    writeln!(io.out)?;
+                }
+                return Err(interrupted_message(peer_name, reached));
+            }
+            Err(error) => {
+                if matches!(error, SendError::Refused(_)) {
+                    reporter.finish();
+                }
+                return Err(send_failed(error));
+            }
+        };
+        let (peer_name, summary) = (sent.peer, sent.summary);
+        if json {
+            super::identity_cmds::write_json(
+                io,
+                &SendJson {
+                    transfer_id: summary.transfer_id.to_string(),
+                    peer: peer_name.clone(),
+                    bytes_sent: summary.bytes_sent,
+                    saved_as: summary.final_name.clone(),
+                },
+            )?;
+        } else {
+            // The name is the receiver's to choose, so it is shown safely.
+            let saved = summary
+                .final_name
+                .as_deref()
+                .map(crate::untrusted::name)
+                .unwrap_or_else(|| "the peer did not say".to_string());
+            let skipped = if summary.bytes_skipped > 0 {
+                format!(
+                    " ({} was already there)",
+                    text::format_bytes(summary.bytes_skipped)
+                )
+            } else {
+                String::new()
+            };
+            writeln!(
+                io.out,
+                "Sent {} to {peer_name}, saved on their side as {saved}{skipped}",
+                text::format_bytes(summary.bytes_sent)
+            )?;
         }
-        result
+        io.out.flush()?;
+        Ok(())
+    }
+}
+
+/// A send that did not happen, as `beam send` has always said it.
+fn send_failed(error: SendError) -> CommandError {
+    match error {
+        SendError::Store(e) => CommandError::Store(e),
+        SendError::Peer(e) => CommandError::Peer(e),
+        SendError::ZeroChunkSize => {
+            CommandError::Message("--chunk-size must be at least 1".to_string())
+        }
+        other => CommandError::Message(other.to_string()),
     }
 }
 

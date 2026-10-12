@@ -13,46 +13,9 @@
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use crate::agent::ipc::{AgentMsg, Client, ClientMsg, RequestInfo};
-use crate::{text, untrusted};
+use crate::actions::inbox::{Address, ConnectError, Inbox, InboxEvent};
 
-/// A transfer request, ready to draw.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequestView {
-    /// This device's nickname for the sender (never the sender's own claim).
-    pub peer_name: String,
-    /// The sender's fingerprint as hex, without `SHA256:`.
-    pub fingerprint: String,
-    pub file_name: String,
-    pub size: u64,
-    /// "continues: 1.2 GiB of 2.0 GiB (60 %) already here, from 3 hours ago".
-    pub resume: Option<String>,
-}
-
-impl From<RequestInfo> for RequestView {
-    fn from(r: RequestInfo) -> Self {
-        let resume = r.resume.as_ref().map(|x| {
-            let age = x
-                .age_secs
-                .map(|s| format!(", from {}", text::format_age(Duration::from_secs(s))))
-                .unwrap_or_default();
-            format!(
-                "continues: {} of {} ({} %) already here{age}",
-                text::format_bytes(x.have_bytes),
-                text::format_bytes(r.size),
-                text::percent(x.have_bytes, r.size)
-            )
-        });
-        let fingerprint = r.fingerprint.trim_start_matches("SHA256:").to_string();
-        Self {
-            peer_name: untrusted::name(&r.peer_name),
-            fingerprint: untrusted::text(&fingerprint),
-            file_name: untrusted::name(&r.file_name),
-            size: r.size,
-            resume,
-        }
-    }
-}
+pub use crate::actions::inbox::RequestView;
 
 /// What the agent said.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,46 +96,44 @@ async fn serve(
     mut answers: tokio::sync::mpsc::UnboundedReceiver<(u64, bool)>,
     mut stopped: tokio::sync::oneshot::Receiver<()>,
 ) -> String {
-    let (mut client, welcome) = match Client::connect(port, token).await {
+    let address = Address {
+        port,
+        token: token.to_string(),
+    };
+    let (mut inbox, receive_dir) = match Inbox::connect(&address).await {
         Ok(connected) => connected,
-        Err(e) => return format!("could not reach the background agent: {e}"),
+        Err(ConnectError::Unreachable(e)) => {
+            return format!("could not reach the background agent: {e}");
+        }
+        Err(ConnectError::Unexpected) => {
+            return "the background agent did not answer as expected".to_string();
+        }
     };
-    let AgentMsg::Welcome { receive_dir, .. } = welcome else {
-        return "the background agent did not answer as expected".to_string();
-    };
-    let _ = updates.send(InboxUpdate::Connected {
-        receive_dir: untrusted::name(&receive_dir),
-    });
+    let _ = updates.send(InboxUpdate::Connected { receive_dir });
     loop {
         tokio::select! {
-            msg = client.next() => {
-                let Ok(msg) = msg else {
-                    return "the background agent stopped".to_string();
-                };
-                let update = match msg {
-                    AgentMsg::Request { id, request, expires_in } => InboxUpdate::Request {
+            event = inbox.next() => {
+                let update = match event {
+                    InboxEvent::Request { id, request, expires_in } => InboxUpdate::Request {
                         id,
                         request: request.into(),
-                        expires_in: Duration::from_secs(expires_in),
+                        expires_in,
                     },
-                    AgentMsg::Closed { id } => InboxUpdate::Closed { id },
-                    AgentMsg::Progress { done, total, relay } => {
+                    InboxEvent::Closed { id } => InboxUpdate::Closed { id },
+                    InboxEvent::Progress { done, total, relay } => {
                         InboxUpdate::Progress { done, total, relay }
                     }
-                    AgentMsg::Finished { ok, text } => InboxUpdate::Finished {
-                        ok,
-                        text: untrusted::text(&text),
-                    },
-                    AgentMsg::TooLate { id } => InboxUpdate::TooLate { id },
-                    AgentMsg::Stopping => return "the background agent is stopping".to_string(),
-                    AgentMsg::Welcome { .. } => continue,
+                    InboxEvent::Finished { ok, text } => InboxUpdate::Finished { ok, text },
+                    InboxEvent::TooLate { id } => InboxUpdate::TooLate { id },
+                    InboxEvent::Stopping => return "the background agent is stopping".to_string(),
+                    InboxEvent::Gone => return "the background agent stopped".to_string(),
                 };
                 if updates.send(update).is_err() {
                     return String::new();
                 }
             }
             Some((id, accept)) = answers.recv() => {
-                if client.send(&ClientMsg::Answer { id, accept }).await.is_err() {
+                if !inbox.answer(id, accept).await {
                     return "the background agent stopped".to_string();
                 }
             }
@@ -183,29 +144,6 @@ async fn serve(
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::*;
-    use crate::agent::ipc::ResumeWire;
-
-    #[test]
-    fn a_request_is_cleaned_and_its_resume_described() {
-        let view = RequestView::from(RequestInfo {
-            peer_name: "alice".into(),
-            fingerprint: "SHA256:ab12".into(),
-            file_name: "evil\x1b[31m.txt".into(),
-            size: 2048,
-            resume: Some(ResumeWire {
-                have_bytes: 1024,
-                have_chunks: 1,
-                chunk_count: 2,
-                age_secs: None,
-            }),
-        });
-        assert_eq!(view.fingerprint, "ab12");
-        assert!(!view.file_name.contains('\x1b'), "{:?}", view.file_name);
-        let resume = view.resume.unwrap();
-        assert!(resume.contains("50 %"), "{resume}");
-    }
-
     // The whole path with a real agent: a paired device sends, the view's
     // link is shown the request, and only its answer decides.
     pub(in crate::tui) mod with_an_agent {
