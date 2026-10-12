@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beam::identity::{Identity, KnownPeers, Peer, encode_public_key};
-use beam::transfer::frame::{read_message, write_message};
-use beam::transfer::message::{
+use beam_core::identity::{Identity, KnownPeers, Peer, encode_public_key};
+use beam_core::transfer::frame::{read_message, write_message};
+use beam_core::transfer::message::{
     CHUNK_SIZE, ChunkStart, Message, RejectReason, TransferId, TransferRequest,
 };
-use beam::transfer::{
+use beam_core::transfer::{
     Prompt, PromptRequest, ReceiveOptions, SendOptions, SilentReporter, TransferError,
     receive_file, send_file,
 };
@@ -155,8 +155,8 @@ async fn transfer(
 ) -> (
     Dirs,
     ScriptedPrompt,
-    Result<beam::transfer::SendSummary, TransferError>,
-    Result<beam::transfer::ReceiveSummary, TransferError>,
+    Result<beam_core::transfer::SendSummary, TransferError>,
+    Result<beam_core::transfer::ReceiveSummary, TransferError>,
 ) {
     let pair = paired();
     let dirs = dirs();
@@ -390,7 +390,7 @@ mod accept_rules {
                 size: bytes.len() as u64,
                 chunk_size: CHUNK_SIZE,
                 chunk_count: 1,
-                file_sha256: beam::transfer::sha256_hex(&bytes),
+                file_sha256: beam_core::transfer::sha256_hex(&bytes),
             };
             write_message(&mut client, &Message::TransferRequest(request))
                 .await
@@ -400,7 +400,7 @@ mod accept_rules {
                 &Message::ChunkStart(ChunkStart {
                     index: 0,
                     len: bytes.len() as u32,
-                    sha256: beam::transfer::sha256_hex(&bytes),
+                    sha256: beam_core::transfer::sha256_hex(&bytes),
                 }),
             )
             .await
@@ -509,7 +509,7 @@ mod accept_rules {
     #[test]
     fn s5_the_default_deadline_is_sixty_seconds() {
         assert_eq!(
-            beam::transfer::DEFAULT_ACCEPT_TIMEOUT,
+            beam_core::transfer::DEFAULT_ACCEPT_TIMEOUT,
             Duration::from_secs(60)
         );
     }
@@ -622,7 +622,7 @@ async fn a_replayed_transfer_id_is_refused() {
             size: bytes.len() as u64,
             chunk_size: CHUNK_SIZE,
             chunk_count: 1,
-            file_sha256: beam::transfer::sha256_hex(&bytes),
+            file_sha256: beam_core::transfer::sha256_hex(&bytes),
         };
         write_message(&mut client, &Message::TransferRequest(request))
             .await
@@ -666,7 +666,7 @@ async fn a_hostile_file_name_is_refused_before_anything_is_created() {
             size: bytes.len() as u64,
             chunk_size: CHUNK_SIZE,
             chunk_count: 1,
-            file_sha256: beam::transfer::sha256_hex(&bytes),
+            file_sha256: beam_core::transfer::sha256_hex(&bytes),
         };
         write_message(&mut client, &Message::TransferRequest(request))
             .await
@@ -742,7 +742,7 @@ async fn the_receiver_refuses_a_chunk_that_fails_its_hash() {
     let pair = paired();
     let dirs = dirs();
     let bytes = payload(1_000);
-    let digest = beam::transfer::sha256_hex(&bytes);
+    let digest = beam_core::transfer::sha256_hex(&bytes);
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let sender_key = encode_public_key(&pair.sender.verifying_key());
@@ -811,7 +811,7 @@ async fn the_receiver_refuses_a_chunk_that_fails_its_hash() {
 
         write_message(
             &mut client,
-            &Message::Complete(beam::transfer::Complete {
+            &Message::Complete(beam_core::transfer::Complete {
                 transfer_id,
                 final_name: None,
             }),
@@ -847,7 +847,7 @@ async fn a_chunk_that_never_verifies_fails_the_transfer() {
     let pair = paired();
     let dirs = dirs();
     let bytes = payload(1_000);
-    let digest = beam::transfer::sha256_hex(&bytes);
+    let digest = beam_core::transfer::sha256_hex(&bytes);
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let sender_key = encode_public_key(&pair.sender.verifying_key());
@@ -945,7 +945,7 @@ async fn the_sender_re_sends_a_chunk_that_is_nakked() {
     };
     write_message(
         &mut server,
-        &Message::Accept(beam::transfer::Accept {
+        &Message::Accept(beam_core::transfer::Accept {
             transfer_id,
             have_bitmap: None,
         }),
@@ -966,12 +966,12 @@ async fn the_sender_re_sends_a_chunk_that_is_nakked() {
                     }
                 }
                 let answer = if attempts == 1 {
-                    Message::ChunkNak(beam::transfer::ChunkNak {
+                    Message::ChunkNak(beam_core::transfer::ChunkNak {
                         index: 0,
-                        reason: beam::transfer::NakReason::HashMismatch,
+                        reason: beam_core::transfer::NakReason::HashMismatch,
                     })
                 } else {
-                    Message::ChunkAck(beam::transfer::ChunkAck { index: 0 })
+                    Message::ChunkAck(beam_core::transfer::ChunkAck { index: 0 })
                 };
                 write_message(&mut server, &answer).await.expect("write");
             }
@@ -983,7 +983,7 @@ async fn the_sender_re_sends_a_chunk_that_is_nakked() {
 
     write_message(
         &mut server,
-        &Message::Complete(beam::transfer::Complete {
+        &Message::Complete(beam_core::transfer::Complete {
             transfer_id,
             final_name: Some("retry.bin".to_string()),
         }),
@@ -1038,17 +1038,18 @@ async fn the_engine_works_over_real_tcp() {
 /// Records every progress event, and switches the route to the relay the first
 /// time bytes move — as iroh does when a direct path drops mid-transfer.
 struct RouteFlipper {
-    events: Vec<beam::transfer::Progress>,
-    flip: Option<tokio::sync::watch::Sender<beam::transport::PathKind>>,
+    events: Vec<beam_core::transfer::Progress>,
+    flip: Option<tokio::sync::watch::Sender<beam_core::transport::PathKind>>,
 }
 
-impl beam::transfer::Reporter for RouteFlipper {
-    fn report(&mut self, progress: beam::transfer::Progress) {
-        if matches!(progress, beam::transfer::Progress::Transferring { .. })
+impl beam_core::transfer::Reporter for RouteFlipper {
+    fn report(&mut self, progress: beam_core::transfer::Progress) {
+        if matches!(progress, beam_core::transfer::Progress::Transferring { .. })
             && let Some(flip) = self.flip.take()
         {
             // A watch receiver keeps the last value after the sender is gone.
-            flip.send(beam::transport::PathKind::Relay).expect("route");
+            flip.send(beam_core::transport::PathKind::Relay)
+                .expect("route");
         }
         self.events.push(progress);
     }
@@ -1058,8 +1059,8 @@ impl beam::transfer::Reporter for RouteFlipper {
 /// every later update carries the new path.
 #[tokio::test]
 async fn a_path_change_mid_transfer_is_reported() {
-    use beam::transfer::Progress;
-    use beam::transport::PathKind;
+    use beam_core::transfer::Progress;
+    use beam_core::transport::PathKind;
 
     let bytes = payload(20_000);
     let pair = paired();
@@ -1202,7 +1203,7 @@ async fn a_sender_turned_away_as_busy_is_told_to_try_later() {
         let mut client = client;
         send_file(&mut client, &options, &mut SilentReporter).await
     });
-    beam::transfer::turn_away(server, RejectReason::Busy, Duration::from_secs(5))
+    beam_core::transfer::turn_away(server, RejectReason::Busy, Duration::from_secs(5))
         .await
         .expect("turn away");
 
@@ -1259,7 +1260,7 @@ async fn write_chunk_by_hand(
     )
     .await
     .expect("write chunk start");
-    for slice in body.chunks(beam::transfer::MAX_CHUNK_DATA) {
+    for slice in body.chunks(beam_core::transfer::MAX_CHUNK_DATA) {
         write_message(
             client,
             &Message::ChunkData {
@@ -1286,7 +1287,7 @@ async fn the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_on
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let mut options = SendOptions::new(path, encode_public_key(&identity.verifying_key()));
     options.chunk_size = CHUNK;
-    assert_eq!(options.window, beam::transfer::PIPELINE_WINDOW);
+    assert_eq!(options.window, beam_core::transfer::PIPELINE_WINDOW);
     let send = tokio::spawn(async move {
         let mut client = client;
         send_file(&mut client, &options, &mut SilentReporter).await
@@ -1298,7 +1299,7 @@ async fn the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_on
     };
     write_message(
         &mut server,
-        &Message::Accept(beam::transfer::Accept {
+        &Message::Accept(beam_core::transfer::Accept {
             transfer_id,
             have_bitmap: None,
         }),
@@ -1307,7 +1308,7 @@ async fn the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_on
     .expect("write accept");
 
     // A full window arrives without any answer...
-    let window = beam::transfer::PIPELINE_WINDOW as usize;
+    let window = beam_core::transfer::PIPELINE_WINDOW as usize;
     let mut first = Vec::new();
     for _ in 0..window {
         first.push(read_chunk_by_hand(&mut server).await.0);
@@ -1321,13 +1322,13 @@ async fn the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_on
         "the sender went past its window"
     );
 
-    let ack = |index| Message::ChunkAck(beam::transfer::ChunkAck { index });
+    let ack = |index| Message::ChunkAck(beam_core::transfer::ChunkAck { index });
     write_message(&mut server, &ack(0)).await.unwrap();
     write_message(
         &mut server,
-        &Message::ChunkNak(beam::transfer::ChunkNak {
+        &Message::ChunkNak(beam_core::transfer::ChunkNak {
             index: 1,
-            reason: beam::transfer::NakReason::HashMismatch,
+            reason: beam_core::transfer::NakReason::HashMismatch,
         }),
     )
     .await
@@ -1356,7 +1357,7 @@ async fn the_sender_keeps_a_window_of_chunks_in_flight_and_resends_a_rejected_on
     ));
     write_message(
         &mut server,
-        &Message::Complete(beam::transfer::Complete {
+        &Message::Complete(beam_core::transfer::Complete {
             transfer_id,
             final_name: Some("window.bin".to_string()),
         }),
@@ -1391,7 +1392,7 @@ async fn the_receiver_takes_missing_chunks_in_any_order() {
                 size: bytes.len() as u64,
                 chunk_size: CHUNK,
                 chunk_count: 3,
-                file_sha256: beam::transfer::sha256_hex(&bytes),
+                file_sha256: beam_core::transfer::sha256_hex(&bytes),
             }),
         )
         .await
@@ -1407,7 +1408,7 @@ async fn the_receiver_takes_missing_chunks_in_any_order() {
         // 2, then a corrupted 0, then 1, then 0 again: all in flight at once.
         let plan: [(u32, Vec<u8>); 4] = [(2, chunk(2)), (0, bad), (1, chunk(1)), (0, chunk(0))];
         for (index, body) in &plan {
-            let digest = beam::transfer::sha256_hex(&chunk(*index));
+            let digest = beam_core::transfer::sha256_hex(&chunk(*index));
             write_chunk_by_hand(&mut client, *index, body, &digest).await;
         }
         let mut answers = Vec::new();
@@ -1420,7 +1421,7 @@ async fn the_receiver_takes_missing_chunks_in_any_order() {
         }
         write_message(
             &mut client,
-            &Message::Complete(beam::transfer::Complete {
+            &Message::Complete(beam_core::transfer::Complete {
                 transfer_id,
                 final_name: None,
             }),
@@ -1472,14 +1473,14 @@ async fn a_duplicate_or_unknown_chunk_is_refused() {
                     size: bytes.len() as u64,
                     chunk_size: CHUNK,
                     chunk_count: 3,
-                    file_sha256: beam::transfer::sha256_hex(&bytes),
+                    file_sha256: beam_core::transfer::sha256_hex(&bytes),
                 }),
             )
             .await
             .unwrap();
             let _ = read_message(&mut client).await;
             let body = bytes[..CHUNK as usize].to_vec();
-            let digest = beam::transfer::sha256_hex(&body);
+            let digest = beam_core::transfer::sha256_hex(&body);
             write_chunk_by_hand(&mut client, 0, &body, &digest).await;
             write_chunk_by_hand(&mut client, second, &body, &digest).await;
             // Keep the pipe open until the receiver has decided.
@@ -1539,7 +1540,7 @@ async fn a_file_changed_while_being_sent_is_caught_before_it_is_sent() {
         }
         write_message(
             &mut server,
-            &Message::Accept(beam::transfer::Accept {
+            &Message::Accept(beam_core::transfer::Accept {
                 transfer_id,
                 have_bitmap: None,
             }),

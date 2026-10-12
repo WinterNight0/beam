@@ -79,5 +79,6 @@ CLI/TUI) be built with?
 the GUI must do: the real friends list, the Accept pop-up with its safe
 default, and the OS file picker; check it against beam's lint rules, test it
 headless, measure size, memory and build time.
-**Exit criteria:** an ADR (ADR-0048) recording the choice and the runner-up.
+**Exit criteria:** an ADR (ADR-0049) recording the choice and the runner-up.
+(ADR-0048 became the restructure that prepares for the GUI.)
 

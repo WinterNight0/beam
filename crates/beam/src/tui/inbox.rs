@@ -11,81 +11,13 @@
 //! (ADR-0034): the file name comes from the sender.
 
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
 
-use crate::agent::ipc::{AgentMsg, Client, ClientMsg, RequestInfo};
-use crate::{ui, untrusted};
+use beam_core::actions::inbox::{Address, ConnectError, Inbox, InboxEvent};
 
-/// A transfer request, ready to draw.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequestView {
-    /// This device's nickname for the sender (never the sender's own claim).
-    pub peer_name: String,
-    /// The sender's fingerprint as hex, without `SHA256:`.
-    pub fingerprint: String,
-    pub file_name: String,
-    pub size: u64,
-    /// "continues: 1.2 GiB of 2.0 GiB (60 %) already here, from 3 hours ago".
-    pub resume: Option<String>,
-}
+pub use beam_core::actions::inbox::RequestView;
 
-impl From<RequestInfo> for RequestView {
-    fn from(r: RequestInfo) -> Self {
-        let resume = r.resume.as_ref().map(|x| {
-            let age = x
-                .age_secs
-                .map(|s| format!(", from {}", ui::format_age(Duration::from_secs(s))))
-                .unwrap_or_default();
-            format!(
-                "continues: {} of {} ({} %) already here{age}",
-                ui::format_bytes(x.have_bytes),
-                ui::format_bytes(r.size),
-                ui::percent(x.have_bytes, r.size)
-            )
-        });
-        let fingerprint = r.fingerprint.trim_start_matches("SHA256:").to_string();
-        Self {
-            peer_name: untrusted::name(&r.peer_name),
-            fingerprint: untrusted::text(&fingerprint),
-            file_name: untrusted::name(&r.file_name),
-            size: r.size,
-            resume,
-        }
-    }
-}
-
-/// What the agent said.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InboxUpdate {
-    Connected {
-        receive_dir: String,
-    },
-    Request {
-        id: u64,
-        request: RequestView,
-        expires_in: Duration,
-    },
-    /// No longer waiting: answered (here or elsewhere), expired, withdrawn.
-    Closed {
-        id: u64,
-    },
-    Progress {
-        done: u64,
-        total: u64,
-        relay: bool,
-    },
-    Finished {
-        ok: bool,
-        text: String,
-    },
-    TooLate {
-        id: u64,
-    },
-    /// The link is gone: the agent stopped, or could not be reached.
-    Gone {
-        reason: String,
-    },
-}
+/// What the agent said: the model's own message (beam-model).
+pub use beam_model::requests::Update as InboxUpdate;
 
 /// A connection to the agent, on its own thread.
 pub struct InboxLink {
@@ -133,46 +65,44 @@ async fn serve(
     mut answers: tokio::sync::mpsc::UnboundedReceiver<(u64, bool)>,
     mut stopped: tokio::sync::oneshot::Receiver<()>,
 ) -> String {
-    let (mut client, welcome) = match Client::connect(port, token).await {
+    let address = Address {
+        port,
+        token: token.to_string(),
+    };
+    let (mut inbox, receive_dir) = match Inbox::connect(&address).await {
         Ok(connected) => connected,
-        Err(e) => return format!("could not reach the background agent: {e}"),
+        Err(ConnectError::Unreachable(e)) => {
+            return format!("could not reach the background agent: {e}");
+        }
+        Err(ConnectError::Unexpected) => {
+            return "the background agent did not answer as expected".to_string();
+        }
     };
-    let AgentMsg::Welcome { receive_dir, .. } = welcome else {
-        return "the background agent did not answer as expected".to_string();
-    };
-    let _ = updates.send(InboxUpdate::Connected {
-        receive_dir: untrusted::name(&receive_dir),
-    });
+    let _ = updates.send(InboxUpdate::Connected { receive_dir });
     loop {
         tokio::select! {
-            msg = client.next() => {
-                let Ok(msg) = msg else {
-                    return "the background agent stopped".to_string();
-                };
-                let update = match msg {
-                    AgentMsg::Request { id, request, expires_in } => InboxUpdate::Request {
+            event = inbox.next() => {
+                let update = match event {
+                    InboxEvent::Request { id, request, expires_in } => InboxUpdate::Request {
                         id,
                         request: request.into(),
-                        expires_in: Duration::from_secs(expires_in),
+                        expires_in,
                     },
-                    AgentMsg::Closed { id } => InboxUpdate::Closed { id },
-                    AgentMsg::Progress { done, total, relay } => {
+                    InboxEvent::Closed { id } => InboxUpdate::Closed { id },
+                    InboxEvent::Progress { done, total, relay } => {
                         InboxUpdate::Progress { done, total, relay }
                     }
-                    AgentMsg::Finished { ok, text } => InboxUpdate::Finished {
-                        ok,
-                        text: untrusted::text(&text),
-                    },
-                    AgentMsg::TooLate { id } => InboxUpdate::TooLate { id },
-                    AgentMsg::Stopping => return "the background agent is stopping".to_string(),
-                    AgentMsg::Welcome { .. } => continue,
+                    InboxEvent::Finished { ok, text } => InboxUpdate::Finished { ok, text },
+                    InboxEvent::TooLate { id } => InboxUpdate::TooLate { id },
+                    InboxEvent::Stopping => return "the background agent is stopping".to_string(),
+                    InboxEvent::Gone => return "the background agent stopped".to_string(),
                 };
                 if updates.send(update).is_err() {
                     return String::new();
                 }
             }
             Some((id, accept)) = answers.recv() => {
-                if client.send(&ClientMsg::Answer { id, accept }).await.is_err() {
+                if !inbox.answer(id, accept).await {
                     return "the background agent stopped".to_string();
                 }
             }
@@ -183,29 +113,6 @@ async fn serve(
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::*;
-    use crate::agent::ipc::ResumeWire;
-
-    #[test]
-    fn a_request_is_cleaned_and_its_resume_described() {
-        let view = RequestView::from(RequestInfo {
-            peer_name: "alice".into(),
-            fingerprint: "SHA256:ab12".into(),
-            file_name: "evil\x1b[31m.txt".into(),
-            size: 2048,
-            resume: Some(ResumeWire {
-                have_bytes: 1024,
-                have_chunks: 1,
-                chunk_count: 2,
-                age_secs: None,
-            }),
-        });
-        assert_eq!(view.fingerprint, "ab12");
-        assert!(!view.file_name.contains('\x1b'), "{:?}", view.file_name);
-        let resume = view.resume.unwrap();
-        assert!(resume.contains("50 %"), "{resume}");
-    }
-
     // The whole path with a real agent: a paired device sends, the view's
     // link is shown the request, and only its answer decides.
     pub(in crate::tui) mod with_an_agent {
@@ -213,15 +120,15 @@ pub(super) mod tests {
         use std::time::Duration;
 
         use super::super::*;
-        use crate::agent::status::{self, Running};
-        use crate::agent::{self, AgentOptions};
-        use crate::config::Relay;
-        use crate::identity::{Identity, Peer, Store};
-        use crate::invite::Invite;
-        use crate::pairing::Network;
-        use crate::transfer::{SendOptions, SilentReporter, TransferError};
-        use crate::transport::dial::{dial_transfer, send_on};
-        use crate::transport::endpoint::{self, Bind};
+        use beam_core::agent::status::{self, Running};
+        use beam_core::agent::{self, AgentOptions};
+        use beam_core::config::Relay;
+        use beam_core::identity::{Identity, Peer, Store};
+        use beam_core::invite::Invite;
+        use beam_core::pairing::Network;
+        use beam_core::transfer::{SendOptions, SilentReporter, TransferError};
+        use beam_core::transport::dial::{dial_transfer, send_on};
+        use beam_core::transport::endpoint::{self, Bind};
 
         pub(in crate::tui) struct Home {
             _tmp: tempfile::TempDir,
@@ -275,7 +182,7 @@ pub(super) mod tests {
                 accept_timeout: Duration::from_secs(60),
                 port_mapping: false,
                 notify: false,
-                echo: false,
+                echo: None,
                 in_view: false,
             };
             let (identity, store) = (home.identity.clone(), home.store.clone());
@@ -300,7 +207,8 @@ pub(super) mod tests {
             from: &Home,
             at: iroh::EndpointAddr,
             bytes: &[u8],
-        ) -> tokio::task::JoinHandle<Result<crate::transfer::SendSummary, TransferError>> {
+        ) -> tokio::task::JoinHandle<Result<beam_core::transfer::SendSummary, TransferError>>
+        {
             let path = from.files.join("report.pdf");
             std::fs::write(&path, bytes).unwrap();
             let identity = from.identity.clone();
@@ -311,7 +219,7 @@ pub(super) mod tests {
                 let connection = dial_transfer(&endpoint, at).await.expect("dial the agent");
                 let mut options = SendOptions::new(
                     path,
-                    crate::identity::encode_public_key(&identity.verifying_key()),
+                    beam_core::identity::encode_public_key(&identity.verifying_key()),
                 );
                 options.accept_timeout = Duration::from_secs(60);
                 let result = send_on(&connection, &mut options, &mut SilentReporter).await;
@@ -338,7 +246,10 @@ pub(super) mod tests {
 
         async fn request_from_bob(
             accept: bool,
-        ) -> (Home, Result<crate::transfer::SendSummary, TransferError>) {
+        ) -> (
+            Home,
+            Result<beam_core::transfer::SendSummary, TransferError>,
+        ) {
             let (alice, bob) = (home("alice"), home("bob"));
             pair(&alice, "bob", &bob, "alice");
             let (status, _stop) = start_agent(&alice).await;
@@ -372,16 +283,33 @@ pub(super) mod tests {
             (alice, result)
         }
 
+        /// The receiver's history, once its line is there. The agent answers
+        /// the sender first and writes the line just after, so the sender
+        /// can finish a moment before it exists.
+        async fn history_of(home: &Home) -> Vec<beam_core::history::Entry> {
+            for _ in 0..100 {
+                let history = beam_core::history::read(&home.store);
+                if !history.is_empty() {
+                    return history;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            beam_core::history::read(&home.store)
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn accepting_in_the_view_saves_the_file() {
             let (alice, result) = request_from_bob(true).await;
             result.expect("sent");
             let saved = std::fs::read(alice.inbox.join("report.pdf")).unwrap();
             assert_eq!(saved, b"the quarterly numbers");
-            let history = crate::history::read(&alice.store);
+            let history = history_of(&alice).await;
             assert_eq!(history.len(), 1, "{history:?}");
-            assert_eq!(history[0].direction, crate::history::Direction::Received);
-            assert_eq!(history[0].outcome, crate::history::Outcome::Done);
+            assert_eq!(
+                history[0].direction,
+                beam_core::history::Direction::Received
+            );
+            assert_eq!(history[0].outcome, beam_core::history::Outcome::Done);
             assert_eq!(
                 (history[0].peer.as_str(), history[0].file.as_str()),
                 ("bob", "report.pdf")
@@ -393,9 +321,9 @@ pub(super) mod tests {
             let (alice, result) = request_from_bob(false).await;
             assert!(result.is_err(), "{result:?}");
             assert!(!alice.inbox.join("report.pdf").exists());
-            let history = crate::history::read(&alice.store);
+            let history = history_of(&alice).await;
             assert_eq!(history.len(), 1, "{history:?}");
-            assert_eq!(history[0].outcome, crate::history::Outcome::Declined);
+            assert_eq!(history[0].outcome, beam_core::history::Outcome::Declined);
             assert_eq!(history[0].file, "report.pdf", "the declined file is named");
         }
     }

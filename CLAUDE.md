@@ -52,12 +52,18 @@ beam history                   # what came and went (ADR-0043)
   M0/M1 were first built that way; it moved to Rust at the team's request. See
   ADR-0010 in `docs/decisions.md`. The Go implementation is preserved in commit
   `a1ae4ec`.
-- Build: cargo workspace; `make check` = `cargo fmt --check` + `cargo clippy -D warnings`
-  + `cargo test`. `unsafe_code = "forbid"` workspace-wide.
+- Build: cargo workspace of three crates (`beam-core`, `beam-model`, `beam`;
+  ADR-0048), dependency versions set once in the workspace `Cargo.toml`;
+  `make check` = `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test`
+  over the workspace. `unsafe_code = "forbid"` workspace-wide.
 - Platforms (ADR-0046): Windows and **Arch Linux** (the first Linux; others once
-  stable). CI: a Windows job and an Arch job (`archlinux:base-devel` container,
-  runs as root, so no test may rely on permissions being enforced). Keep
-  `cfg(windows)`-only helpers out of Linux builds: CI has `-D warnings`.
+  stable). CI (ADR-0050): a Windows job, an Arch job (`archlinux:base-devel`
+  container, tests run as an ordinary user, not root) and a Rust 1.91 job
+  (the MSRV; keep it equal to `rust-version`). Runs on pull requests into
+  `main` or `GUI-Experimental`, pushes to `main`, and by hand; not on other
+  pushes. `--locked`, `--no-fail-fast`. The audit is `security.yml` (also
+  weekly). Keep `cfg(windows)`-only helpers out of Linux builds: CI has
+  `-D warnings`.
 - CLI: `clap` (derive).
 - Full-screen view: `ratatui` 0.30 with its `crossterm` backend (through ratatui's
   re-export), approved for ADR-0043. Plain `beam` on a terminal opens it.
@@ -117,24 +123,53 @@ needs a new Accept" a property of the design rather than a rule to remember. Res
 triggered only by running `beam send` again — no automatic reconnection, no
 `beam resume`. See ADR-0020.
 
-## Suggested layout
+## Layout (ADR-0048: four layers, three crates)
 
 ```
-crates/beam/
-  src/main.rs          CLI entry point
-  src/cli/             command definitions (kept out of main so they are testable)
-  src/identity/        keygen, fingerprint, short ID, known_peers
+crates/beam-core/      L1 core + L2 actions. No terminal or GUI library.
+  src/identity/        keygen, fingerprint, short ID, known_peers, ~/.beam store
   src/pairing/         PAKE pairing flow
   src/transport/       iroh endpoint, connection, relay configuration
   src/invite.rs        invites, and where a paired peer is found
   src/transfer/        protocol messages, state machine, chunking, resume, integrity
-  src/ui.rs            prompts, progress bar
-  tests/               command-level and integration tests
+  src/listener.rs      `listen` as a service; src/agent/ the background agent
+  src/history.rs, config.rs, untrusted.rs, text.rs
+  src/actions/         one copy of each flow: send, pair, receive, inbox, messages
+  tests/               core integration and security tests; tests/layers.rs
+crates/beam-model/     L3 what a screen shows: snapshot, requests, sending,
+                       ask (every yes/no question starts on No). Depends on
+                       beam-core only.
+crates/beam/           L4 front ends: the `beam` binary
+  src/main.rs          entry point
+  src/cli/             command definitions (kept out of main so they are testable)
+  src/tui/             the full-screen view
+  src/ui.rs            terminal tables and y/N prompts
+  tests/               command, two-process and terminal-injection tests
 docs/                  requirements, diagrams, test plan, design decisions
 ```
 
-New areas start as modules of the `beam` library crate and are promoted to their
-own workspace crates only if compile times demand it.
+A crate may only use the ones above it in this list; Cargo enforces it, and
+`crates/beam-core/tests/layers.rs` keeps the core from using `actions`.
+The GUI will be another front-end crate (`beam-gui`, ADR-0049 to come).
+
+## Adding a feature
+
+In this order, each step with its tests (ADR-0048):
+
+1. **Core** (`beam-core`): the logic, and every rule it must keep. No
+   printing, no terminal.
+2. **Action** (`beam-core/src/actions/`): the flow a person runs, returning
+   what happened, never words. Text that can quote the network comes back
+   cleaned.
+3. **CLI** (`crates/beam/src/cli/`): always, first. It is the reference
+   front end.
+4. **Model** (`beam-model`), if a screen shows it: its state and rules. A
+   yes/no question is an `Ask`, so it starts on No.
+5. **View** (`crates/beam/src/tui/`): keys, drawing and words only.
+6. **GUI**, when it exists: drawing and clicks only; it may come a release
+   later.
+7. **`docs/parity.md`**: a row saying which front end offers it. The ADR for
+   the feature says the same.
 
 ## Milestones (do them in order; stop for review after each)
 
@@ -225,7 +260,21 @@ own workspace crates only if compile times demand it.
   itself on Ctrl+V / Shift+Insert (`clipboard::paste`, PowerShell
   `Get-Clipboard`), Ctrl+Insert copies, `m` toggles mouse capture; detected by
   no `WT_SESSION`/`TERM_PROGRAM`/… → starts with clicks off.
-- **Next (to be planned):** the path itself — why cross-network transfers stay on the relay
+- **Post-M6 (ADR-0048)** Four layers in three crates: `beam-core` (core +
+  `actions/`: one send, pair, receive, inbox flow for every front end),
+  `beam-model` (snapshot, requests, sending, `Ask<Q>`: every yes/no question
+  starts on No by construction), `beam` (CLI + view). Cargo enforces the
+  layers; `tests/layers.rs` checks core vs actions. `save_location` refuses a
+  relay change without a yes; failed-send messages come back cleaned
+  (SECURITY.md F-5). "Adding a feature" above; `docs/parity.md`.
+- **Post-M6 (ADR-0050)** CI/CD upgrade: runs on PRs into `main` /
+  `GUI-Experimental`, pushes to `main`, or by hand; `--locked --workspace`,
+  tests `--no-fail-fast`; Arch tests as user `builder`; a Rust 1.91 (MSRV)
+  job; `cargo audit` in `security.yml`, weekly too (scheduled runs start once
+  it is on `main`). Later: `release.yml` with checksums, required checks.
+  Branch flow: work merges into `GUI-Experimental`; `main` waits for the GUI.
+- **Next (to be planned):** the GUI (`beam-gui`, iced per SPIKE-002, ADR-0049);
+  the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): bandwidth limit, folder transfer. (The TUI and
   transfer history are done: ADR-0043..0045.)

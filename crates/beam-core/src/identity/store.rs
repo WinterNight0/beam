@@ -404,8 +404,7 @@ fn write_atomic(path: &Path, data: &[u8], visibility: Visibility) -> Result<(), 
     tmp.as_file()
         .sync_all()
         .map_err(|e| StoreError::io("flush", path, e))?;
-    tmp.persist(path)
-        .map_err(|e| StoreError::io("replace", path, e.error))?;
+    crate::replace::persist(tmp, path).map_err(|e| StoreError::io("replace", path, e.error))?;
     Ok(())
 }
 

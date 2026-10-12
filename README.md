@@ -26,7 +26,8 @@ Requires Rust 1.91 or newer (edition 2024). On Windows you also need the MSVC
 build tools, which `rustup` will point you at.
 
 **Supported platforms:** Windows, and **Arch Linux** as the first Linux; CI
-builds and tests both on every push. Other Linux distributions are expected
+builds and tests both on every pull request, and checks the oldest Rust beam
+supports, 1.91 (ADR-0050). Other Linux distributions are expected
 to work but are not tested yet; they will be added once beam is stable
 (ADR-0046). On Arch: `sudo pacman -S --needed base-devel rustup`, then
 `rustup default stable`.
@@ -446,19 +447,16 @@ to it inside the PAKE.
 ## Layout
 
 ```
-crates/beam/
-  src/main.rs          CLI entry point
-  src/cli/             command definitions
-  src/identity/        keys, fingerprints, Short IDs, known_peers, store
-  src/pairing/         pairing codes, SPAKE2 + key confirmation, the two roles
-  src/invite.rs        invites, and where a paired peer is found
-  src/transfer/        protocol, state machine, chunking, resume, integrity
-  src/transport/       iroh endpoint; the M2 TCP stand-in
-  src/config.rs        ~/.beam/config.toml
-  src/ui.rs            terminal output helpers
-  tests/               command, integration and two-process tests
+crates/beam-core/      the core and the shared actions: identity, pairing,
+                       transfers, transport, the agent; send, pair, receive
+crates/beam-model/     what a screen shows; every yes/no question starts on No
+crates/beam/           the `beam` program: the CLI and the full-screen view
 docs/                  requirements, design decisions, test plan
 ```
+
+Each crate may only use the ones above it, and the build enforces it
+(ADR-0048). [docs/how-it-works.md §11](docs/how-it-works.md) lists every
+file; [docs/parity.md](docs/parity.md) says which front end offers what.
 
 Transfer speed, what has been measured and the plan to improve it:
 [docs/performance-plan.md](docs/performance-plan.md).

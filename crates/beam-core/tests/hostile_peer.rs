@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beam::identity::{Identity, KnownPeers, Peer, encode_public_key};
-use beam::transfer::frame::{read_message, write_message};
-use beam::transfer::message::{
+use beam_core::identity::{Identity, KnownPeers, Peer, encode_public_key};
+use beam_core::transfer::frame::{read_message, write_message};
+use beam_core::transfer::message::{
     ChunkStart, MAX_CHUNK_COUNT, MAX_CHUNK_SIZE, Message, RejectReason, TransferId, TransferRequest,
 };
-use beam::transfer::{
+use beam_core::transfer::{
     Progress, Prompt, PromptRequest, ReceiveOptions, Reporter, SendOptions, SilentReporter,
     TransferError, receive_file, send_file, sha256_hex,
 };
@@ -342,7 +342,7 @@ async fn a_receiver_that_never_acknowledges_is_given_up_on() {
     };
     write_message(
         &mut peer,
-        &Message::Accept(beam::transfer::message::Accept {
+        &Message::Accept(beam_core::transfer::message::Accept {
             transfer_id: req.transfer_id,
             have_bitmap: None,
         }),

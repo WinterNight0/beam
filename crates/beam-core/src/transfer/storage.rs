@@ -79,6 +79,24 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// `dir`, or the nearest folder above it that exists. A destination is made
+/// only once a transfer is accepted, and Linux cannot tell the free space of
+/// a folder that is not there yet (Windows can): asked anyway, it fails, and
+/// every request would be refused as "no space". The file lands on the disk
+/// of that nearest folder, so its free space is the right answer.
+fn nearest_existing(dir: &Path) -> &Path {
+    dir.ancestors()
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                p
+            }
+        })
+        .find(|p| p.is_dir())
+        .unwrap_or(dir)
+}
+
 /// Checks there is room for a transfer before anyone is asked to accept it.
 ///
 /// `remaining` is what is still to be downloaded, so a resume only has to
@@ -91,29 +109,33 @@ pub fn check_space(
     remaining: u64,
     total: u64,
 ) -> Result<(), SpaceError> {
-    let partial_available = available_space(partial_dir)?;
+    let (partial_disk, destination_disk) = (
+        nearest_existing(partial_dir),
+        nearest_existing(destination_dir),
+    );
+    let partial_available = available_space(partial_disk)?;
     let partial_needed = remaining.saturating_add(SPACE_MARGIN);
     if partial_available < partial_needed {
         return Err(SpaceError::Insufficient {
             where_: format!("partial transfers ({})", partial_dir.display()),
-            needed: crate::ui::format_bytes(partial_needed),
-            available: crate::ui::format_bytes(partial_available),
+            needed: crate::text::format_bytes(partial_needed),
+            available: crate::text::format_bytes(partial_available),
         });
     }
 
     // On one volume the commit is a rename, so the finished file costs nothing
     // beyond the bytes already counted above.
-    if same_volume(partial_dir, destination_dir) {
+    if same_volume(partial_disk, destination_disk) {
         return Ok(());
     }
 
-    let destination_available = available_space(destination_dir)?;
+    let destination_available = available_space(destination_disk)?;
     let destination_needed = total.saturating_add(SPACE_MARGIN);
     if destination_available < destination_needed {
         return Err(SpaceError::Insufficient {
             where_: format!("the destination ({})", destination_dir.display()),
-            needed: crate::ui::format_bytes(destination_needed),
-            available: crate::ui::format_bytes(destination_available),
+            needed: crate::text::format_bytes(destination_needed),
+            available: crate::text::format_bytes(destination_available),
         });
     }
 
@@ -129,7 +151,7 @@ pub fn check_space(
 /// within one volume, and a crash part-way through leaves a temporary file
 /// rather than a half-written download wearing the destination's name.
 pub async fn commit(part: &Path, destination: &Path) -> std::io::Result<()> {
-    match tokio::fs::rename(part, destination).await {
+    match crate::replace::rename(part, destination).await {
         Ok(()) => Ok(()),
         Err(e) if is_cross_volume(&e) => commit_by_copy(part, destination).await,
         Err(e) => Err(e),
@@ -167,7 +189,7 @@ pub async fn commit_by_copy(part: &Path, destination: &Path) -> std::io::Result<
         return Err(e);
     }
 
-    if let Err(e) = tokio::fs::rename(&staging_path_owned, destination).await {
+    if let Err(e) = crate::replace::rename(&staging_path_owned, destination).await {
         let _ = tokio::fs::remove_file(&staging_path_owned).await;
         return Err(e);
     }
@@ -230,6 +252,21 @@ mod tests {
         let out = tmp.path().join("out");
         std::fs::create_dir_all(&out).expect("create out");
         check_space(tmp.path(), &out, 1024, 1024).expect("a 1 KiB transfer should fit");
+    }
+
+    /// The destination is made only after Accept. Before, Linux cannot say
+    /// how much room a missing folder has, and every request was refused as
+    /// "no space"; the folder it will be made in answers instead.
+    #[test]
+    fn a_destination_not_made_yet_is_measured_by_the_folder_it_will_be_in() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("not").join("made").join("yet");
+        check_space(tmp.path(), &out, 1024, 1024).expect("a 1 KiB transfer should fit");
+        assert!(
+            check_space(tmp.path(), &out, u64::MAX / 2, u64::MAX / 2).is_err(),
+            "the real disk is still measured"
+        );
+        assert!(!out.exists(), "checking makes nothing");
     }
 
     #[test]

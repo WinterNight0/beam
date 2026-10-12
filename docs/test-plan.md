@@ -13,21 +13,25 @@ cargo test --test end_to_end                # two real processes
 ```
 
 `make check` is the gate: a milestone is not done until it passes. CI runs the
-same three commands on Windows (`windows-latest`) and on **Arch Linux** (the
-official `archlinux:base-devel` image) for every push and pull request
-(ADR-0014, ADR-0046), so the gate is enforced rather than remembered.
+same three commands, with `--locked`, on Windows (`windows-latest`), on
+**Arch Linux** (the official `archlinux:base-devel` image, as an ordinary
+user rather than root, so permission checks mean something) and with
+**Rust 1.91**, the declared minimum (ADR-0014, ADR-0046, ADR-0050). It runs
+on every pull request into `main` or `GUI-Experimental`, every push to
+`main`, and by hand, so the gate is enforced rather than remembered.
 
 ## Test levels
 
 | Level | Where | What it covers |
 |-------|-------|----------------|
-| Unit | `#[cfg(test)]` modules inside `crates/beam/src/` | derivations, parsing, framing, chunk arithmetic, state machine transitions, path safety |
+| Unit | `#[cfg(test)]` modules inside each crate's `src/` (`beam-core`, `beam-model`, `beam`) | derivations, parsing, framing, chunk arithmetic, state machine transitions, path safety |
 | Command | `crates/beam/tests/cli.rs` | whole commands driven through `cli::execute` with in-memory streams and a temporary `--beam-dir` |
-| Integration | `crates/beam/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
-| Failure | `crates/beam/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
-| Security | `tests/transfer.rs::accept_rules`, `tests/cli.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
-| Resume | `crates/beam/tests/resume.rs` | partial transfers: what carries over, what is re-fetched, and what survives a failure |
+| Integration | `crates/beam-core/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
+| Failure | `crates/beam-core/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
+| Security | `crates/beam-core/tests/transfer.rs::accept_rules`, `hostile_peer.rs`, `crates/beam/tests/cli.rs`, `injection.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
+| Resume | `crates/beam-core/tests/resume.rs` | partial transfers: what carries over, what is re-fetched, and what survives a failure |
 | End to end | `crates/beam/tests/end_to_end.rs` | two real `beam` processes, talking over a real socket, with the prompt answered only once it has actually appeared — including killing one of them mid-transfer |
+| Layers | `crates/beam-core/tests/layers.rs`, `crates/beam-model/tests/layers.rs` | which layer may use which (ADR-0048) |
 | Manual | `docs/test-plan.md` | the few things one machine cannot honestly automate: a real second volume, a real full disk |
 
 Command-level tests never spawn a process and never touch the real `~/.beam`:
@@ -197,6 +201,48 @@ than once, and both would have failed in CI eventually.
   about data arriving *while the prompt is open* depend on the data winning. A
   prompt returning in nanoseconds sometimes beat it. Those tests now use a
   prompt that takes 300 ms, as a person does.
+- **The kill-and-resume tests failed under load, and the cause was in beam
+  (2026-10-12).** `end_to_end.rs`'s three kill-and-resume tests passed alone
+  but failed about one run in five when many ran at once, after a 30 s wait
+  for "two chunks on disk". Assumed at first to be the file finishing before
+  the cut; a stress run (8 to 12 copies at a time) and the receiver's own
+  output showed otherwise: `replace …\state.json: Access is denied`. On
+  Windows, replacing a file fails while another program has it open, and
+  the test reads `state.json` to count chunks, so under load a read and a
+  replace met and the **transfer failed**. Antivirus scanners, indexers and
+  backup tools open new files the same way, so real transfers could fail
+  too. Fixed in beam, not in the test: `beam-core/src/replace.rs` retries a
+  refused replace for about a second, on Windows only, for `state.json`, the
+  `~/.beam` files and the final move into place
+  (`replace::tests::a_replace_waits_out_a_program_that_holds_the_file_for_a_moment`,
+  `a_file_that_stays_held_still_fails_after_about_a_second`). The same stress
+  run then passed 180 of 180, against 58 of 72 before. The wait in the test
+  now prints the receiver's output if it ever fails again.
+
+### Linux-only failures that CI hid (2026-10-12)
+
+The Linux CI job had failed on every run, each time on a different test,
+because `cargo test` stops at the first failing test program and the rest
+never ran. Reading each run's log (`gh run view --log-failed`) found:
+
+- **A real bug: "no space" for a folder not made yet.** Before the prompt,
+  the receiver checks the free space of the destination folder. Linux
+  cannot measure a folder that does not exist (Windows can), and the error
+  was reported as "not enough space", so every request was refused. It
+  showed in `hostile_peer.rs`, whose `out` folder is made only after
+  Accept; for a person, it happens if the receive folder is deleted while
+  `listen` or the agent runs. The check now measures the nearest folder
+  that exists, which is on the same disk
+  (`storage::tests::a_destination_not_made_yet_is_measured_by_the_folder_it_will_be_in`).
+- **A test race: the inbox history line.** The agent answers the sender
+  first and writes its history line just after, so on Linux the test could
+  read the history before the line existed. `tui::inbox`'s two tests now
+  wait for it.
+- Earlier, fixed then: the file browser read `D:` as a drive letter on
+  every platform (ADR-0046).
+
+CI now runs tests with `--no-fail-fast`, so one run reports every failure
+(ADR-0050).
 
 ## Implemented (M4)
 
@@ -253,7 +299,7 @@ fingerprints. The successful case then runs `listen` and `send` between the two
 freshly paired homes, so pairing is shown to produce a `known_peers` entry the
 transfer engine accepts.
 
-### S-17 — `tests/no_n0_discovery.rs`
+### S-17 — `crates/beam-core/tests/no_n0_discovery.rs`
 
 iroh cannot report which address lookup services a bound endpoint has, so the
 test checks the source: no `presets::N0`, pkarr or DNS lookup, `address_lookup`
@@ -517,7 +563,7 @@ invite by chat and the code by another channel; the other runs `beam pair
 | **S-33 only `https://` public relays from invites** (F-3) | `invite::an_http_or_local_relay_in_an_invite_is_dropped_not_used` (http, private IPv4, loopback v4/v6, `localhost`, `*.local`; the rest of the invite still counts); a public https relay is kept |
 | What counts as a public address | `transport::endpoint::only_internet_reachable_addresses_count_as_public` (private, CGNAT, link-local, unique-local, documentation ranges are not) |
 | F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
-| S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
+| S-35 dependency audit | the `audit` job in `.github/workflows/security.yml` (also weekly, ADR-0050); manual results in `SECURITY.md` §7 |
 
 ## Implemented (post-M6): the full-screen view and history (ADR-0043)
 
@@ -538,6 +584,10 @@ file is given.
 | F-37 first-run welcome (ADR-0045) | `app::tests::the_first_run_offers_to_create_the_identity_and_enter_does_it`, `not_now_leaves_and_keys_do_nothing_else_meanwhile`, `tests::the_first_run_makes_an_identity_once_and_never_replaces_it`, `view::tests::the_first_run_shows_a_welcome_with_create_it_highlighted` |
 | F-38 file browser (ADR-0045) | `browse::tests::*`, `send::tests::s_opens_the_browser_and_enter_goes_in_then_sends`, `typing_filters_backspace_goes_up_and_a_dragged_path_is_sent`, `esc_closes_and_the_browser_reopens_where_it_was_left`, `tab_goes_to_the_places_and_enter_jumps`, `view::tests::sending_shows_the_browser_then_a_progress_pop_up_and_a_header_pill` |
 | F-39 classic Windows console (ADR-0047) | `tests::the_classic_console_keys_paste_and_copy`, `the_classic_console_is_told_apart_from_modern_terminals`, `app::tests::ctrl_v_reads_the_clipboard_only_where_something_is_typed`, `m_gives_the_mouse_to_the_terminal_and_back_but_is_a_letter_when_typing`; manual: run `beam` from `conhost.exe` and paste an invite with Ctrl+V |
+| Restructure safety net (before ADR-0048): a send reaches only the chosen friend; the Receiving switch never pairs; the view's failure messages are cleaned (SECURITY.md F-5) | `sending::tests::a_send_from_the_view_reaches_the_chosen_friend_and_no_other`, `beam_send_reaches_the_chosen_friend_and_no_other` (the CLI path), `actions::messages::tests::messages_come_back_cleaned`, `both_key_change_messages_warn_of_impersonation`, `receiving::tests::the_switch_never_offers_pairing` |
+| Actions (ADR-0048): one send, pairing, receiver and inbox flow for every front end | `actions::receive::tests::both_places_receive_by_the_same_rules`, `port_mapping_is_off_unless_asked_for`; `actions::pair::tests::a_relay_change_is_not_saved_without_a_yes`, `new_addresses_are_saved_and_the_key_is_kept`, `a_stranger_is_not_already_paired`; `actions::inbox::tests::a_request_is_cleaned_and_its_resume_described`; the send path is covered by the safety-net row above and every existing send, pairing, agent and end-to-end test, which now run through the actions |
+| Model (ADR-0048): every question starts on No, by construction; requests, the Receiving switch, the send in progress and "last seen" follow one set of rules for the view and a GUI | `crates/beam-model`: `ask::tests::every_question_starts_on_no`, `the_highlight_moves_only_when_asked`; `requests::tests::a_request_waits_until_answered_and_cannot_be_answered_twice`, `expired_requests_go_even_without_word_from_the_receiver`, `a_lost_link_takes_every_request_with_it`, `the_switch_asks_before_cutting_off_a_file_and_never_fights`; `sending::tests::the_stages_follow_the_engine_and_the_end_is_handed_back`; `snapshot::tests::last_seen_counts_answers_not_attempts_that_never_arrived`, `no_identity_is_the_first_run`; `tests/layers.rs::the_model_depends_only_on_the_core`; the view's own tests (Accept starts on Decline, Remove on Keep, …) still pass on top of it |
+| Layers (ADR-0048): the core never uses the actions or a front end | `crates/beam-core/tests/layers.rs::the_core_never_uses_the_layers_above_it`, `every_module_is_placed_in_a_layer`, `the_core_crate_depends_on_no_front_end_library` (the crate split makes Cargo enforce the front-end half) |
 | Keys, mouse, terminal | `tests::ctrl_c_copies_ctrl_q_quits_and_other_ctrl_keys_are_ignored`, `left_clicks_and_the_wheel_count_and_mouse_moves_do_not`, `view::tests::clicking_where_a_friend_was_drawn_selects_them`, `a_tiny_terminal_does_not_panic`, `input::tests::*` |
 
 ## Implemented (post-M6): background agent (ADR-0042)

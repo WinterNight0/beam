@@ -90,7 +90,7 @@ across the workspace (`unsafe_code = "forbid"`).
 | **The invite** (key, relay, IP addresses) | Whoever you send it to, and anyone who reads that chat. It is not a password, but it reveals your addresses. |
 | **The relay** (n0's public one by default) | Sees your public IP, which keys connect through it, when, and how many bytes. Cannot read or alter the encrypted connection. Set `relay = "none"` to avoid it (section 5). |
 | **UDP port 7820** while `listen` runs | `listen` binds a fixed port so its invite stays stable. iroh also asks your router to forward it (UPnP, NAT-PMP or PCP) when the router allows that. So a running `listen` may be reachable from the internet. Anyone who reaches it can try to pair (R-8), but transfers from unknown keys are refused. |
-| **n0's discovery service** | Nothing: beam never uses it, and a test fails if anyone adds it (`tests/no_n0_discovery.rs`). |
+| **n0's discovery service** | Nothing: beam never uses it, and a test fails if anyone adds it, in any of beam's crates (`crates/beam-core/tests/no_n0_discovery.rs`). |
 
 ## 5. Using beam safely
 
@@ -155,9 +155,12 @@ These are accepted on purpose, with their reasons, in
 
 ### Ongoing
 
-- **CI runs `cargo audit`** on every push and pull request (the `audit` job in
-  `.github/workflows/ci.yml`). A vulnerability fails the build; an
-  unmaintained-crate notice is shown as a warning.
+- **CI runs `cargo audit`** (`.github/workflows/security.yml`, ADR-0050) on
+  every pull request into `main` or `GUI-Experimental`, every push to `main`,
+  on request, and **weekly**, so an advisory published while no code changes
+  is still noticed (the weekly run starts once the file is on `main`). A
+  vulnerability fails the job; an unmaintained-crate notice is shown as a
+  warning.
 - **To check by hand:**
   ```
   cargo install cargo-audit --locked
@@ -167,6 +170,9 @@ These are accepted on purpose, with their reasons, in
   to exact versions, because their behaviour is part of beam's security, and
   bumping either is its own reviewed change.
 - **CI actions are pinned to commit hashes**, and the CI token is read-only.
+- **CI tests on Linux as an ordinary user**, not root (ADR-0050), so a test
+  that a private file is private, or that a folder is off limits, means
+  something there.
 
 ### Security review log
 
@@ -176,6 +182,9 @@ These are accepted on purpose, with their reasons, in
 | 2026-10-02 | F-2: a fixed port with router port mapping makes `listen` findable by scanning; anyone can use up its pairing codes | Low | **Open**, planned: R-8 |
 | 2026-10-02 | F-3: an invite could name any `http://` or local relay URL, making beam connect to local services or talk to a relay in plain text | Low | **Fixed**: invites accept only `https://` relays on public hosts (ADR-0038) |
 | 2026-10-02 | F-4: CI token had default permissions; actions referenced by movable tags; no automatic dependency audit | Low | **Fixed**: read-only token, actions pinned to commits, `cargo audit` job |
+| 2026-10-12 | F-5: in the full-screen view, the message for a failed send was drawn without cleaning. It can quote network error text, including the reason a peer gives for closing a connection, so a hostile paired device could put control characters on the screen. `beam send` was not affected (it cleans when it prints) | Low | **Fixed**: the messages now come back cleaned from the one place every front end takes them (`actions::messages`); `actions::messages::tests::messages_come_back_cleaned` |
+| 2026-10-12 | Hardening (ADR-0048): a relay move for a paired friend relied on each front end asking first (ADR-0038). Now the one save every front end uses refuses a relay change without the person's yes, and every yes/no question is built to start on No | — | **Done**: `actions::pair::tests::a_relay_change_is_not_saved_without_a_yes`, `beam_model::ask::tests::every_question_starts_on_no` |
+| 2026-10-12 | Hardening (ADR-0050): the audit ran only when code was pushed; Linux tests ran as root, where permission checks prove nothing | — | **Done**: weekly `security.yml`; Arch tests as user `builder` |
 | M6 | Impersonation, terminal injection, hostile-peer limits | — | Fixed and tested in M6; `threat-model.md` |
 
 ## 8. Reporting a vulnerability

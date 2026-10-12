@@ -16,8 +16,8 @@ unsafe_code = "forbid"
 all = { level = "deny", priority = -1 }
 
 [dependencies]
-# The real library: the window lists the real friends from ~/.beam.
-beam = { path = "../../crates/beam" }
+# The real core: the window lists the real friends from ~/.beam.
+beam-core = { path = "../../crates/beam-core" }
 # Pinned exactly, as iroh is: iced is not 1.0 and every minor release breaks.
 iced = { version = "=0.14.0", features = ["tokio", "canvas"] }
 rfd = "=0.17.2"

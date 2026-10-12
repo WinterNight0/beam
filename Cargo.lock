@@ -210,7 +210,26 @@ name = "beam"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "beam-core",
+ "beam-model",
  "clap",
+ "dirs",
+ "ed25519-dalek",
+ "iroh",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "beam-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
  "dirs",
  "ed25519-dalek",
  "fs4",
@@ -218,7 +237,6 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "iroh",
- "ratatui",
  "serde",
  "serde_json",
  "sha2",
@@ -229,6 +247,14 @@ dependencies = [
  "tokio",
  "toml",
  "zeroize",
+]
+
+[[package]]
+name = "beam-model"
+version = "0.1.0"
+dependencies = [
+ "beam-core",
+ "tempfile",
 ]
 
 [[package]]

@@ -23,3 +23,16 @@ pub use store::{
     HISTORY_LOCK_NAME, HISTORY_NAME, KNOWN_PEERS_NAME, LISTEN_LOCK_NAME, LISTEN_STATUS_NAME,
     PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, Store, StoreError, TMP_NAME,
 };
+
+/// A best-effort machine name for the public key comment. It is cosmetic, so a
+/// missing value is not an error.
+pub fn hostname() -> String {
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(name) = std::env::var(key)
+            && !name.trim().is_empty()
+        {
+            return name;
+        }
+    }
+    String::new()
+}

@@ -64,7 +64,7 @@ modern without effort; Slint is the runner-up.
 | Dependencies | 514 crates in the spike's tree against 382 for beam: iced, its renderers and windowing add about 130. |
 | Build time (clean, this machine) | debug 2 min 06 s, release 3 min 08 s, beam included. |
 | Arch Linux | **Not run yet.** Needs the Arch CI job (and a desktop for the window itself). Wayland and X11 are both in iced's defaults; `rfd` uses the XDG desktop portal, present on KDE/GNOME, possibly missing on a bare window manager. |
-| `cargo audit` | Not run (not installed locally); the CI audit job covers it once the GUI is in the workspace. |
+| `cargo audit` | Not run (not installed locally); the audit job (`security.yml`) covers it once the GUI is in the workspace. |
 
 ## Costs to accept
 
@@ -82,10 +82,10 @@ modern without effort; Slint is the runner-up.
 
 ## Next steps, if accepted
 
-1. ADR-0048 records the choice.
-2. Split the workspace: `beam-core` (library), `beam` (CLI/TUI), `beam-gui`.
-   No user-visible change.
-3. Move the TUI's background workers and the shared model out of `tui/` so
-   the GUI uses the same code (one place for the safe defaults).
-4. Build the GUI first version; release it separately (tag `gui-v*`), bundled
-   with the `beam` it was built with.
+1. ADR-0049 records the choice.
+2. ~~Split the workspace~~ and ~~move the shared flows and model out of
+   `tui/`~~: done by the restructure, ADR-0048 (`beam-core` with
+   `actions/`, `beam-model`, `beam`). The GUI uses the same code, and the
+   same safe defaults (`beam_model::Ask`).
+3. Build the GUI first version as `crates/beam-gui`; release it separately
+   (tag `gui-v*`), bundled with the `beam` it was built with.

@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use beam::identity::Store;
+use beam_core::identity::Store;
 use iced::widget::{button, center, column, container, opaque, row, scrollable, stack, text};
 use iced::{Element, Fill, Subscription, Task, Theme, keyboard};
 

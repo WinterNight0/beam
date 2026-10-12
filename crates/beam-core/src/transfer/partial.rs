@@ -153,7 +153,7 @@ pub struct PartialSummary {
 impl PartialSummary {
     /// How far along this partial is, 0-100.
     pub fn percent(&self) -> u8 {
-        crate::ui::percent(self.have_bytes, self.size)
+        crate::text::percent(self.have_bytes, self.size)
     }
 
     /// How long ago it was last written to.
@@ -654,7 +654,7 @@ fn write_state_file(dir: &Path, state: &PartialState, durable: bool) -> Result<(
             .sync_all()
             .map_err(|e| PartialError::io("flush", &path, e))?;
     }
-    temp.persist(&path)
+    crate::replace::persist(temp, &path)
         .map_err(|e| PartialError::io("replace", &path, e.error))?;
     Ok(())
 }

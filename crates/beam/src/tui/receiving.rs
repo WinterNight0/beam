@@ -1,7 +1,8 @@
 //! The Receiving switch (ADR-0044): the background agent's receiver, run
 //! inside the view for as long as the switch is on.
 //!
-//! It is [`agent::run`] unchanged — pairing off, a five-minute Accept window,
+//! It is [`actions::receive`](beam_core::actions::receive), which is
+//! [`agent::run`](beam_core::agent::run) unchanged — pairing off, a five-minute Accept window,
 //! router port mapping only if `beam service port-mapping on`, a desktop
 //! notification per request — with `in_view` set, so `beam service status`
 //! and `beam whoami` say who is receiving. It takes the agent's lock, so
@@ -14,22 +15,13 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use crate::agent::status::{self, Running};
-use crate::agent::{self, AgentOptions};
-use crate::config::Config;
-use crate::identity::Store;
-use crate::pairing::Network;
-use crate::transport::endpoint::Bind;
-use crate::untrusted;
+use beam_core::actions::receive::{self, Place};
+use beam_core::identity::Store;
+use beam_core::transport::endpoint::Bind;
+use beam_core::untrusted;
 
-/// What the receiving thread tells the view.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RecvUpdate {
-    /// Listening, saving to this folder.
-    Started { receive_dir: String },
-    /// Not listening any more; why, if it was not asked to stop.
-    Stopped(Option<String>),
-}
+/// What the receiving thread tells the view: the model's own message.
+pub use beam_model::requests::SwitchUpdate as RecvUpdate;
 
 /// The receiver while the switch is on.
 pub struct InView {
@@ -86,55 +78,27 @@ fn run(
     stopped: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let fail = |e: &dyn std::fmt::Display| untrusted::lines(&e.to_string());
-    let identity = store.load_identity().map_err(|e| fail(&e))?;
-    let config = Config::load(&store.config_path()).map_err(|e| fail(&e))?;
-    let (receive_dir, _) = agent::receive_dir(config.receive_dir.as_deref());
-    let shown_dir = untrusted::name(&receive_dir.display().to_string());
-    let options = AgentOptions {
-        network: Network {
-            relay: config.relay,
-            bind,
-            port: config.port,
-            advertise: config.advertise,
-        },
-        receive_dir,
-        accept_timeout: agent::AGENT_ACCEPT_TIMEOUT,
-        port_mapping: config.agent_port_mapping,
-        notify,
-        echo: false,
-        in_view: true,
-    };
+    let receiver =
+        receive::prepare(store, Place::InView, bind, notify, None).map_err(|e| fail(&e))?;
+    let shown_dir = untrusted::name(&receiver.receive_dir().display().to_string());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| fail(&e))?;
-    let result = runtime.block_on(async {
-        let receiving = agent::run(identity, store.clone(), options, async {
-            // A drop counts as "stop" too: the view went away.
+    let result = runtime.block_on(receive::run(
+        store,
+        receiver,
+        // A drop counts as "stop" too: the view went away.
+        async {
             let _ = stopped.await;
-        });
-        tokio::pin!(receiving);
-        // Say "on" once it is really listening: its status file names this
-        // process and carries its invite.
-        loop {
-            tokio::select! {
-                result = &mut receiving => return result,
-                () = tokio::time::sleep(Duration::from_millis(50)) => {
-                    if let Running::Yes(status) = status::read(store)
-                        && status.in_view
-                        && status.pid == std::process::id()
-                        && status.invite.is_some()
-                    {
-                        let _ = updates.send(RecvUpdate::Started {
-                            receive_dir: shown_dir.clone(),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-        receiving.await
-    });
+        },
+        // Say "on" once it is really receiving.
+        || {
+            let _ = updates.send(RecvUpdate::Started {
+                receive_dir: shown_dir,
+            });
+        },
+    ));
     runtime.shutdown_timeout(Duration::from_secs(1));
     result.map_err(|e| fail(&e))
 }
@@ -143,6 +107,7 @@ fn run(
 mod tests {
     use super::*;
     use crate::tui::inbox::tests::with_an_agent::home;
+    use beam_core::agent::status::{self, Running};
 
     fn next(on: &InView) -> RecvUpdate {
         on.updates
@@ -173,24 +138,82 @@ mod tests {
         assert!(matches!(status::read(&alice.store), Running::No));
     }
 
+    /// The switch, as the view starts it, does not pair: a stranger who
+    /// finds it cannot even open the pairing protocol, so cannot try codes
+    /// (safety net for moving the switch into one shared place; R-8).
+    #[test]
+    fn the_switch_never_offers_pairing() {
+        let alice = home("alice");
+        std::fs::write(alice.store.config_path(), "relay = \"none\"\nport = 0\n").unwrap();
+        let mut on = InView::start_on(alice.store.clone(), Bind::Loopback, false);
+        assert!(matches!(next(&on), RecvUpdate::Started { .. }));
+        let mut invite = None;
+        for _ in 0..600 {
+            if let Running::Yes(status) = status::read(&alice.store)
+                && let Some(text) = status.invite
+            {
+                invite = Some(text);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let at = invite
+            .expect("the switch published its invite")
+            .parse::<beam_core::invite::Invite>()
+            .unwrap()
+            .endpoint_addr();
+
+        let stranger = home("stranger");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let refused = runtime.block_on(async {
+            let endpoint = beam_core::transport::endpoint::bind(
+                &stranger.identity,
+                &beam_core::config::Relay::Disabled,
+                Bind::Loopback,
+                0,
+                &[],
+            )
+            .await
+            .unwrap();
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(30),
+                endpoint.connect(at, beam_core::transport::endpoint::PAIR_ALPN),
+            )
+            .await
+            .expect("the attempt hung");
+            endpoint.close().await;
+            attempt.is_err()
+        });
+        assert!(
+            refused,
+            "the Receiving switch accepted a pairing connection"
+        );
+
+        on.stop();
+        assert_eq!(next(&on), RecvUpdate::Stopped(None));
+    }
+
     #[test]
     fn it_will_not_start_beside_a_running_listen() {
         let alice = home("alice");
         std::fs::write(alice.store.config_path(), "relay = \"none\"\nport = 0\n").unwrap();
         // A `listen` holds its lock and has published what it offers.
         let mut board =
-            crate::listen_status::Board::claim(&alice.store, Duration::from_secs(600)).unwrap();
-        let code = crate::pairing::PairingCode::generate().unwrap();
+            beam_core::listen_status::Board::claim(&alice.store, Duration::from_secs(600)).unwrap();
+        let code = beam_core::pairing::PairingCode::generate().unwrap();
         board
-            .on_event(&crate::listener::ListenEvent::Ready {
-                invite: crate::invite::Invite {
+            .on_event(&beam_core::listener::ListenEvent::Ready {
+                invite: beam_core::invite::Invite {
                     key: alice.identity.verifying_key(),
                     relay: None,
                     addrs: vec!["127.0.0.1:7820".parse().unwrap()],
                 },
                 fingerprint: alice.identity.fingerprint(),
                 code,
-                relay: crate::config::Relay::Disabled,
+                relay: beam_core::config::Relay::Disabled,
             })
             .unwrap();
         let on = InView::start_on(alice.store.clone(), Bind::Loopback, false);
@@ -219,7 +242,7 @@ port = 0
 port = 0
 receive_dir = {}
 ",
-            crate::config::toml_string(&alice.inbox.display().to_string())
+            beam_core::config::toml_string(&alice.inbox.display().to_string())
         );
         std::fs::write(alice.store.config_path(), config).unwrap();
 
@@ -232,12 +255,12 @@ receive_dir = {}
         let link = InboxLink::connect(status.port, status.token.clone());
 
         // bob knows where she is, as after pairing with her invite.
-        let invite: crate::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
+        let invite: beam_core::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
         let mut known = bob.store.load_known_peers().unwrap();
-        crate::invite::remember(
+        beam_core::invite::remember(
             known.lookup_key_mut(&invite.key).unwrap(),
             &invite,
-            &crate::config::Relay::Disabled,
+            &beam_core::config::Relay::Disabled,
         );
         bob.store.save_known_peers(&known).unwrap();
         let path = bob.files.join("report.pdf");

@@ -38,7 +38,7 @@ use crate::listener::{ListenEvent, ListenOptions};
 use crate::pairing::{Confirm, ConfirmRequest, Network, Policy, Timeouts};
 use crate::transfer::{Progress, Prompt, PromptRequest, Reporter};
 use crate::transport::PathKind;
-use crate::{ui, untrusted};
+use crate::{text, untrusted};
 
 use ipc::{AgentMsg, ClientMsg, HELLO_TIMEOUT, MAX_CLIENTS};
 use status::{AgentLock, AgentStatus};
@@ -93,8 +93,10 @@ pub struct AgentOptions {
     pub port_mapping: bool,
     /// Show desktop notifications. Off in tests.
     pub notify: bool,
-    /// Also print what happens to stdout, for `beam agent` run in a terminal.
-    pub echo: bool,
+    /// Where else each log line goes, besides `agent.log`: `beam agent` run
+    /// in a terminal passes one that prints it. The agent itself never
+    /// prints; it is core code, and the screen belongs to the front end.
+    pub echo: Option<fn(&str)>,
     /// Run by the full-screen view's Receiving switch rather than as the
     /// background agent: same rules, but it lives only while the view is
     /// open (ADR-0044).
@@ -139,7 +141,7 @@ struct State {
     receive_dir: String,
     port_mapping: bool,
     notify: bool,
-    echo: bool,
+    echo: Option<fn(&str)>,
     pending: Mutex<Option<Pending>>,
     next_id: AtomicU64,
     events: broadcast::Sender<AgentMsg>,
@@ -154,14 +156,14 @@ impl State {
         let _ = self.events.send(msg);
     }
 
-    /// Writes a line to `agent.log`, and to stdout when run in a terminal.
+    /// Writes a line to `agent.log`, and hands it to `echo` if there is one.
     fn log(&self, line: &str) {
         let stamp = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
         let line = untrusted::text(line);
-        if self.echo {
-            println!("{line}");
+        if let Some(echo) = self.echo {
+            echo(&line);
         }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -209,7 +211,7 @@ impl State {
             "{} wants to send {} ({}). Open a terminal and run: beam inbox (expires in {} min)",
             untrusted::name(&info.peer_name),
             untrusted::name(&info.file_name),
-            ui::format_bytes(info.size),
+            text::format_bytes(info.size),
             AGENT_ACCEPT_TIMEOUT.as_secs() / 60
         );
         notify::show("beam: incoming file", &body);
@@ -239,7 +241,7 @@ impl Prompt for InboxPrompt {
             info.peer_name,
             info.fingerprint,
             info.file_name,
-            ui::format_bytes(info.size)
+            text::format_bytes(info.size)
         ));
         self.state.broadcast(AgentMsg::Request {
             id,
@@ -427,7 +429,7 @@ fn on_event(state: &State, event: ListenEvent) {
             state.close_pending();
             let text = format!(
                 "Received {} from {}, saved as {} in {}",
-                ui::format_bytes(summary.bytes),
+                text::format_bytes(summary.bytes),
                 untrusted::name(&summary.peer_name),
                 untrusted::name(&summary.final_name),
                 state.receive_dir

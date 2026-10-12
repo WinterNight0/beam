@@ -9,16 +9,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use beam::agent::ipc::{AgentMsg, Client, ClientMsg};
-use beam::agent::status::{self, AgentStatus, Running};
-use beam::agent::{self, AgentOptions};
-use beam::config::Relay;
-use beam::identity::{Identity, Peer, Store};
-use beam::invite::Invite;
-use beam::pairing::Network;
-use beam::transfer::{RejectReason, SendOptions, SilentReporter, TransferError};
-use beam::transport::dial::{dial_transfer, send_on};
-use beam::transport::endpoint::{self, Bind, PAIR_ALPN};
+use beam_core::agent::ipc::{AgentMsg, Client, ClientMsg};
+use beam_core::agent::status::{self, AgentStatus, Running};
+use beam_core::agent::{self, AgentOptions};
+use beam_core::config::Relay;
+use beam_core::identity::{Identity, Peer, Store};
+use beam_core::invite::Invite;
+use beam_core::pairing::Network;
+use beam_core::transfer::{RejectReason, SendOptions, SilentReporter, TransferError};
+use beam_core::transport::dial::{dial_transfer, send_on};
+use beam_core::transport::endpoint::{self, Bind, PAIR_ALPN};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -98,7 +98,7 @@ async fn start_agent(home: &Home, accept_timeout: Duration) -> Running_ {
         accept_timeout,
         port_mapping: false,
         notify: false,
-        echo: false,
+        echo: None,
         in_view: false,
     };
     let (identity, store) = (home.identity.clone(), home.store.clone());
@@ -133,7 +133,7 @@ fn send(
     at: iroh::EndpointAddr,
     name: &str,
     bytes: &[u8],
-) -> tokio::task::JoinHandle<Result<beam::transfer::SendSummary, TransferError>> {
+) -> tokio::task::JoinHandle<Result<beam_core::transfer::SendSummary, TransferError>> {
     let path = from.files.join(name);
     std::fs::write(&path, bytes).unwrap();
     let identity = from.identity.clone();
@@ -144,7 +144,7 @@ fn send(
         let connection = dial_transfer(&endpoint, at).await.expect("dial the agent");
         let mut options = SendOptions::new(
             path,
-            beam::identity::encode_public_key(&identity.verifying_key()),
+            beam_core::identity::encode_public_key(&identity.verifying_key()),
         );
         options.accept_timeout = Duration::from_secs(60);
         let result = send_on(&connection, &mut options, &mut SilentReporter).await;
@@ -506,7 +506,7 @@ async fn a_second_agent_in_the_same_home_is_refused() {
         accept_timeout: Duration::from_secs(60),
         port_mapping: false,
         notify: false,
-        echo: false,
+        echo: None,
         in_view: false,
     };
     let second = agent::run(
