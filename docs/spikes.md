@@ -63,3 +63,21 @@ The spike is done when the ADR is merged. If no candidate is clearly better,
 the ADR says so and records the tie-break reason explicitly — "we picked the one
 the brief named" is an acceptable tie-break, as long as it is written down as a
 tie-break rather than presented as a finding.
+
+---
+
+## SPIKE-002 — GUI library
+
+**Status: complete (2026-10-08), awaiting a decision. Recommendation: iced
+`=0.14.0` with `rfd` for the OS file picker. Findings in
+[`spikes/gui.md`](spikes/gui.md). Branch `GUI-Experimental`.**
+
+**Question:** which library should beam's GUI (a second download, after the
+CLI/TUI) be built with?
+**Candidates:** iced, Slint, egui, Tauri, JavaFX (the team's experience).
+**Method:** compare on paper, then build the smallest window that shows what
+the GUI must do: the real friends list, the Accept pop-up with its safe
+default, and the OS file picker; check it against beam's lint rules, test it
+headless, measure size, memory and build time.
+**Exit criteria:** an ADR (ADR-0048) recording the choice and the runner-up.
+

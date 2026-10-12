@@ -1,0 +1,794 @@
+//! SPIKE-002 mock-up: what a styled beam GUI looks like in iced.
+//!
+//! Not linked to beam: every friend, request and transfer is made up, and the
+//! buttons only change what is on screen. The look lives in `style.rs`, the
+//! counterpart of a JavaFX `.css` file.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod style;
+
+use std::time::Duration;
+
+use iced::font::Weight;
+use iced::widget::{
+    button, center, column, container, mouse_area, opaque, progress_bar, row, rule, scrollable,
+    space, stack, text, text_input, toggler,
+};
+use iced::{Alignment, Color, Element, Fill, Font, Subscription, Task, Theme, color, keyboard};
+
+fn main() -> iced::Result {
+    iced::application(Mockup::new, Mockup::update, Mockup::view)
+        .title("beam")
+        .theme(Mockup::theme)
+        .subscription(Mockup::subscription)
+        .window_size((1100.0, 680.0))
+        .run()
+}
+
+const BOLD: Font = Font {
+    weight: Weight::Bold,
+    ..Font::DEFAULT
+};
+const SEMIBOLD: Font = Font {
+    weight: Weight::Semibold,
+    ..Font::DEFAULT
+};
+
+struct Friend {
+    name: &'static str,
+    tint: Color,
+    seen: &'static str,
+    fingerprint: &'static str,
+}
+
+const FRIENDS: [Friend; 6] = [
+    Friend {
+        name: "Alice",
+        tint: color!(0xeb459e),
+        seen: "last seen 2 hours ago",
+        fingerprint: "SHA256:82f1 4c7d 179a d27f",
+    },
+    Friend {
+        name: "Bob",
+        tint: color!(0x3ba55c),
+        seen: "last seen yesterday",
+        fingerprint: "SHA256:0b9e 77a1 c3d0 5e12",
+    },
+    Friend {
+        name: "Charlie",
+        tint: color!(0xfaa61a),
+        seen: "last seen 3 days ago",
+        fingerprint: "SHA256:f00d 1a2b 3c4d 5e6f",
+    },
+    Friend {
+        name: "Dana",
+        tint: color!(0x5865f2),
+        seen: "never sent anything",
+        fingerprint: "SHA256:aa11 bb22 cc33 dd44",
+    },
+    Friend {
+        name: "Eve",
+        tint: color!(0xed4245),
+        seen: "last seen 2 weeks ago",
+        fingerprint: "SHA256:9a8b 7c6d 5e4f 3a2b",
+    },
+    Friend {
+        name: "Frank",
+        tint: color!(0x9b59b6),
+        seen: "last seen just now",
+        fingerprint: "SHA256:1234 5678 9abc def0",
+    },
+];
+
+struct Request {
+    from: usize,
+    file: &'static str,
+    size: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tab {
+    Friends,
+    Pending,
+    History,
+}
+
+enum Dialog {
+    Accept(usize),
+    AddInvite,
+    AddCode,
+}
+
+struct Sending {
+    to: usize,
+    file: &'static str,
+    progress: f32,
+}
+
+struct Mockup {
+    dark: bool,
+    tab: Tab,
+    selected: Option<usize>,
+    search: String,
+    receiving: bool,
+    requests: Vec<Request>,
+    dialog: Option<Dialog>,
+    invite: String,
+    code: String,
+    sending: Option<Sending>,
+    toast: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    Tab(Tab),
+    Select(usize),
+    Search(String),
+    Receiving(bool),
+    Review(usize),
+    Accept,
+    Decline,
+    AddFriend,
+    Invite(String),
+    Code(String),
+    Next,
+    Cancel,
+    Send(usize),
+    StopSending,
+    Tick,
+    ToggleTheme,
+    Key(keyboard::Key),
+}
+
+impl Mockup {
+    fn new() -> Self {
+        let mut m = Self::empty();
+        // For screenshots only: `MOCKUP_START=pending,accept,light` opens the
+        // mock-up in that state.
+        let start = std::env::var("MOCKUP_START").unwrap_or_default();
+        for word in start.split(',') {
+            match word {
+                "pending" => m.tab = Tab::Pending,
+                "history" => m.tab = Tab::History,
+                "on" => m.receiving = true,
+                "accept" => m.dialog = Some(Dialog::Accept(0)),
+                "invite" => m.dialog = Some(Dialog::AddInvite),
+                "code" => m.dialog = Some(Dialog::AddCode),
+                "sending" => {
+                    m.sending = Some(Sending {
+                        to: 1,
+                        file: "report-final-v3.pdf",
+                        progress: 62.0,
+                    })
+                }
+                "light" => m.dark = false,
+                _ => {}
+            }
+        }
+        m
+    }
+
+    fn empty() -> Self {
+        Self {
+            dark: true,
+            tab: Tab::Friends,
+            selected: Some(0),
+            search: String::new(),
+            receiving: false,
+            requests: vec![
+                Request {
+                    from: 0,
+                    file: "project.zip",
+                    size: "12.4 MB",
+                },
+                Request {
+                    from: 2,
+                    file: "holiday-photos.zip",
+                    size: "1.3 GB",
+                },
+            ],
+            dialog: None,
+            invite: String::new(),
+            code: String::new(),
+            sending: None,
+            toast: None,
+        }
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Tab(tab) => self.tab = tab,
+            Message::Select(i) => self.selected = Some(i),
+            Message::Search(s) => self.search = s,
+            Message::Receiving(on) => {
+                self.receiving = on;
+                self.toast = Some(if on {
+                    "Receiving is on: friends can send to you while beam is open.".into()
+                } else {
+                    "Receiving is off.".into()
+                });
+            }
+            Message::Review(i) => self.dialog = Some(Dialog::Accept(i)),
+            Message::Accept => {
+                if let Some(Dialog::Accept(i)) = self.dialog.take() {
+                    let r = self.requests.remove(i);
+                    self.toast = Some(format!(
+                        "Receiving {} from {}…",
+                        r.file, FRIENDS[r.from].name
+                    ));
+                }
+            }
+            Message::Decline => {
+                if let Some(Dialog::Accept(i)) = self.dialog.take() {
+                    let r = self.requests.remove(i);
+                    self.toast = Some(format!(
+                        "Declined {} from {}.",
+                        r.file, FRIENDS[r.from].name
+                    ));
+                }
+            }
+            Message::AddFriend => {
+                self.invite.clear();
+                self.code.clear();
+                self.dialog = Some(Dialog::AddInvite);
+            }
+            Message::Invite(s) => self.invite = s,
+            Message::Code(s) => {
+                self.code = s.chars().filter(char::is_ascii_digit).take(6).collect()
+            }
+            Message::Next => match self.dialog {
+                Some(Dialog::AddInvite) if !self.invite.trim().is_empty() => {
+                    self.dialog = Some(Dialog::AddCode);
+                }
+                Some(Dialog::AddCode) if self.code.len() == 6 => {
+                    self.dialog = None;
+                    self.toast =
+                        Some("Paired (pretend). The fingerprint check would come next.".into());
+                }
+                _ => {}
+            },
+            Message::Cancel => self.dialog = None,
+            Message::Send(i) => {
+                self.sending = Some(Sending {
+                    to: i,
+                    file: "report-final-v3.pdf",
+                    progress: 0.0,
+                });
+            }
+            Message::StopSending => {
+                self.sending = None;
+                self.toast = Some("Send cancelled.".into());
+            }
+            Message::Tick => {
+                if let Some(s) = &mut self.sending {
+                    s.progress += 0.5;
+                    if s.progress >= 100.0 {
+                        self.toast = Some(format!("{} sent to {}.", s.file, FRIENDS[s.to].name));
+                        self.sending = None;
+                    }
+                }
+            }
+            Message::ToggleTheme => self.dark = !self.dark,
+            // Enter and Escape on the Accept pop-up decline, never accept.
+            Message::Key(keyboard::Key::Named(
+                keyboard::key::Named::Enter | keyboard::key::Named::Escape,
+            )) => {
+                return match self.dialog {
+                    Some(Dialog::Accept(_)) => self.update(Message::Decline),
+                    Some(_) => self.update(Message::Cancel),
+                    None => Task::none(),
+                };
+            }
+            Message::Key(_) => {}
+        }
+        Task::none()
+    }
+
+    // -----------------------------------------------------------------------
+    // Layout (JavaFX: the FXML / scene graph)
+    // -----------------------------------------------------------------------
+
+    fn view(&self) -> Element<'_, Message> {
+        let page = row![self.rail(), self.sidebar(), self.main()];
+
+        let overlay = match &self.dialog {
+            None => return page.into(),
+            Some(Dialog::Accept(i)) => self.accept_dialog(*i),
+            Some(Dialog::AddInvite) => self.invite_dialog(),
+            Some(Dialog::AddCode) => self.code_dialog(),
+        };
+        stack![page, opaque(center(overlay).style(style::veil))].into()
+    }
+
+    /// The narrow strip on the far left.
+    fn rail(&self) -> Element<'_, Message> {
+        let logo = button(center(text("b").font(BOLD).size(22)))
+            .width(48)
+            .height(48)
+            .style(style::rail_button);
+        let theme = button(center(text(if self.dark { "☀" } else { "☾" }).size(18)))
+            .width(48)
+            .height(48)
+            .style(style::rail_button)
+            .on_press(Message::ToggleTheme);
+        container(
+            column![logo, rule::horizontal(2), space::vertical(), theme]
+                .spacing(10)
+                .align_x(Alignment::Center),
+        )
+        .padding(12)
+        .width(72)
+        .height(Fill)
+        .style(style::rail)
+        .into()
+    }
+
+    /// Search, the friends list, and "you" at the bottom.
+    fn sidebar(&self) -> Element<'_, Message> {
+        let needle = self.search.to_lowercase();
+        let friends = column(
+            FRIENDS
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.name.to_lowercase().contains(&needle))
+                .map(|(i, f)| {
+                    button(
+                        row![
+                            avatar(f, 32.0),
+                            column![text(f.name).font(SEMIBOLD), muted(f.seen, 12)]
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Fill)
+                    .padding([6, 8])
+                    .style(style::row_item(self.selected == Some(i)))
+                    .on_press(Message::Select(i))
+                    .into()
+                }),
+        )
+        .spacing(2);
+
+        let me = container(
+            row![
+                avatar(
+                    &Friend {
+                        name: "You",
+                        tint: color!(0x00a8fc),
+                        seen: "",
+                        fingerprint: ""
+                    },
+                    32.0
+                ),
+                column![
+                    text("my-laptop").font(SEMIBOLD),
+                    muted(
+                        if self.receiving {
+                            "Receiving"
+                        } else {
+                            "Not receiving"
+                        },
+                        12
+                    )
+                ],
+                space::horizontal(),
+                toggler(self.receiving)
+                    .on_toggle(Message::Receiving)
+                    .size(18)
+                    .style(style::switch),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([10, 12])
+        .style(style::rail);
+
+        container(column![
+            container(
+                text_input("Find a friend", &self.search)
+                    .on_input(Message::Search)
+                    .padding([8, 10])
+                    .style(style::input)
+            )
+            .padding(10),
+            rule::horizontal(1),
+            container(muted("FRIENDS — 6", 12).font(BOLD)).padding([12, 18]),
+            scrollable(container(friends).padding([0, 8])).height(Fill),
+            me,
+        ])
+        .width(260)
+        .height(Fill)
+        .style(style::sidebar)
+        .into()
+    }
+
+    /// Header with tabs, the tab's content, and a transfer card at the bottom.
+    fn main(&self) -> Element<'_, Message> {
+        let pending = self.requests.len();
+        let mut pending_label = row![text("Pending")].spacing(6).align_y(Alignment::Center);
+        if pending > 0 {
+            pending_label = pending_label.push(
+                container(text(pending).size(11).font(BOLD))
+                    .padding([1, 6])
+                    .style(style::badge),
+            );
+        }
+        let header = container(
+            row![
+                text("Friends").font(BOLD).size(16),
+                rule::vertical(1).style(rule::weak),
+                tab_button(text("All").into(), Tab::Friends, self.tab),
+                tab_button(pending_label.into(), Tab::Pending, self.tab),
+                tab_button(text("History").into(), Tab::History, self.tab),
+                space::horizontal(),
+                button(text("Add friend").font(SEMIBOLD))
+                    .padding([6, 14])
+                    .style(style::success)
+                    .on_press(Message::AddFriend),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center)
+            .height(32),
+        )
+        .padding([12, 20]);
+
+        let body = match self.tab {
+            Tab::Friends => self.friends_tab(),
+            Tab::Pending => self.pending_tab(),
+            Tab::History => self.history_tab(),
+        };
+
+        let mut content = column![
+            header,
+            rule::horizontal(1),
+            container(body).padding(20).height(Fill)
+        ];
+        if let Some(s) = &self.sending {
+            content = content.push(container(self.transfer_card(s)).padding([0, 20]));
+        }
+        if let Some(t) = &self.toast {
+            content = content.push(container(muted(t, 13)).padding([10, 20]));
+        }
+        container(content)
+            .width(Fill)
+            .height(Fill)
+            .style(style::page)
+            .into()
+    }
+
+    fn friends_tab(&self) -> Element<'_, Message> {
+        let rows = FRIENDS.iter().enumerate().map(|(i, f)| {
+            let send = button(text("Send a file"))
+                .padding([6, 14])
+                .style(style::primary)
+                .on_press_maybe(self.sending.is_none().then_some(Message::Send(i)));
+            let card = container(
+                row![
+                    avatar(f, 40.0),
+                    column![text(f.name).font(SEMIBOLD).size(16), muted(f.seen, 13)].spacing(2),
+                    space::horizontal(),
+                    send,
+                    button(text("•••")).padding([6, 10]).style(style::secondary),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            )
+            .padding([10, 14])
+            .style(style::card);
+            mouse_area(card).on_press(Message::Select(i)).into()
+        });
+        column![
+            muted("ALL FRIENDS — 6", 12).font(BOLD),
+            scrollable(column(rows).spacing(8)).height(Fill),
+        ]
+        .spacing(12)
+        .into()
+    }
+
+    fn pending_tab(&self) -> Element<'_, Message> {
+        let on = self.receiving;
+        let banner = container(
+            row![
+                column![
+                    text(if on { "Receiving is ON" } else { "Receiving is OFF" }).font(BOLD),
+                    muted(
+                        if on {
+                            "Friends can send to you while beam is open. You still accept every file."
+                        } else {
+                            "Turn it on to let friends send to you without opening a terminal."
+                        },
+                        13,
+                    ),
+                ]
+                .spacing(2),
+                space::horizontal(),
+                toggler(on).on_toggle(Message::Receiving).size(22).style(style::switch),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .padding([12, 16])
+        .style(style::banner(on));
+
+        let requests: Element<'_, Message> = if self.requests.is_empty() {
+            center(muted("Nothing waiting. Requests show up here.", 14)).into()
+        } else {
+            column(self.requests.iter().enumerate().map(|(i, r)| {
+                let f = &FRIENDS[r.from];
+                container(
+                    row![
+                        avatar(f, 40.0),
+                        column![
+                            text(format!("{} wants to send you a file", f.name)).font(SEMIBOLD),
+                            muted(format!("{}  ·  {}  ·  expires in 4:12", r.file, r.size), 13),
+                        ]
+                        .spacing(2),
+                        space::horizontal(),
+                        button(text("Review"))
+                            .padding([6, 14])
+                            .style(style::primary)
+                            .on_press(Message::Review(i)),
+                    ]
+                    .spacing(14)
+                    .align_y(Alignment::Center),
+                )
+                .padding([10, 14])
+                .style(style::card)
+                .into()
+            }))
+            .spacing(8)
+            .into()
+        };
+
+        column![
+            banner,
+            muted(format!("WAITING — {}", self.requests.len()), 12).font(BOLD),
+            requests
+        ]
+        .spacing(14)
+        .into()
+    }
+
+    fn history_tab(&self) -> Element<'_, Message> {
+        let entries = [
+            (
+                "↑",
+                "Sent report.pdf to Alice",
+                "2.1 MB  ·  accepted",
+                "2 hours ago",
+            ),
+            (
+                "↓",
+                "Received slides.pptx from Bob",
+                "8.7 MB  ·  accepted",
+                "yesterday",
+            ),
+            (
+                "↑",
+                "Sent game.iso to Charlie",
+                "4.2 GB  ·  declined",
+                "3 days ago",
+            ),
+            (
+                "↓",
+                "Received notes.txt from Frank",
+                "4 KB  ·  accepted",
+                "just now",
+            ),
+        ];
+        column(entries.into_iter().map(|(arrow, what, detail, when)| {
+            container(
+                row![
+                    container(center(text(arrow).size(18).font(BOLD)))
+                        .width(36)
+                        .height(36)
+                        .style(style::card),
+                    column![text(what).font(SEMIBOLD), muted(detail, 13)].spacing(2),
+                    space::horizontal(),
+                    muted(when, 13),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            )
+            .padding([8, 14])
+            .style(style::card)
+            .into()
+        }))
+        .spacing(8)
+        .into()
+    }
+
+    fn transfer_card<'a>(&self, s: &'a Sending) -> Element<'a, Message> {
+        let f = &FRIENDS[s.to];
+        container(
+            column![
+                row![
+                    text(format!("Sending {} to {}", s.file, f.name)).font(SEMIBOLD),
+                    space::horizontal(),
+                    muted(
+                        format!("{:.0}%  ·  [Direct P2P]  ·  14.2 MB/s", s.progress),
+                        13
+                    ),
+                    button(text("Cancel"))
+                        .padding([4, 12])
+                        .style(style::danger)
+                        .on_press(Message::StopSending),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                progress_bar(0.0..=100.0, s.progress)
+                    .girth(6)
+                    .style(style::progress),
+            ]
+            .spacing(10),
+        )
+        .padding([12, 16])
+        .style(style::card)
+        .into()
+    }
+
+    // -----------------------------------------------------------------------
+    // Dialogs
+    // -----------------------------------------------------------------------
+
+    /// The Accept pop-up. Decline is the filled, default button; Enter and
+    /// Escape decline (the same safe default as the TUI).
+    fn accept_dialog(&self, i: usize) -> Element<'_, Message> {
+        let r = &self.requests[i];
+        let f = &FRIENDS[r.from];
+        let file =
+            container(column![text(r.file).font(SEMIBOLD).size(16), muted(r.size, 13)].spacing(2))
+                .padding([10, 14])
+                .width(Fill)
+                .style(style::card);
+        dialog_box(
+            column![
+                row![
+                    avatar(f, 48.0),
+                    column![
+                        text(f.name).font(BOLD).size(20),
+                        muted("wants to send you a file", 14)
+                    ]
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+                file,
+                column![
+                    muted("Fingerprint", 12).font(BOLD),
+                    text(f.fingerprint).font(Font::MONOSPACE).size(13)
+                ]
+                .spacing(4),
+                muted(
+                    "Only accept files you are expecting. Enter or Esc declines.",
+                    13
+                ),
+                row![
+                    space::horizontal(),
+                    button(text("Accept"))
+                        .padding([8, 18])
+                        .style(style::secondary)
+                        .on_press(Message::Accept),
+                    button(text("Decline").font(SEMIBOLD))
+                        .padding([8, 18])
+                        .style(style::primary)
+                        .on_press(Message::Decline),
+                ]
+                .spacing(10),
+            ]
+            .spacing(16),
+        )
+    }
+
+    fn invite_dialog(&self) -> Element<'_, Message> {
+        dialog_box(
+            column![
+                text("Add a friend").font(BOLD).size(20),
+                muted(
+                    "Paste the invite your friend sent you. It starts with beam1.",
+                    14
+                ),
+                text_input("beam1…", &self.invite)
+                    .on_input(Message::Invite)
+                    .on_submit(Message::Next)
+                    .padding(10)
+                    .style(style::input),
+                row![
+                    space::horizontal(),
+                    button(text("Cancel"))
+                        .padding([8, 18])
+                        .style(style::secondary)
+                        .on_press(Message::Cancel),
+                    button(text("Next").font(SEMIBOLD))
+                        .padding([8, 18])
+                        .style(style::primary)
+                        .on_press_maybe((!self.invite.trim().is_empty()).then_some(Message::Next)),
+                ]
+                .spacing(10),
+            ]
+            .spacing(16),
+        )
+    }
+
+    fn code_dialog(&self) -> Element<'_, Message> {
+        dialog_box(
+            column![
+                text("Enter the pairing code").font(BOLD).size(20),
+                muted("Your friend's beam shows a 6-digit code. Type it here.", 14),
+                text_input("123456", &self.code)
+                    .on_input(Message::Code)
+                    .on_submit(Message::Next)
+                    .padding(12)
+                    .size(24)
+                    .font(Font::MONOSPACE)
+                    .style(style::input),
+                row![
+                    space::horizontal(),
+                    button(text("Cancel"))
+                        .padding([8, 18])
+                        .style(style::secondary)
+                        .on_press(Message::Cancel),
+                    button(text("Pair").font(SEMIBOLD))
+                        .padding([8, 18])
+                        .style(style::primary)
+                        .on_press_maybe((self.code.len() == 6).then_some(Message::Next)),
+                ]
+                .spacing(10),
+            ]
+            .spacing(16),
+        )
+    }
+
+    fn theme(&self) -> Theme {
+        style::theme(self.dark)
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let keys = keyboard::listen().filter_map(|event| match event {
+            keyboard::Event::KeyPressed { key, .. } => Some(Message::Key(key)),
+            _ => None,
+        });
+        if self.sending.is_some() {
+            Subscription::batch([
+                keys,
+                iced::time::every(Duration::from_millis(80)).map(|_| Message::Tick),
+            ])
+        } else {
+            keys
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small reusable pieces (JavaFX: a custom control or an fx:include)
+// ---------------------------------------------------------------------------
+
+fn avatar<'a>(f: &Friend, size: f32) -> Element<'a, Message> {
+    let initial = f.name.chars().next().unwrap_or('?').to_string();
+    container(center(text(initial).font(BOLD).size(size * 0.45)))
+        .width(size)
+        .height(size)
+        .style(style::avatar(f.tint))
+        .into()
+}
+
+fn muted<'a>(s: impl text::IntoFragment<'a>, size: u32) -> text::Text<'a> {
+    text(s).size(size).style(|theme: &Theme| text::Style {
+        color: Some(style::colors(theme).muted),
+    })
+}
+
+fn tab_button<'a>(label: Element<'a, Message>, tab: Tab, current: Tab) -> Element<'a, Message> {
+    button(label)
+        .padding([4, 10])
+        .style(style::tab(tab == current))
+        .on_press(Message::Tab(tab))
+        .into()
+}
+
+fn dialog_box<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(24)
+        .width(460)
+        .style(style::dialog)
+        .into()
+}
