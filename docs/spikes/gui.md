@@ -64,7 +64,7 @@ modern without effort; Slint is the runner-up.
 | Dependencies | 514 crates in the spike's tree against 382 for beam: iced, its renderers and windowing add about 130. |
 | Build time (clean, this machine) | debug 2 min 06 s, release 3 min 08 s, beam included. |
 | Arch Linux | **Not run yet.** Needs the Arch CI job (and a desktop for the window itself). Wayland and X11 are both in iced's defaults; `rfd` uses the XDG desktop portal, present on KDE/GNOME, possibly missing on a bare window manager. |
-| `cargo audit` | Not run (not installed locally); the CI audit job covers it once the GUI is in the workspace. |
+| `cargo audit` | Not run (not installed locally); the audit job (`security.yml`) covers it once the GUI is in the workspace. |
 
 ## Costs to accept
 

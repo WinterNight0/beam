@@ -2482,7 +2482,8 @@ been failing after the QoL merge.
   `Cargo.lock`, so it is not a platform test.
 * Container jobs run as **root**, which ignores file permissions: no test may
   depend on a permission being enforced (none does; the private-file tests
-  check the mode bits beam sets, which still holds).
+  check the mode bits beam sets, which still holds). *Superseded by
+  ADR-0050: the tests now run as an ordinary user.*
 * Fixed while reviewing Linux-only behaviour: the file browser (ADR-0045)
   treated `D:` as a drive letter on every platform, and its test expected
   that; drive letters are now Windows-only.
@@ -2613,3 +2614,67 @@ reviewed patch with every test passing.
   replace now goes through `beam-core/src/replace.rs`, which retries that
   one error for about a second on Windows only; see the test plan's "flaky
   tests".
+
+## ADR-0050 — CI: when it runs, tests as an ordinary user, the minimum Rust, a weekly audit
+
+**Status:** accepted (2026-10-12). Branch `RE-Arrange-Structure`, "CI/CD
+Upgrade - Patch #1". (ADR-0049 stays reserved for the GUI library choice.)
+
+**Context.** The Linux job had failed on every run since the repository went
+up, on Ubuntu and then on Arch (ADR-0046), while Windows passed. Reading the
+logs showed why it stayed red so long: `cargo test` stops at the first test
+program that fails, so each run showed one failure and hid whatever came
+after it. Two of those failures were real Linux bugs or races (the free-space
+check on a folder not made yet, and the inbox history timing; see the test
+plan). Four more gaps:
+
+* CI ran on every push to `main` and on pull requests into *any* branch,
+  yet the planned branch flow puts work into `GUI-Experimental` for weeks
+  before `main` (ADR-0048 lands there first, the GUI after).
+* The Arch container runs as root, which ignores file permissions; a test
+  that a private file really is private would pass whatever beam did.
+* `rust-version = "1.91"` was declared but never built: every job used the
+  newest stable.
+* The dependency audit ran only when code was pushed, so an advisory
+  published against an unchanged `Cargo.lock` went unnoticed.
+
+### Decision
+
+* **When CI runs:** a pull request into `main` or `GUI-Experimental`, a push
+  to `main`, or by hand (`workflow_dispatch`). A push to another branch does
+  not: a branch is checked when it is offered for merging, or on request.
+* **Every cargo command uses `--locked`** (a run that would change
+  `Cargo.lock` fails) and `--workspace`. **Tests use `--no-fail-fast`**, so
+  one run lists every failing test.
+* **The Arch job builds and tests as an ordinary user** (`builder`), as beam
+  runs for real. Only installing packages and creating the user use root.
+  This replaces ADR-0046's "no test may depend on a permission being
+  enforced".
+* **A job builds and tests with Rust 1.91**, the declared minimum, on
+  GitHub's Ubuntu image. If a dependency ever needs newer, `rust-version` is
+  raised on purpose and documented, never the job dropped. Checked locally
+  before adding it: the whole suite passes on 1.91 with `-D warnings`.
+* **The audit moves to `security.yml`**, which runs on the same events plus
+  **weekly** (Mondays 03:17 UTC). Same rule as before: a vulnerability fails,
+  an unmaintained notice warns.
+* `actions/checkout` moves to v5.1.0 (v4 ran on Node 20, which GitHub has
+  deprecated), pinned by commit hash like every action (ADR-0038).
+
+Not now: a release build and packaging (`release.yml`, with checksums), which
+belong with the first release from `main`; required status checks on `main`,
+a repository setting once CI is green; no new security tools.
+
+### Consequences
+
+* A feature branch can be pushed freely; it is checked when its pull request
+  opens and on every push after that.
+* GitHub runs scheduled workflows, and offers the "Run workflow" button,
+  only from `main`. Until `GUI-Experimental` is merged into `main`, the
+  weekly audit does not fire and a manual run may be refused; the pull
+  request runs work from the start.
+* A test may now rely on a permission being enforced on Linux, so tests such
+  as "a receive folder beam cannot write to" become possible.
+* One more Linux job per run (the minimum Rust); the audit leaving `ci.yml`
+  keeps the total about the same.
+* Supersedes the "every push and pull request" trigger of ADR-0014 and the
+  root rule of ADR-0046; both are otherwise unchanged.

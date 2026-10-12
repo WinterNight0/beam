@@ -1,0 +1,51 @@
+name: Security
+
+# Every dependency in Cargo.lock against the RustSec advisory database.
+# Unmaintained-crate notices are reported as warnings; a vulnerability fails
+# the job. See SECURITY.md.
+#
+# Separate from ci.yml because it also runs weekly (ADR-0050): a new advisory
+# can be published against a dependency while no code changes, and a weekly
+# run notices it without anyone remembering to look. GitHub runs scheduled
+# workflows from main only, so the weekly run starts once this file is there.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, GUI-Experimental]
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Actions are pinned to commit hashes, as in ci.yml.
+jobs:
+  # It reads only Cargo.lock, so it is not a platform test and runs on
+  # GitHub's standard Linux image.
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit

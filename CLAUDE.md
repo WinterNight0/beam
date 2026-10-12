@@ -57,9 +57,13 @@ beam history                   # what came and went (ADR-0043)
   `make check` = `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test`
   over the workspace. `unsafe_code = "forbid"` workspace-wide.
 - Platforms (ADR-0046): Windows and **Arch Linux** (the first Linux; others once
-  stable). CI: a Windows job and an Arch job (`archlinux:base-devel` container,
-  runs as root, so no test may rely on permissions being enforced). Keep
-  `cfg(windows)`-only helpers out of Linux builds: CI has `-D warnings`.
+  stable). CI (ADR-0050): a Windows job, an Arch job (`archlinux:base-devel`
+  container, tests run as an ordinary user, not root) and a Rust 1.91 job
+  (the MSRV; keep it equal to `rust-version`). Runs on pull requests into
+  `main` or `GUI-Experimental`, pushes to `main`, and by hand; not on other
+  pushes. `--locked`, `--no-fail-fast`. The audit is `security.yml` (also
+  weekly). Keep `cfg(windows)`-only helpers out of Linux builds: CI has
+  `-D warnings`.
 - CLI: `clap` (derive).
 - Full-screen view: `ratatui` 0.30 with its `crossterm` backend (through ratatui's
   re-export), approved for ADR-0043. Plain `beam` on a terminal opens it.
@@ -263,6 +267,12 @@ In this order, each step with its tests (ADR-0048):
   layers; `tests/layers.rs` checks core vs actions. `save_location` refuses a
   relay change without a yes; failed-send messages come back cleaned
   (SECURITY.md F-5). "Adding a feature" above; `docs/parity.md`.
+- **Post-M6 (ADR-0050)** CI/CD upgrade: runs on PRs into `main` /
+  `GUI-Experimental`, pushes to `main`, or by hand; `--locked --workspace`,
+  tests `--no-fail-fast`; Arch tests as user `builder`; a Rust 1.91 (MSRV)
+  job; `cargo audit` in `security.yml`, weekly too (scheduled runs start once
+  it is on `main`). Later: `release.yml` with checksums, required checks.
+  Branch flow: work merges into `GUI-Experimental`; `main` waits for the GUI.
 - **Next (to be planned):** the GUI (`beam-gui`, iced per SPIKE-002, ADR-0049);
   the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.

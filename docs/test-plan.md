@@ -13,9 +13,12 @@ cargo test --test end_to_end                # two real processes
 ```
 
 `make check` is the gate: a milestone is not done until it passes. CI runs the
-same three commands on Windows (`windows-latest`) and on **Arch Linux** (the
-official `archlinux:base-devel` image) for every push and pull request
-(ADR-0014, ADR-0046), so the gate is enforced rather than remembered.
+same three commands, with `--locked`, on Windows (`windows-latest`), on
+**Arch Linux** (the official `archlinux:base-devel` image, as an ordinary
+user rather than root, so permission checks mean something) and with
+**Rust 1.91**, the declared minimum (ADR-0014, ADR-0046, ADR-0050). It runs
+on every pull request into `main` or `GUI-Experimental`, every push to
+`main`, and by hand, so the gate is enforced rather than remembered.
 
 ## Test levels
 
@@ -215,6 +218,31 @@ than once, and both would have failed in CI eventually.
   `a_file_that_stays_held_still_fails_after_about_a_second`). The same stress
   run then passed 180 of 180, against 58 of 72 before. The wait in the test
   now prints the receiver's output if it ever fails again.
+
+### Linux-only failures that CI hid (2026-10-12)
+
+The Linux CI job had failed on every run, each time on a different test,
+because `cargo test` stops at the first failing test program and the rest
+never ran. Reading each run's log (`gh run view --log-failed`) found:
+
+- **A real bug: "no space" for a folder not made yet.** Before the prompt,
+  the receiver checks the free space of the destination folder. Linux
+  cannot measure a folder that does not exist (Windows can), and the error
+  was reported as "not enough space", so every request was refused. It
+  showed in `hostile_peer.rs`, whose `out` folder is made only after
+  Accept; for a person, it happens if the receive folder is deleted while
+  `listen` or the agent runs. The check now measures the nearest folder
+  that exists, which is on the same disk
+  (`storage::tests::a_destination_not_made_yet_is_measured_by_the_folder_it_will_be_in`).
+- **A test race: the inbox history line.** The agent answers the sender
+  first and writes its history line just after, so on Linux the test could
+  read the history before the line existed. `tui::inbox`'s two tests now
+  wait for it.
+- Earlier, fixed then: the file browser read `D:` as a drive letter on
+  every platform (ADR-0046).
+
+CI now runs tests with `--no-fail-fast`, so one run reports every failure
+(ADR-0050).
 
 ## Implemented (M4)
 
@@ -535,7 +563,7 @@ invite by chat and the code by another channel; the other runs `beam pair
 | **S-33 only `https://` public relays from invites** (F-3) | `invite::an_http_or_local_relay_in_an_invite_is_dropped_not_used` (http, private IPv4, loopback v4/v6, `localhost`, `*.local`; the rest of the invite still counts); a public https relay is kept |
 | What counts as a public address | `transport::endpoint::only_internet_reachable_addresses_count_as_public` (private, CGNAT, link-local, unique-local, documentation ranges are not) |
 | F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
-| S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
+| S-35 dependency audit | the `audit` job in `.github/workflows/security.yml` (also weekly, ADR-0050); manual results in `SECURITY.md` §7 |
 
 ## Implemented (post-M6): the full-screen view and history (ADR-0043)
 
