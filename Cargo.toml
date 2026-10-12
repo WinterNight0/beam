@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-# The layers, from the bottom up (ADR-0048): beam-core (core + actions), then
-# the front ends in beam (CLI + full-screen view). A crate may only depend on
-# the ones before it.
-members = ["crates/beam-core", "crates/beam"]
+# The layers, from the bottom up (ADR-0048): beam-core (core + actions),
+# beam-model (what a screen shows), then the front ends in beam (CLI +
+# full-screen view). A crate may only depend on the ones before it.
+members = ["crates/beam-core", "crates/beam-model", "crates/beam"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,6 +16,7 @@ repository = ""
 # crate names what it uses with `name.workspace = true`.
 [workspace.dependencies]
 beam-core = { path = "crates/beam-core" }
+beam-model = { path = "crates/beam-model" }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"

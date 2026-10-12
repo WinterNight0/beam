@@ -11,44 +11,13 @@
 //! (ADR-0034): the file name comes from the sender.
 
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
 
 use beam_core::actions::inbox::{Address, ConnectError, Inbox, InboxEvent};
 
 pub use beam_core::actions::inbox::RequestView;
 
-/// What the agent said.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InboxUpdate {
-    Connected {
-        receive_dir: String,
-    },
-    Request {
-        id: u64,
-        request: RequestView,
-        expires_in: Duration,
-    },
-    /// No longer waiting: answered (here or elsewhere), expired, withdrawn.
-    Closed {
-        id: u64,
-    },
-    Progress {
-        done: u64,
-        total: u64,
-        relay: bool,
-    },
-    Finished {
-        ok: bool,
-        text: String,
-    },
-    TooLate {
-        id: u64,
-    },
-    /// The link is gone: the agent stopped, or could not be reached.
-    Gone {
-        reason: String,
-    },
-}
+/// What the agent said: the model's own message (beam-model).
+pub use beam_model::requests::Update as InboxUpdate;
 
 /// A connection to the agent, on its own thread.
 pub struct InboxLink {

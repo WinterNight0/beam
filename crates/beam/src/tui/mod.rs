@@ -335,11 +335,11 @@ fn connect_inbox(store: &Store, link: &mut Option<inbox::InboxLink>, app: &mut A
     match beam_core::actions::inbox::find(store) {
         Ok(address) => {
             *link = Some(inbox::InboxLink::connect(address.port, address.token));
-            if !matches!(app.link, pending::Link::Lost(_)) {
-                app.link = pending::Link::Connecting;
+            if !matches!(app.requests.link, pending::Link::Lost(_)) {
+                app.requests.link = pending::Link::Connecting;
             }
         }
-        Err(_) => app.link = pending::Link::Off,
+        Err(_) => app.requests.link = pending::Link::Off,
     }
 }
 

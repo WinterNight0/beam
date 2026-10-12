@@ -20,15 +20,8 @@ use beam_core::transfer::{Progress, Reporter};
 use beam_core::transport::endpoint::Bind;
 use beam_core::{text, untrusted};
 
-/// What the sending thread tells the view.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SendUpdate {
-    /// Looking for the friend.
-    Dialling,
-    Progress(Progress),
-    /// How it ended, in words for the person.
-    Finished(Result<String, String>),
-}
+/// What the sending thread tells the view: the model's own message.
+pub use beam_model::sending::Update as SendUpdate;
 
 /// A send running in the background.
 pub struct Outgoing {

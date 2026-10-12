@@ -20,14 +20,8 @@ use beam_core::identity::Store;
 use beam_core::transport::endpoint::Bind;
 use beam_core::untrusted;
 
-/// What the receiving thread tells the view.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RecvUpdate {
-    /// Listening, saving to this folder.
-    Started { receive_dir: String },
-    /// Not listening any more; why, if it was not asked to stop.
-    Stopped(Option<String>),
-}
+/// What the receiving thread tells the view: the model's own message.
+pub use beam_model::requests::SwitchUpdate as RecvUpdate;
 
 /// The receiver while the switch is on.
 pub struct InView {

@@ -18,9 +18,10 @@ path = "src/main.rs"
 workspace = true
 
 # The front ends: the CLI and the full-screen view. Everything they share is
-# in beam-core (ADR-0048). Versions are set in the workspace Cargo.toml.
+# in beam-core and beam-model (ADR-0048). Versions are set in the workspace Cargo.toml.
 [dependencies]
 beam-core.workspace = true
+beam-model.workspace = true
 base64.workspace = true
 clap.workspace = true
 dirs.workspace = true

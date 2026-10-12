@@ -29,7 +29,7 @@ const CORE: &[&str] = &[
 ];
 
 /// The layers above the core, as they would be named from inside it.
-const ABOVE: &[&str] = &["actions", "beam", "cli", "tui", "ui"];
+const ABOVE: &[&str] = &["actions", "beam", "beam_model", "cli", "tui", "ui"];
 
 fn rust_files(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_dir() {
@@ -59,10 +59,14 @@ fn names_a_layer_above(line: &str) -> Option<&'static str> {
                 .split(['}', ','])
                 .any(|name| name.trim() == *layer)
         });
-        let front_end_crate = *layer == "beam"
-            && code
-                .match_indices("beam::")
-                .any(|(i, _)| !code[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+        // A crate above, named by its own path: `beam::…`, `beam_model::…`.
+        let crate_above = |name: &str| {
+            *layer == name
+                && code
+                    .match_indices(&format!("{name}::"))
+                    .any(|(i, _)| !code[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+        };
+        let front_end_crate = crate_above("beam") || crate_above("beam_model");
         names("crate::", layer) || front_end_crate || braced
     })
 }
@@ -120,7 +124,15 @@ fn every_module_is_placed_in_a_layer() {
 fn the_core_crate_depends_on_no_front_end_library() {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
-    for front_end in ["ratatui", "crossterm", "clap", "iced", "rfd", "\nbeam "] {
+    for front_end in [
+        "ratatui",
+        "crossterm",
+        "clap",
+        "iced",
+        "rfd",
+        "\nbeam ",
+        "beam-model",
+    ] {
         assert!(
             !manifest.contains(&format!("{front_end}.workspace"))
                 && !manifest.contains(&format!("{front_end} =")),
@@ -140,6 +152,10 @@ fn the_check_catches_what_it_should() {
         Some("actions")
     );
     assert_eq!(names_a_layer_above("use beam::cli::Io;"), Some("beam"));
+    assert_eq!(
+        names_a_layer_above("use beam_model::Ask;"),
+        Some("beam_model")
+    );
     assert_eq!(names_a_layer_above("use crate::untrusted;"), None);
     assert_eq!(
         names_a_layer_above("use crate::{transfer, transport};"),

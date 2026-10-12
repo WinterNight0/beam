@@ -9,51 +9,11 @@
 //! hidden (Esc): the header keeps a "⇡ 45 %" pill, and `s` brings it back.
 //! Leaving beam mid-send asks first, starting on No.
 
-use super::app::{App, Choice, Effect, Key, Modal, Target};
+use super::app::{App, Ask, Choice, Effect, Key, LeaveMidTransfer, Modal, Target};
 use super::browse::{Browser, Chosen, Pane, Row};
 use super::sending::SendUpdate;
-use beam_core::transfer::Progress;
-use beam_core::transport::PathKind;
 
-/// Where a send has got to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stage {
-    Starting,
-    Dialling,
-    /// Reading the file to hash it.
-    Hashing {
-        done: u64,
-        total: u64,
-    },
-    /// The request is with them; a person has to say yes.
-    Waiting,
-    Moving {
-        done: u64,
-        total: u64,
-        relay: bool,
-    },
-    /// They are checking the whole file.
-    Checking {
-        done: u64,
-        total: u64,
-    },
-}
-
-/// The one send the view runs at a time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Sending {
-    pub peer: String,
-    pub file: String,
-    pub stage: Stage,
-    /// Set when it ended: what to tell the person.
-    pub result: Option<Result<String, String>>,
-}
-
-impl Sending {
-    pub fn running(&self) -> bool {
-        self.result.is_none()
-    }
-}
+pub use beam_model::sending::{Sending, Stage};
 
 impl App {
     /// `s`: the send pop-up if a send is running, else the file browser for
@@ -222,66 +182,43 @@ impl App {
         let Some(sending) = self.sending.as_mut() else {
             return;
         };
-        match update {
-            SendUpdate::Dialling => sending.stage = Stage::Dialling,
-            SendUpdate::Progress(progress) => {
-                sending.stage = match progress {
-                    Progress::Hashing { done, total } => Stage::Hashing { done, total },
-                    Progress::AwaitingAccept => Stage::Waiting,
-                    Progress::Accepted { path } => Stage::Moving {
-                        done: 0,
-                        total: 0,
-                        relay: path == PathKind::Relay,
-                    },
-                    Progress::Transferring { done, total, path } => Stage::Moving {
-                        done,
-                        total,
-                        relay: path == PathKind::Relay,
-                    },
-                    Progress::PeerVerifying { done, total } => Stage::Checking { done, total },
-                    _ => sending.stage,
-                };
-            }
-            SendUpdate::Finished(result) => {
-                self.flash = Some(match &result {
-                    Ok(message) | Err(message) => message.clone(),
-                });
-                if matches!(self.modal, Some(Modal::SendStatus)) {
-                    sending.result = Some(result);
-                } else {
-                    // Hidden: the status bar says how it ended.
-                    self.sending = None;
-                }
-            }
+        let Some(result) = sending.on_update(update) else {
+            return;
+        };
+        self.flash = Some(match &result {
+            Ok(message) | Err(message) => message.clone(),
+        });
+        if matches!(self.modal, Some(Modal::SendStatus)) {
+            sending.result = Some(result);
+        } else {
+            // Hidden: the status bar says how it ended.
+            self.sending = None;
         }
     }
 
     /// Ctrl+Q, `q` or `:quit`: leaves, unless a file is still going out,
     /// which asks first.
     pub(super) fn request_quit(&mut self) {
-        let arriving = self.switch == super::pending::Switch::On && self.receiving.is_some();
+        let arriving = self.requests.arriving_here();
         if self.sending.as_ref().is_some_and(Sending::running) || arriving {
             self.palette = None;
-            self.modal = Some(Modal::ConfirmQuit { focus: Choice::No });
+            self.modal = Some(Modal::ConfirmQuit(Ask::new(LeaveMidTransfer)));
         } else {
             self.quit = true;
         }
     }
 
-    pub(super) fn on_confirm_quit_key(&mut self, focus: Choice, key: Key) {
-        let focus = match key {
+    pub(super) fn on_confirm_quit_key(&mut self, mut ask: Ask<LeaveMidTransfer>, key: Key) {
+        match key {
             Key::Esc => return,
             Key::Enter => {
-                self.quit = focus == Choice::Yes;
+                self.quit = ask.focus() == Choice::Yes;
                 return;
             }
-            Key::Left | Key::Right | Key::Tab | Key::BackTab => match focus {
-                Choice::Yes => Choice::No,
-                Choice::No => Choice::Yes,
-            },
-            _ => focus,
-        };
-        self.modal = Some(Modal::ConfirmQuit { focus });
+            Key::Left | Key::Right | Key::Tab | Key::BackTab => ask.flip(),
+            _ => {}
+        }
+        self.modal = Some(Modal::ConfirmQuit(ask));
     }
 }
 
@@ -301,8 +238,10 @@ pub fn unquote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::Owner;
     use crate::tui::app::{Agent, Event, Friend, Snapshot};
-    use crate::tui::pending::Owner;
+    use beam_core::transfer::Progress;
+    use beam_core::transport::PathKind;
 
     fn app() -> App {
         let mut app = App::new(Snapshot {
@@ -471,7 +410,10 @@ mod tests {
         });
         app.on_key(Key::Quit);
         assert!(!app.quit);
-        assert_eq!(app.modal, Some(Modal::ConfirmQuit { focus: Choice::No }));
+        assert_eq!(
+            app.modal,
+            Some(Modal::ConfirmQuit(Ask::new(LeaveMidTransfer)))
+        );
         app.on_key(Key::Enter);
         assert!(!app.quit, "Enter alone stays");
         app.on_key(Key::Quit);
