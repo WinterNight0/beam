@@ -75,6 +75,23 @@ impl Outgoing {
     }
 }
 
+/// Why the friend could not be reached, as `beam send` says it. Cleaned
+/// here because the view draws it as it is, and the reason can quote the
+/// network: a peer chooses the reason it gives for closing a connection.
+/// (`beam send` cleans when it prints; this text never passes there.)
+fn unreachable(
+    peer: &str,
+    key: &ed25519_dalek::VerifyingKey,
+    error: crate::transport::dial::DialError,
+) -> String {
+    untrusted::lines(&crate::cli::net_cmds::unreachable_message(peer, key, error).to_string())
+}
+
+/// A refusal from the friend, as `beam send` says it, cleaned for the view.
+fn refused(peer: &str, error: crate::transfer::TransferError) -> String {
+    untrusted::lines(&crate::cli::net_cmds::refused_message(peer, error).to_string())
+}
+
 /// Passes the engine's progress to the view.
 struct ToView<'a>(&'a Sender<SendUpdate>);
 
@@ -127,12 +144,12 @@ fn run(
             let _ = updates.send(SendUpdate::Dialling);
             let connection = dial_transfer(&endpoint, peer_addr).await.map_err(|e| {
                 ended = Some((history::Outcome::Failed, Some("not reachable".to_string())));
-                crate::cli::net_cmds::unreachable_message(&peer_name, &peer_key, e).to_string()
+                unreachable(&peer_name, &peer_key, e)
             })?;
             *live.lock().expect("not poisoned") = Some(connection.clone());
             let sent = send_on(&connection, &mut options, &mut ToView(updates)).await;
             ended = Some(history::send_outcome(&sent));
-            sent.map_err(|e| crate::cli::net_cmds::refused_message(&peer_name, e).to_string())
+            sent.map_err(|e| refused(&peer_name, e))
         };
         let outcome = tokio::select! {
             outcome = attempt => outcome,
@@ -298,6 +315,151 @@ mod tests {
             crate::history::read(&bob.store)[0].outcome,
             crate::history::Outcome::Declined
         );
+    }
+
+    /// bob, with two friends whose agents are both up and reachable: a send
+    /// meant for one must never reach the other (safety net for moving the
+    /// send flow into one shared place).
+    struct TwoFriends {
+        alice: crate::tui::inbox::tests::with_an_agent::Home,
+        alice_link: InboxLink,
+        carol: crate::tui::inbox::tests::with_an_agent::Home,
+        carol_link: InboxLink,
+        bob: crate::tui::inbox::tests::with_an_agent::Home,
+        /// Dropping these stops the agents.
+        _stops: Vec<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    async fn bob_with_two_friends() -> TwoFriends {
+        let (alice, carol, bob) = (home("alice"), home("carol"), home("bob"));
+        pair(&alice, "bob", &bob, "alice");
+        pair(&carol, "bob", &bob, "carol");
+        std::fs::write(bob.store.config_path(), "relay = \"none\"\n").unwrap();
+        let mut stops = Vec::new();
+        let mut links = Vec::new();
+        for friend in [&alice, &carol] {
+            let (status, stop) = start_agent(friend).await;
+            stops.push(stop);
+            let invite: crate::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
+            let mut known = bob.store.load_known_peers().unwrap();
+            crate::invite::remember(
+                known.lookup_key_mut(&invite.key).unwrap(),
+                &invite,
+                &crate::config::Relay::Disabled,
+            );
+            bob.store.save_known_peers(&known).unwrap();
+            let link = InboxLink::connect(status.port, status.token.clone());
+            next(&link, |u| matches!(u, InboxUpdate::Connected { .. })).await;
+            links.push(link);
+        }
+        let carol_link = links.pop().unwrap();
+        let alice_link = links.pop().unwrap();
+        TwoFriends {
+            alice,
+            alice_link,
+            carol,
+            carol_link,
+            bob,
+            _stops: stops,
+        }
+    }
+
+    /// The file is at carol's, nothing is at alice's, and alice was never
+    /// even asked.
+    fn only_carol_got_it(two: &TwoFriends, file: &str) {
+        assert_eq!(
+            std::fs::read(two.carol.inbox.join(file)).unwrap(),
+            b"for carol only"
+        );
+        assert!(!two.alice.inbox.join(file).exists());
+        while let Ok(update) = two.alice_link.updates.try_recv() {
+            assert!(
+                !matches!(update, InboxUpdate::Request { .. }),
+                "alice was asked: {update:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_from_the_view_reaches_the_chosen_friend_and_no_other() {
+        let two = bob_with_two_friends().await;
+        let path = two.bob.files.join("for-carol.txt");
+        std::fs::write(&path, b"for carol only").unwrap();
+        let out = Outgoing::start_on(two.bob.store.clone(), "carol".into(), path, Bind::Loopback);
+        let seen = until_finished(&out, &two.carol_link, Some(true)).await;
+        assert!(
+            matches!(seen.last(), Some(SendUpdate::Finished(Ok(_)))),
+            "{seen:?}"
+        );
+        only_carol_got_it(&two, "for-carol.txt");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn beam_send_reaches_the_chosen_friend_and_no_other() {
+        let two = bob_with_two_friends().await;
+        let path = two.bob.files.join("for-carol.txt");
+        std::fs::write(&path, b"for carol only").unwrap();
+        let argv = vec![
+            "--beam-dir".to_string(),
+            two.bob.store.dir().display().to_string(),
+            "send".to_string(),
+            "carol".to_string(),
+            path.display().to_string(),
+            "--loopback".to_string(),
+        ];
+        // `beam send` runs its own runtime, so it gets a plain thread.
+        let cli = std::thread::spawn(move || {
+            let mut input: &[u8] = b"";
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = crate::cli::execute(
+                argv,
+                &mut crate::cli::Io {
+                    input: &mut input,
+                    out: &mut out,
+                    err: &mut err,
+                },
+            );
+            (code, String::from_utf8_lossy(&err).into_owned())
+        });
+        let InboxUpdate::Request { id, .. } = next(&two.carol_link, |u| {
+            matches!(u, InboxUpdate::Request { .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        two.carol_link.answer(id, true);
+        let (code, err) = tokio::task::spawn_blocking(move || cli.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, crate::cli::EXIT_OK, "{err}");
+        only_carol_got_it(&two, "for-carol.txt");
+    }
+
+    /// What the view shows when a send fails can quote the other side (the
+    /// reason a peer gives for closing, a cancel reason); none of it may
+    /// reach the screen as control characters (ADR-0035).
+    #[test]
+    fn failure_messages_for_the_view_carry_no_control_characters() {
+        use crate::transfer::TransferError;
+        use crate::transport::dial::DialError;
+        let key = crate::identity::Identity::generate("x")
+            .unwrap()
+            .verifying_key();
+        let hostile = "closed by peer: \u{1b}[2J\u{1b}]0;owned\u{7}gone";
+        let not_reached = unreachable("alice", &key, DialError::Unreachable(hostile.into()));
+        assert!(not_reached.contains("alice is not reachable") || not_reached.contains("alice ("));
+        for shown in [
+            not_reached,
+            refused("alice", TransferError::Cancelled(hostile.into())),
+            refused("alice", TransferError::BadRequest(hostile.into())),
+        ] {
+            assert!(shown.contains("gone"), "the reason is still there: {shown}");
+            assert!(
+                !shown.chars().any(|c| c.is_control() && c != '\n'),
+                "{shown:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

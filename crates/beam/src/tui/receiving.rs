@@ -173,6 +173,64 @@ mod tests {
         assert!(matches!(status::read(&alice.store), Running::No));
     }
 
+    /// The switch, as the view starts it, does not pair: a stranger who
+    /// finds it cannot even open the pairing protocol, so cannot try codes
+    /// (safety net for moving the switch into one shared place; R-8).
+    #[test]
+    fn the_switch_never_offers_pairing() {
+        let alice = home("alice");
+        std::fs::write(alice.store.config_path(), "relay = \"none\"\nport = 0\n").unwrap();
+        let mut on = InView::start_on(alice.store.clone(), Bind::Loopback, false);
+        assert!(matches!(next(&on), RecvUpdate::Started { .. }));
+        let mut invite = None;
+        for _ in 0..600 {
+            if let Running::Yes(status) = status::read(&alice.store)
+                && let Some(text) = status.invite
+            {
+                invite = Some(text);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let at = invite
+            .expect("the switch published its invite")
+            .parse::<crate::invite::Invite>()
+            .unwrap()
+            .endpoint_addr();
+
+        let stranger = home("stranger");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let refused = runtime.block_on(async {
+            let endpoint = crate::transport::endpoint::bind(
+                &stranger.identity,
+                &crate::config::Relay::Disabled,
+                Bind::Loopback,
+                0,
+                &[],
+            )
+            .await
+            .unwrap();
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(30),
+                endpoint.connect(at, crate::transport::endpoint::PAIR_ALPN),
+            )
+            .await
+            .expect("the attempt hung");
+            endpoint.close().await;
+            attempt.is_err()
+        });
+        assert!(
+            refused,
+            "the Receiving switch accepted a pairing connection"
+        );
+
+        on.stop();
+        assert_eq!(next(&on), RecvUpdate::Stopped(None));
+    }
+
     #[test]
     fn it_will_not_start_beside_a_running_listen() {
         let alice = home("alice");
