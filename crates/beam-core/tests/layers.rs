@@ -2,12 +2,12 @@
 //!
 //! The core is everything that makes beam secure and correct: identity,
 //! pairing, transfers, the listener, the agent. Above it sit the actions
-//! (`actions/`, one copy of each flow) and the front ends (`cli/`, `tui/`,
-//! `ui.rs`). A core module that printed, drew, or called into a front end
-//! would tie every front end to that one, and is refused here.
+//! (`actions/`, one copy of each flow, in this crate too) and the front ends
+//! (the `beam` crate: CLI and full-screen view).
 //!
-//! Once the core is its own crate, Cargo enforces the front-end half of
-//! this by itself; the `actions` half stays a test.
+//! Cargo enforces the front-end half: this crate does not depend on `beam`
+//! or on any terminal or GUI library, so it cannot name them. The actions
+//! share this crate with the core, so that half is checked here.
 
 use std::path::{Path, PathBuf};
 
@@ -28,8 +28,8 @@ const CORE: &[&str] = &[
     "untrusted.rs",
 ];
 
-/// What the core may not name.
-const ABOVE: &[&str] = &["actions", "cli", "tui", "ui"];
+/// The layers above the core, as they would be named from inside it.
+const ABOVE: &[&str] = &["actions", "beam", "cli", "tui", "ui"];
 
 fn rust_files(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_dir() {
@@ -41,20 +41,29 @@ fn rust_files(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `crate::cli`, `crate::{ui, …}`, `crate::cli::…` and the like.
+/// `crate::actions`, `crate::{actions, …}`, `beam::cli` and the like.
 fn names_a_layer_above(line: &str) -> Option<&'static str> {
     let code = line.split("//").next().unwrap_or("");
+    let names = |prefix: &str, layer: &str| {
+        let direct = format!("{prefix}{layer}");
+        code.match_indices(&direct).any(|(i, _)| {
+            let before_ok = !code[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+            let after_ok =
+                !code[i + direct.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
+            before_ok && after_ok
+        })
+    };
     ABOVE.iter().copied().find(|layer| {
-        let direct = format!("crate::{layer}");
-        let at = code.match_indices(&direct).any(|(i, _)| {
-            !code[i + direct.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
-        });
         let braced = code.find("crate::{").is_some_and(|i| {
             code[i + "crate::{".len()..]
                 .split(['}', ','])
                 .any(|name| name.trim() == *layer)
         });
-        at || braced
+        let front_end_crate = *layer == "beam"
+            && code
+                .match_indices("beam::")
+                .any(|(i, _)| !code[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+        names("crate::", layer) || front_end_crate || braced
     })
 }
 
@@ -95,38 +104,47 @@ fn the_core_never_uses_the_layers_above_it() {
 #[test]
 fn every_module_is_placed_in_a_layer() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let placed: Vec<&str> = CORE
-        .iter()
-        .copied()
-        .chain(["actions", "cli", "tui", "ui.rs", "lib.rs", "main.rs"])
-        .collect();
+    let placed: Vec<&str> = CORE.iter().copied().chain(["actions", "lib.rs"]).collect();
     for entry in std::fs::read_dir(&src).unwrap() {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
         assert!(
             placed.contains(&name.as_str()),
-            "src/{name} is in no layer: add it to CORE in tests/layers.rs, or to the layer it belongs to"
+            "src/{name} is in no layer: add it to CORE in tests/layers.rs, or under actions/"
+        );
+    }
+}
+
+/// The crate that holds the core lists no front-end library: the compiler,
+/// not this test, then keeps terminal and GUI code out of it.
+#[test]
+fn the_core_crate_depends_on_no_front_end_library() {
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    for front_end in ["ratatui", "crossterm", "clap", "iced", "rfd", "\nbeam "] {
+        assert!(
+            !manifest.contains(&format!("{front_end}.workspace"))
+                && !manifest.contains(&format!("{front_end} =")),
+            "beam-core depends on {front_end:?}"
         );
     }
 }
 
 #[test]
 fn the_check_catches_what_it_should() {
-    assert_eq!(names_a_layer_above("use crate::cli::Io;"), Some("cli"));
-    assert_eq!(
-        names_a_layer_above("use crate::{text, ui, untrusted};"),
-        Some("ui")
-    );
     assert_eq!(
         names_a_layer_above("    crate::actions::messages::refused(p, e)"),
         Some("actions")
     );
+    assert_eq!(
+        names_a_layer_above("use crate::{actions, untrusted};"),
+        Some("actions")
+    );
+    assert_eq!(names_a_layer_above("use beam::cli::Io;"), Some("beam"));
     assert_eq!(names_a_layer_above("use crate::untrusted;"), None);
     assert_eq!(
         names_a_layer_above("use crate::{transfer, transport};"),
         None
     );
-    assert_eq!(
-        names_a_layer_above("// see crate::cli for the commands"),
-        None
-    );
+    assert_eq!(names_a_layer_above("// see crate::actions"), None);
+    assert_eq!(names_a_layer_above("use beam_core::identity;"), None);
 }

@@ -513,7 +513,7 @@ create the identity (ADR-0045). `beam ui cli` turns the view off. Details:
 | **The relay** (n0's by default) | which keys are connected to it, which pairs talk, when, how many bytes, IP addresses | file names, contents, the pairing code, anything inside the encrypted connection |
 | **Anyone who reads your invite** | your public key, your addresses, which relay you use | anything else; they cannot pair without the code |
 | **Someone on the network path** | that encrypted UDP traffic flows | everything inside it |
-| **n0's discovery service** | nothing: beam never uses it (`tests/no_n0_discovery.rs`) | |
+| **n0's discovery service** | nothing: beam never uses it (`crates/beam-core/tests/no_n0_discovery.rs`) | |
 
 Use `relay = "none"` to take n0 out of the picture entirely. Then only devices
 that can reach each other directly can connect: the same LAN, a shared VPN, or

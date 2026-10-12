@@ -253,7 +253,7 @@ fingerprints. The successful case then runs `listen` and `send` between the two
 freshly paired homes, so pairing is shown to produce a `known_peers` entry the
 transfer engine accepts.
 
-### S-17 — `tests/no_n0_discovery.rs`
+### S-17 — `crates/beam-core/tests/no_n0_discovery.rs`
 
 iroh cannot report which address lookup services a bound endpoint has, so the
 test checks the source: no `presets::N0`, pkarr or DNS lookup, `address_lookup`
@@ -540,7 +540,7 @@ file is given.
 | F-39 classic Windows console (ADR-0047) | `tests::the_classic_console_keys_paste_and_copy`, `the_classic_console_is_told_apart_from_modern_terminals`, `app::tests::ctrl_v_reads_the_clipboard_only_where_something_is_typed`, `m_gives_the_mouse_to_the_terminal_and_back_but_is_a_letter_when_typing`; manual: run `beam` from `conhost.exe` and paste an invite with Ctrl+V |
 | Restructure safety net (before ADR-0048): a send reaches only the chosen friend; the Receiving switch never pairs; the view's failure messages are cleaned (SECURITY.md F-5) | `sending::tests::a_send_from_the_view_reaches_the_chosen_friend_and_no_other`, `beam_send_reaches_the_chosen_friend_and_no_other` (the CLI path), `actions::messages::tests::messages_come_back_cleaned`, `both_key_change_messages_warn_of_impersonation`, `receiving::tests::the_switch_never_offers_pairing` |
 | Actions (ADR-0048): one send, pairing, receiver and inbox flow for every front end | `actions::receive::tests::both_places_receive_by_the_same_rules`, `port_mapping_is_off_unless_asked_for`; `actions::pair::tests::a_relay_change_is_not_saved_without_a_yes`, `new_addresses_are_saved_and_the_key_is_kept`, `a_stranger_is_not_already_paired`; `actions::inbox::tests::a_request_is_cleaned_and_its_resume_described`; the send path is covered by the safety-net row above and every existing send, pairing, agent and end-to-end test, which now run through the actions |
-| Layers (ADR-0048): the core never uses the actions or a front end | `tests/layers.rs::the_core_never_uses_the_layers_above_it`, `every_module_is_placed_in_a_layer` |
+| Layers (ADR-0048): the core never uses the actions or a front end | `crates/beam-core/tests/layers.rs::the_core_never_uses_the_layers_above_it`, `every_module_is_placed_in_a_layer`, `the_core_crate_depends_on_no_front_end_library` (the crate split makes Cargo enforce the front-end half) |
 | Keys, mouse, terminal | `tests::ctrl_c_copies_ctrl_q_quits_and_other_ctrl_keys_are_ignored`, `left_clicks_and_the_wheel_count_and_mouse_moves_do_not`, `view::tests::clicking_where_a_friend_was_drawn_selects_them`, `a_tiny_terminal_does_not_panic`, `input::tests::*` |
 
 ## Implemented (post-M6): background agent (ADR-0042)

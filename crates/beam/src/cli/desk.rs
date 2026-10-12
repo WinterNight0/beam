@@ -410,7 +410,6 @@ pub mod testing {
 mod tests {
     use super::testing::desk;
     use super::*;
-    use crate::identity::vectors;
 
     fn transfer(peer: &str, file: &str) -> Question {
         Question::Transfer(PromptRequest {
@@ -426,8 +425,12 @@ mod tests {
         Question::Pairing(ConfirmRequest {
             role: Role::Waiter,
             name: name.into(),
-            peer_fingerprint: vectors::identity("alpha").fingerprint(),
-            own_fingerprint: vectors::identity("bravo").fingerprint(),
+            peer_fingerprint: crate::identity::Identity::generate("alpha")
+                .unwrap()
+                .fingerprint(),
+            own_fingerprint: crate::identity::Identity::generate("bravo")
+                .unwrap()
+                .fingerprint(),
         })
     }
 

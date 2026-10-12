@@ -90,7 +90,7 @@ across the workspace (`unsafe_code = "forbid"`).
 | **The invite** (key, relay, IP addresses) | Whoever you send it to, and anyone who reads that chat. It is not a password, but it reveals your addresses. |
 | **The relay** (n0's public one by default) | Sees your public IP, which keys connect through it, when, and how many bytes. Cannot read or alter the encrypted connection. Set `relay = "none"` to avoid it (section 5). |
 | **UDP port 7820** while `listen` runs | `listen` binds a fixed port so its invite stays stable. iroh also asks your router to forward it (UPnP, NAT-PMP or PCP) when the router allows that. So a running `listen` may be reachable from the internet. Anyone who reaches it can try to pair (R-8), but transfers from unknown keys are refused. |
-| **n0's discovery service** | Nothing: beam never uses it, and a test fails if anyone adds it (`tests/no_n0_discovery.rs`). |
+| **n0's discovery service** | Nothing: beam never uses it, and a test fails if anyone adds it, in any of beam's crates (`crates/beam-core/tests/no_n0_discovery.rs`). |
 
 ## 5. Using beam safely
 

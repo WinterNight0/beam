@@ -1,0 +1,36 @@
+[package]
+name = "beam-core"
+description = "beam's core and shared actions: identity, pairing, transfers, transport, the agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "beam_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# No terminal or GUI library belongs here: the core never prints or draws
+# (ADR-0048). Versions are set in the workspace Cargo.toml.
+[dependencies]
+base64.workspace = true
+dirs.workspace = true
+ed25519-dalek.workspace = true
+fs4.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+iroh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+spake2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+toml.workspace = true
+zeroize.workspace = true

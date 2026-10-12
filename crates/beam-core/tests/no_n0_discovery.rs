@@ -36,14 +36,37 @@ fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The source of the crate, without comments: the rule is about what the
-/// code does, and the doc comments that explain the rule have to name the
-/// things they forbid.
+/// The source of every crate in the workspace (the core, the front ends,
+/// and any added later), without comments: the rule is about what the code
+/// does, and the doc comments that explain the rule have to name the things
+/// they forbid. All crates, not just this one: a front end could build an
+/// endpoint of its own (ADR-0048).
 fn code_lines() -> Vec<(PathBuf, usize, String)> {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/ holds this crate");
     let mut files = Vec::new();
-    rust_files(&crate_dir.join("src"), &mut files);
+    let mut crate_count = 0;
+    for entry in std::fs::read_dir(crates).expect("read crates/") {
+        let src = entry.expect("dir entry").path().join("src");
+        if src.is_dir() {
+            crate_count += 1;
+            rust_files(&src, &mut files);
+        }
+    }
+    assert!(
+        crate_count >= 2,
+        "found only {crate_count} crates under crates/"
+    );
     assert!(files.len() > 10, "found only {} source files", files.len());
+    for must in ["transport", "cli"] {
+        assert!(
+            files
+                .iter()
+                .any(|f| f.components().any(|c| c.as_os_str() == must)),
+            "the scan missed src/{must}: it must cover the core and the front ends"
+        );
+    }
 
     let mut lines = Vec::new();
     for file in files {
