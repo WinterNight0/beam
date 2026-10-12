@@ -6,8 +6,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::text;
-use crate::transfer::{Progress, Reporter};
+use beam_core::text;
+use beam_core::transfer::{Progress, Reporter};
 
 /// Lines typed at the keyboard.
 ///

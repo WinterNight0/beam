@@ -190,8 +190,8 @@ impl Browser {
             Err(e) => {
                 self.error = Some(format!(
                     "Can't open {}: {}",
-                    crate::untrusted::name(&dir.display().to_string()),
-                    crate::untrusted::text(&e.to_string())
+                    beam_core::untrusted::name(&dir.display().to_string()),
+                    beam_core::untrusted::text(&e.to_string())
                 ));
                 Err(())
             }
@@ -233,7 +233,7 @@ impl Browser {
             } else {
                 self.error = Some(format!(
                     "Nothing at {}.",
-                    crate::untrusted::name(&path.display().to_string())
+                    beam_core::untrusted::name(&path.display().to_string())
                 ));
             }
             return Chosen::Nothing;

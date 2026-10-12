@@ -384,7 +384,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some(out) = app.sending.as_ref().filter(|s| s.running()) {
         let what = match out.stage {
             Stage::Moving { done, total, .. } if total > 0 => {
-                format!("{} %", crate::text::percent(done, total))
+                format!("{} %", beam_core::text::percent(done, total))
             }
             Stage::Waiting => "waiting".to_string(),
             _ => "…".to_string(),
@@ -397,7 +397,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     if let Some(live) = app.receiving {
         right.push(Span::styled(
-            format!(" ⇣ {} % ", crate::text::percent(live.done, live.total)),
+            format!(" ⇣ {} % ", beam_core::text::percent(live.done, live.total)),
             Style::new().bg(ACCENT).fg(Color::White).bold(),
         ));
         right.push(Span::raw(" "));
@@ -552,7 +552,10 @@ fn draw_friends(frame: &mut Frame, area: Rect, app: &mut App) {
             middle.push(Line::from(vec![
                 Span::styled(" ← ", Style::new().fg(ACCENT).bold()),
                 Span::styled(p.request.file_name.clone(), Style::new().bold()),
-                Span::raw(format!("  {}  ", crate::text::format_bytes(p.request.size))),
+                Span::raw(format!(
+                    "  {}  ",
+                    beam_core::text::format_bytes(p.request.size)
+                )),
                 Span::styled(" WAITING ", Style::new().bg(DANGER).fg(Color::White).bold()),
                 Span::styled(
                     format!("  {} left · Enter to answer", countdown(p.expires)),
@@ -693,7 +696,7 @@ fn details(friend: &Friend) -> Vec<Line<'static>> {
         Line::from(""),
         heading("LAST SEEN"),
         Line::from(match friend.last_seen {
-            Some(at) => crate::history::ago(at, crate::history::unix_now()),
+            Some(at) => beam_core::history::ago(at, beam_core::history::unix_now()),
             None => "not yet".to_string(),
         }),
         Line::from(""),
@@ -706,12 +709,12 @@ fn details(friend: &Friend) -> Vec<Line<'static>> {
 }
 
 /// The middle panel: what went to and came from this friend, newest first.
-fn transfers(friend: Option<&Friend>, history: &[crate::history::Entry]) -> Vec<Line<'static>> {
-    use crate::history::{Direction, Outcome};
+fn transfers(friend: Option<&Friend>, history: &[beam_core::history::Entry]) -> Vec<Line<'static>> {
+    use beam_core::history::{Direction, Outcome};
     let Some(friend) = friend else {
         return vec![Line::from("Pick a friend on the left.".fg(MUTED))];
     };
-    let theirs: Vec<&crate::history::Entry> = history
+    let theirs: Vec<&beam_core::history::Entry> = history
         .iter()
         .rev()
         .filter(|e| e.fingerprint == friend.fingerprint)
@@ -730,7 +733,7 @@ fn transfers(friend: Option<&Friend>, history: &[crate::history::Entry]) -> Vec<
             ]),
         ];
     }
-    let now = crate::history::unix_now();
+    let now = beam_core::history::unix_now();
     let mut lines = vec![heading("FILES")];
     for e in theirs {
         let (arrow, arrow_style) = match e.direction {
@@ -750,16 +753,16 @@ fn transfers(friend: Option<&Friend>, history: &[crate::history::Entry]) -> Vec<
         let mut spans = vec![
             Span::styled(arrow, arrow_style.bold()),
             Span::styled(e.file.clone(), Style::new().bold()),
-            Span::raw(format!("  {}  ", crate::text::format_bytes(e.size))),
+            Span::raw(format!("  {}  ", beam_core::text::format_bytes(e.size))),
             Span::styled(
                 format!(
                     "{}{mark}",
-                    crate::history::outcome_word(e.outcome, e.direction)
+                    beam_core::history::outcome_word(e.outcome, e.direction)
                 ),
                 result_style,
             ),
             Span::styled(
-                format!("  {}", crate::history::ago(e.at, now)),
+                format!("  {}", beam_core::history::ago(e.at, now)),
                 Style::new().fg(MUTED),
             ),
         ];
@@ -872,7 +875,7 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(
                     format!(
                         " {} · {} left",
-                        crate::text::format_bytes(p.request.size),
+                        beam_core::text::format_bytes(p.request.size),
                         countdown(p.expires)
                     ),
                     Style::new().fg(MUTED),
@@ -914,8 +917,8 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
             Span::styled("Receiving  ", Style::new().fg(MUTED)),
             Span::raw(format!(
                 "{} of {}  {path}",
-                crate::text::format_bytes(live.done),
-                crate::text::format_bytes(live.total)
+                beam_core::text::format_bytes(live.done),
+                beam_core::text::format_bytes(live.total)
             )),
         ]));
         let width = status.width.saturating_sub(8) as u64;
@@ -930,7 +933,7 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
             ),
             Span::raw(format!(
                 " {:>3} %",
-                crate::text::percent(live.done, live.total)
+                beam_core::text::percent(live.done, live.total)
             )),
         ]));
         lines.push(Line::from(""));
@@ -947,11 +950,14 @@ fn stage_words(stage: &Stage, peer: &str) -> String {
     match *stage {
         Stage::Starting | Stage::Dialling => format!("looking for {peer}…"),
         Stage::Hashing { done, total } => {
-            format!("reading the file {} %", crate::text::percent(done, total))
+            format!(
+                "reading the file {} %",
+                beam_core::text::percent(done, total)
+            )
         }
         Stage::Waiting => format!("waiting for {peer} to accept"),
         Stage::Moving { done, total, .. } if total > 0 => {
-            format!("sending {} %", crate::text::percent(done, total))
+            format!("sending {} %", beam_core::text::percent(done, total))
         }
         Stage::Moving { .. } => "accepted".to_string(),
         Stage::Checking { .. } => format!("{peer} is checking the file"),
@@ -968,7 +974,7 @@ fn bar(done: u64, total: u64, width: u16) -> Line<'static> {
             "░".repeat((width - filled) as usize),
             Style::new().fg(BORDER),
         ),
-        Span::raw(format!(" {:>3} %", crate::text::percent(done, total))),
+        Span::raw(format!(" {:>3} %", beam_core::text::percent(done, total))),
     ])
 }
 
@@ -1085,7 +1091,7 @@ fn draw_browse(frame: &mut Frame, area: Rect, areas: &mut Areas, b: &Browser) {
     let rows = b.rows();
     let height = list.height as usize;
     let offset = (b.selected + 1).saturating_sub(height);
-    let now = crate::history::unix_now();
+    let now = beam_core::history::unix_now();
     if rows.is_empty() && b.typed_path().is_none() {
         let empty = if b.filter.text().is_empty() {
             "This folder is empty."
@@ -1131,12 +1137,15 @@ fn draw_browse(frame: &mut Frame, area: Rect, areas: &mut Areas, b: &Browser) {
                 } else {
                     let when = entry
                         .modified
-                        .map(|at| crate::history::ago(at, now))
+                        .map(|at| beam_core::history::ago(at, now))
                         .unwrap_or_default();
                     (
                         Span::raw(name),
                         Span::styled(
-                            format!("{:>10}  {when:>12}", crate::text::format_bytes(entry.size)),
+                            format!(
+                                "{:>10}  {when:>12}",
+                                beam_core::text::format_bytes(entry.size)
+                            ),
                             Style::new().fg(MUTED),
                         ),
                     )
@@ -1161,7 +1170,7 @@ fn draw_browse(frame: &mut Frame, area: Rect, areas: &mut Areas, b: &Browser) {
 
 /// A file name from this disk can still hold control characters.
 fn untrusted_path(path: &str) -> String {
-    crate::untrusted::text(path)
+    beam_core::untrusted::text(path)
 }
 
 /// How the send is going; Hide keeps it going in the header.
@@ -1472,7 +1481,7 @@ fn draw_accept(
         ]),
         Line::from(vec![
             Span::styled("Size   ", Style::new().fg(MUTED)),
-            Span::raw(crate::text::format_bytes(request.size)),
+            Span::raw(beam_core::text::format_bytes(request.size)),
         ]),
     ];
     if let Some(resume) = &request.resume {
@@ -2605,9 +2614,9 @@ mod tests {
 
     #[test]
     fn a_friends_panel_lists_their_files_newest_first_and_when_last_seen() {
-        use crate::history::{Direction, Entry, Outcome};
+        use beam_core::history::{Direction, Entry, Outcome};
         let mut app = app(&["alice"], Agent::Stopped);
-        let now = crate::history::unix_now();
+        let now = beam_core::history::unix_now();
         let entry = |file: &str, direction, outcome, ago: u64| Entry {
             at: now - ago,
             direction,
@@ -2673,10 +2682,10 @@ mod tests {
             file: "report.pdf".into(),
         });
         app.on_send(crate::tui::sending::SendUpdate::Progress(
-            crate::transfer::Progress::Transferring {
+            beam_core::transfer::Progress::Transferring {
                 done: 50,
                 total: 100,
-                path: crate::transport::PathKind::Direct,
+                path: beam_core::transport::PathKind::Direct,
             },
         ));
         let screen = render(&mut app, 120, 30);

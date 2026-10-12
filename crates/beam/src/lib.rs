@@ -10,11 +10,3 @@
 pub mod cli;
 pub mod tui;
 pub mod ui;
-
-// TEMPORARY (ADR-0048, part a of the split): the core's modules under their
-// old paths, so this move is only a move. Part b replaces every use with
-// `beam_core::…` and removes these lines.
-pub use beam_core::{
-    actions, agent, config, history, identity, invite, listen_status, listener, pairing, text,
-    transfer, transport, untrusted,
-};

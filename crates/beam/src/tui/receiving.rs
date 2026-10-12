@@ -1,8 +1,8 @@
 //! The Receiving switch (ADR-0044): the background agent's receiver, run
 //! inside the view for as long as the switch is on.
 //!
-//! It is [`actions::receive`](crate::actions::receive), which is
-//! [`agent::run`](crate::agent::run) unchanged — pairing off, a five-minute Accept window,
+//! It is [`actions::receive`](beam_core::actions::receive), which is
+//! [`agent::run`](beam_core::agent::run) unchanged — pairing off, a five-minute Accept window,
 //! router port mapping only if `beam service port-mapping on`, a desktop
 //! notification per request — with `in_view` set, so `beam service status`
 //! and `beam whoami` say who is receiving. It takes the agent's lock, so
@@ -15,10 +15,10 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use crate::actions::receive::{self, Place};
-use crate::identity::Store;
-use crate::transport::endpoint::Bind;
-use crate::untrusted;
+use beam_core::actions::receive::{self, Place};
+use beam_core::identity::Store;
+use beam_core::transport::endpoint::Bind;
+use beam_core::untrusted;
 
 /// What the receiving thread tells the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,8 +112,8 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::status::{self, Running};
     use crate::tui::inbox::tests::with_an_agent::home;
+    use beam_core::agent::status::{self, Running};
 
     fn next(on: &InView) -> RecvUpdate {
         on.updates
@@ -165,7 +165,7 @@ mod tests {
         }
         let at = invite
             .expect("the switch published its invite")
-            .parse::<crate::invite::Invite>()
+            .parse::<beam_core::invite::Invite>()
             .unwrap()
             .endpoint_addr();
 
@@ -175,9 +175,9 @@ mod tests {
             .build()
             .unwrap();
         let refused = runtime.block_on(async {
-            let endpoint = crate::transport::endpoint::bind(
+            let endpoint = beam_core::transport::endpoint::bind(
                 &stranger.identity,
-                &crate::config::Relay::Disabled,
+                &beam_core::config::Relay::Disabled,
                 Bind::Loopback,
                 0,
                 &[],
@@ -186,7 +186,7 @@ mod tests {
             .unwrap();
             let attempt = tokio::time::timeout(
                 Duration::from_secs(30),
-                endpoint.connect(at, crate::transport::endpoint::PAIR_ALPN),
+                endpoint.connect(at, beam_core::transport::endpoint::PAIR_ALPN),
             )
             .await
             .expect("the attempt hung");
@@ -208,18 +208,18 @@ mod tests {
         std::fs::write(alice.store.config_path(), "relay = \"none\"\nport = 0\n").unwrap();
         // A `listen` holds its lock and has published what it offers.
         let mut board =
-            crate::listen_status::Board::claim(&alice.store, Duration::from_secs(600)).unwrap();
-        let code = crate::pairing::PairingCode::generate().unwrap();
+            beam_core::listen_status::Board::claim(&alice.store, Duration::from_secs(600)).unwrap();
+        let code = beam_core::pairing::PairingCode::generate().unwrap();
         board
-            .on_event(&crate::listener::ListenEvent::Ready {
-                invite: crate::invite::Invite {
+            .on_event(&beam_core::listener::ListenEvent::Ready {
+                invite: beam_core::invite::Invite {
                     key: alice.identity.verifying_key(),
                     relay: None,
                     addrs: vec!["127.0.0.1:7820".parse().unwrap()],
                 },
                 fingerprint: alice.identity.fingerprint(),
                 code,
-                relay: crate::config::Relay::Disabled,
+                relay: beam_core::config::Relay::Disabled,
             })
             .unwrap();
         let on = InView::start_on(alice.store.clone(), Bind::Loopback, false);
@@ -248,7 +248,7 @@ port = 0
 port = 0
 receive_dir = {}
 ",
-            crate::config::toml_string(&alice.inbox.display().to_string())
+            beam_core::config::toml_string(&alice.inbox.display().to_string())
         );
         std::fs::write(alice.store.config_path(), config).unwrap();
 
@@ -261,12 +261,12 @@ receive_dir = {}
         let link = InboxLink::connect(status.port, status.token.clone());
 
         // bob knows where she is, as after pairing with her invite.
-        let invite: crate::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
+        let invite: beam_core::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
         let mut known = bob.store.load_known_peers().unwrap();
-        crate::invite::remember(
+        beam_core::invite::remember(
             known.lookup_key_mut(&invite.key).unwrap(),
             &invite,
-            &crate::config::Relay::Disabled,
+            &beam_core::config::Relay::Disabled,
         );
         bob.store.save_known_peers(&known).unwrap();
         let path = bob.files.join("report.pdf");

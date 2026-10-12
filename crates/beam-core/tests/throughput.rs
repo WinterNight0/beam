@@ -23,13 +23,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beam::config::Relay;
-use beam::identity::{Identity, Peer, Store};
-use beam::listener::{ListenEvent, ListenOptions, run};
-use beam::pairing::{Confirm, ConfirmRequest, Network, Policy, Timeouts};
-use beam::transfer::{Progress, Prompt, PromptRequest, Reporter, SendOptions, SilentReporter};
-use beam::transport::dial::{dial_transfer, send_on};
-use beam::transport::endpoint::{self, Bind};
+use beam_core::config::Relay;
+use beam_core::identity::{Identity, Peer, Store};
+use beam_core::listener::{ListenEvent, ListenOptions, run};
+use beam_core::pairing::{Confirm, ConfirmRequest, Network, Policy, Timeouts};
+use beam_core::transfer::{Progress, Prompt, PromptRequest, Reporter, SendOptions, SilentReporter};
+use beam_core::transport::dial::{dial_transfer, send_on};
+use beam_core::transport::endpoint::{self, Bind};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use tokio::sync::mpsc;
@@ -296,7 +296,7 @@ async fn throughput_over_loopback_iroh() {
     let connection = dial_transfer(&endpoint, at).await.expect("dial");
     let mut send_options = SendOptions::new(
         path,
-        beam::identity::encode_public_key(&alice.identity.verifying_key()),
+        beam_core::identity::encode_public_key(&alice.identity.verifying_key()),
     );
     let mut clock = Clock::default();
     let started = Instant::now();

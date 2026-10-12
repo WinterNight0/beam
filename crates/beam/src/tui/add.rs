@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use super::app::{App, Choice, Effect, Key, Modal, Tab, Target};
 use super::input::Input;
 use super::pairing::{Answer, Update};
-use crate::identity::MAX_NAME_LEN;
-use crate::pairing::PairingCode;
+use beam_core::identity::MAX_NAME_LEN;
+use beam_core::pairing::PairingCode;
 
 /// The longest invite the box takes; real ones are a few hundred characters.
 const MAX_INVITE: usize = 2048;

@@ -3,8 +3,9 @@
 use serde::Serialize;
 
 use super::{App, CommandError, Io};
-use crate::history::{self, Direction, Outcome};
-use crate::{text, ui, untrusted};
+use crate::ui;
+use beam_core::history::{self, Direction, Outcome};
+use beam_core::{text, untrusted};
 
 /// The `--json` shape of one entry. File and peer names are given as stored;
 /// a program reading them is responsible for showing them safely.

@@ -22,9 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
-use crate::pairing::{ConfirmRequest, Role};
-use crate::transfer::PromptRequest;
-use crate::{text, ui, untrusted};
+use crate::ui;
+use beam_core::pairing::{ConfirmRequest, Role};
+use beam_core::transfer::PromptRequest;
+use beam_core::{text, untrusted};
 
 /// Set while a question is on screen, so a progress line does not redraw over
 /// it. Read by `terminal::TerminalReporter`.
@@ -307,7 +308,7 @@ impl DeskPrompt {
     }
 }
 
-impl crate::transfer::Prompt for DeskPrompt {
+impl beam_core::transfer::Prompt for DeskPrompt {
     fn confirm(&mut self, request: &PromptRequest) -> std::io::Result<bool> {
         Ok(self
             .desk
@@ -315,7 +316,7 @@ impl crate::transfer::Prompt for DeskPrompt {
     }
 }
 
-impl crate::pairing::Confirm for DeskPrompt {
+impl beam_core::pairing::Confirm for DeskPrompt {
     fn confirm(&mut self, request: &ConfirmRequest) -> std::io::Result<bool> {
         Ok(self
             .desk
@@ -425,10 +426,10 @@ mod tests {
         Question::Pairing(ConfirmRequest {
             role: Role::Waiter,
             name: name.into(),
-            peer_fingerprint: crate::identity::Identity::generate("alpha")
+            peer_fingerprint: beam_core::identity::Identity::generate("alpha")
                 .unwrap()
                 .fingerprint(),
-            own_fingerprint: crate::identity::Identity::generate("bravo")
+            own_fingerprint: beam_core::identity::Identity::generate("bravo")
                 .unwrap()
                 .fingerprint(),
         })

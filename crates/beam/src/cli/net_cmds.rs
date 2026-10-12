@@ -16,19 +16,20 @@ use super::terminal::Keyboard;
 use super::terminal::TerminalReporter;
 use super::transfer_cmds::{EitherReporter, ReceiveJson, SendJson, reporter_for};
 use super::{App, CommandError, Io};
-use crate::actions::{
+use crate::ui;
+use beam_core::actions::{
     self,
     send::{SendError, SendRequest, Step},
 };
-use crate::config::Config;
-use crate::identity::Fingerprint;
-use crate::listen_status::Board;
-use crate::listener::{ListenEvent, ListenOptions};
-use crate::pairing::rotation::NewCodeReason;
-use crate::pairing::{Network, Policy, Timeouts};
-use crate::transfer::{DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore};
-use crate::transport::endpoint::Bind;
-use crate::{text, ui, untrusted};
+use beam_core::config::Config;
+use beam_core::identity::Fingerprint;
+use beam_core::listen_status::Board;
+use beam_core::listener::{ListenEvent, ListenOptions};
+use beam_core::pairing::rotation::NewCodeReason;
+use beam_core::pairing::{Network, Policy, Timeouts};
+use beam_core::transfer::{DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore};
+use beam_core::transport::endpoint::Bind;
+use beam_core::{text, untrusted};
 
 impl App {
     fn network(&self, loopback: bool) -> Result<Network, CommandError> {
@@ -54,8 +55,8 @@ impl App {
         self.store.load_known_peers()?;
         // Two receivers on one identity would split the peers between them.
         if !matches!(
-            crate::agent::status::read(&self.store),
-            crate::agent::status::Running::No
+            beam_core::agent::status::read(&self.store),
+            beam_core::agent::status::Running::No
         ) {
             return Err(CommandError::Message(
                 "the background agent is running and already receives files (answer them with \
@@ -104,7 +105,7 @@ impl App {
         let options = ListenOptions {
             out_dir: out_dir.clone(),
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
-            stall_timeout: crate::transfer::engine::DEFAULT_STALL_TIMEOUT,
+            stall_timeout: beam_core::transfer::engine::DEFAULT_STALL_TIMEOUT,
             pairing: policy,
             timeouts: Timeouts::default(),
             allow_pairing: true,
@@ -122,7 +123,7 @@ impl App {
         let runtime = self.runtime()?;
         // Ctrl+C stops `listen` cleanly: a sender mid-transfer is told, what
         // arrived is kept, and `whoami` stops showing the code (ADR-0041).
-        let result = runtime.block_on(crate::listener::run_until(
+        let result = runtime.block_on(beam_core::listener::run_until(
             identity,
             self.store.clone(),
             network,
@@ -219,7 +220,7 @@ impl App {
             let saved = summary
                 .final_name
                 .as_deref()
-                .map(crate::untrusted::name)
+                .map(beam_core::untrusted::name)
                 .unwrap_or_else(|| "the peer did not say".to_string());
             let skipped = if summary.bytes_skipped > 0 {
                 format!(
@@ -284,7 +285,7 @@ fn interrupted_message(peer: &str, told: bool) -> CommandError {
 struct Screen {
     json: bool,
     out_dir: String,
-    store: crate::identity::Store,
+    store: beam_core::identity::Store,
     /// Everything `listen` prints goes through the desk, so a notice never
     /// lands in the middle of an open question without the question being
     /// drawn again (M6 item 5).

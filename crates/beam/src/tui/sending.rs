@@ -11,14 +11,14 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use crate::actions::{
+use beam_core::actions::{
     self,
     send::{SendError, SendRequest, Step},
 };
-use crate::identity::{PeerError, Store};
-use crate::transfer::{Progress, Reporter};
-use crate::transport::endpoint::Bind;
-use crate::{text, untrusted};
+use beam_core::identity::{PeerError, Store};
+use beam_core::transfer::{Progress, Reporter};
+use beam_core::transport::endpoint::Bind;
+use beam_core::{text, untrusted};
 
 /// What the sending thread tells the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,12 +210,12 @@ mod tests {
         .unwrap();
         let (status, _stop) = start_agent(&alice).await;
         // bob knows where alice is, as after pairing with her invite.
-        let invite: crate::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
+        let invite: beam_core::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
         let mut known = bob.store.load_known_peers().unwrap();
-        crate::invite::remember(
+        beam_core::invite::remember(
             known.lookup_key_mut(&invite.key).unwrap(),
             &invite,
-            &crate::config::Relay::Disabled,
+            &beam_core::config::Relay::Disabled,
         );
         bob.store.save_known_peers(&known).unwrap();
         let link = InboxLink::connect(status.port, status.token.clone());
@@ -251,10 +251,10 @@ mod tests {
             std::fs::read(alice.inbox.join("report.pdf")).unwrap(),
             b"the quarterly numbers"
         );
-        let history = crate::history::read(&bob.store);
+        let history = beam_core::history::read(&bob.store);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].direction, crate::history::Direction::Sent);
-        assert_eq!(history[0].outcome, crate::history::Outcome::Done);
+        assert_eq!(history[0].direction, beam_core::history::Direction::Sent);
+        assert_eq!(history[0].outcome, beam_core::history::Outcome::Done);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -266,8 +266,8 @@ mod tests {
         assert!(message.contains("declined"), "{message}");
         assert!(!alice.inbox.join("report.pdf").exists());
         assert_eq!(
-            crate::history::read(&bob.store)[0].outcome,
-            crate::history::Outcome::Declined
+            beam_core::history::read(&bob.store)[0].outcome,
+            beam_core::history::Outcome::Declined
         );
     }
 
@@ -294,12 +294,13 @@ mod tests {
         for friend in [&alice, &carol] {
             let (status, stop) = start_agent(friend).await;
             stops.push(stop);
-            let invite: crate::invite::Invite = status.invite.as_deref().unwrap().parse().unwrap();
+            let invite: beam_core::invite::Invite =
+                status.invite.as_deref().unwrap().parse().unwrap();
             let mut known = bob.store.load_known_peers().unwrap();
-            crate::invite::remember(
+            beam_core::invite::remember(
                 known.lookup_key_mut(&invite.key).unwrap(),
                 &invite,
-                &crate::config::Relay::Disabled,
+                &beam_core::config::Relay::Disabled,
             );
             bob.store.save_known_peers(&known).unwrap();
             let link = InboxLink::connect(status.port, status.token.clone());
@@ -399,8 +400,8 @@ mod tests {
         assert!(message.starts_with("Cancelled"), "{message}");
         assert!(!alice.inbox.join("report.pdf").exists());
         assert_eq!(
-            crate::history::read(&bob.store)[0].outcome,
-            crate::history::Outcome::Cancelled
+            beam_core::history::read(&bob.store)[0].outcome,
+            beam_core::history::Outcome::Cancelled
         );
     }
 }

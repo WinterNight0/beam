@@ -47,9 +47,9 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use crate::identity::Store;
-use crate::untrusted;
 use app::{App, Done, Effect, Event, Key, MouseKind, Snapshot};
+use beam_core::identity::Store;
+use beam_core::untrusted;
 use palette::Place;
 
 /// How often `~/.beam` is read again, so a peer paired or an agent started
@@ -332,7 +332,7 @@ fn connect_inbox(store: &Store, link: &mut Option<inbox::InboxLink>, app: &mut A
     if link.is_some() {
         return;
     }
-    match crate::actions::inbox::find(store) {
+    match beam_core::actions::inbox::find(store) {
         Ok(address) => {
             *link = Some(inbox::InboxLink::connect(address.port, address.token));
             if !matches!(app.link, pending::Link::Lost(_)) {
@@ -394,7 +394,7 @@ fn create_identity(store: &Store) -> Done {
     if store.has_identity() {
         return Done::Message("This device already has its identity.".to_string());
     }
-    let made = crate::identity::Identity::generate(&crate::identity::hostname())
+    let made = beam_core::identity::Identity::generate(&beam_core::identity::hostname())
         .map_err(|e| e.to_string())
         .and_then(|identity| {
             store
@@ -424,13 +424,13 @@ enum Joining {
 /// `beam pair` does.
 fn start_join(store: &Store, text: &str, name: &str) -> Result<Joining, String> {
     let fail = |e: &dyn std::fmt::Display| untrusted::lines(&e.to_string());
-    let invite: crate::invite::Invite = text.parse().map_err(|e| fail(&e))?;
+    let invite: beam_core::invite::Invite = text.parse().map_err(|e| fail(&e))?;
     let identity = store.load_identity().map_err(|e| fail(&e))?;
     if invite.key == identity.verifying_key() {
         return Err("That is this device's own invite. Ask them for theirs.".to_string());
     }
     if let Some(location) =
-        crate::actions::pair::already_paired(store, &invite).map_err(|e| fail(&e))?
+        beam_core::actions::pair::already_paired(store, &invite).map_err(|e| fail(&e))?
     {
         if location.changes_relay() {
             let describe = |relay: &Option<String>| match relay {
@@ -448,7 +448,7 @@ fn start_join(store: &Store, text: &str, name: &str) -> Result<Joining, String> 
         return Ok(Joining::Done(update_location(store, text, false)));
     }
     let known = store.load_known_peers().map_err(|e| fail(&e))?;
-    crate::pairing::check_name(&known, name).map_err(|e| fail(&e))?;
+    beam_core::pairing::check_name(&known, name).map_err(|e| fail(&e))?;
     Ok(Joining::Started(pairing::Worker::join(
         store.clone(),
         invite,
@@ -459,16 +459,16 @@ fn start_join(store: &Store, text: &str, name: &str) -> Result<Joining, String> 
 /// Saves where an already-paired friend is now. Never touches the key.
 fn update_location(store: &Store, text: &str, relay_change_agreed: bool) -> Done {
     let fail = |e: &dyn std::fmt::Display| Done::Failed(untrusted::lines(&e.to_string()));
-    let invite: crate::invite::Invite = match text.parse() {
+    let invite: beam_core::invite::Invite = match text.parse() {
         Ok(invite) => invite,
         Err(e) => return fail(&e),
     };
-    match crate::actions::pair::save_location(store, &invite, relay_change_agreed) {
+    match beam_core::actions::pair::save_location(store, &invite, relay_change_agreed) {
         Ok(name) => Done::Message(format!(
             "{} is already your friend. Updated where to find them; their key is unchanged.",
             untrusted::name(&name)
         )),
-        Err(crate::actions::pair::PairFailure::NoLongerPaired) => {
+        Err(beam_core::actions::pair::PairFailure::NoLongerPaired) => {
             Done::Failed("That friend is no longer paired.".to_string())
         }
         Err(e) => fail(&e),
@@ -695,7 +695,7 @@ fn translate_key(key: KeyEvent) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{Identity, Peer};
+    use beam_core::identity::{Identity, Peer};
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -854,7 +854,7 @@ mod tests {
     }
 
     fn invite_for(key: ed25519_dalek::VerifyingKey) -> String {
-        crate::invite::Invite {
+        beam_core::invite::Invite {
             key,
             relay: None,
             addrs: vec!["127.0.0.1:7820".parse().unwrap()],

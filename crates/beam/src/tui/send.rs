@@ -12,8 +12,8 @@
 use super::app::{App, Choice, Effect, Key, Modal, Target};
 use super::browse::{Browser, Chosen, Pane, Row};
 use super::sending::SendUpdate;
-use crate::transfer::Progress;
-use crate::transport::PathKind;
+use beam_core::transfer::Progress;
+use beam_core::transport::PathKind;
 
 /// Where a send has got to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

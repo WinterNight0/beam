@@ -22,15 +22,16 @@ use std::time::Duration;
 use super::desk::{DeskPrompt, PromptDesk};
 use super::terminal::Keyboard;
 use super::{App, CommandError, Io};
-use crate::actions::{
+use crate::ui;
+use beam_core::actions::{
     self,
     pair::{Location, PairFailure, PairRequest},
 };
-use crate::identity::Identity;
-use crate::invite::{self, Invite};
-use crate::pairing::{Event, Network, PairError, PairingCode, PairingError, Timeouts};
-use crate::transport::endpoint::Bind;
-use crate::{ui, untrusted};
+use beam_core::identity::Identity;
+use beam_core::invite::{self, Invite};
+use beam_core::pairing::{Event, Network, PairError, PairingCode, PairingError, Timeouts};
+use beam_core::transport::endpoint::Bind;
+use beam_core::untrusted;
 
 /// How long the joiner has to type the code.
 const CODE_ENTRY_TIMEOUT: Duration = Duration::from_secs(5 * 60);

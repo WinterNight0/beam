@@ -16,14 +16,14 @@ use tokio::net::{TcpListener, TcpStream};
 use super::desk::{DeskPrompt, PromptDesk};
 use super::terminal::{Keyboard, TerminalReporter};
 use super::{App, CommandError, Io};
-use crate::identity::{Identity, KnownPeers, encode_public_key};
-use crate::text;
-use crate::transfer::{
+use crate::ui;
+use beam_core::identity::{Identity, KnownPeers, encode_public_key};
+use beam_core::text;
+use beam_core::transfer::{
     DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialError, ReceiveOptions, Reporter, SendOptions,
     SilentReporter, TransferError, TransferId, receive_file, send_file,
 };
-use crate::transport::is_loopback;
-use crate::ui;
+use beam_core::transport::is_loopback;
 
 /// The `--json` shape of a finished send.
 #[derive(Serialize)]
@@ -230,7 +230,9 @@ impl App {
         // all it buys: nothing yet proves the machine at `addr` is that peer.
         // See ADR-0019.
         let peer = known_peers.lookup(peer_name).ok_or_else(|| {
-            CommandError::Peer(crate::identity::PeerError::NotFound(peer_name.to_string()))
+            CommandError::Peer(beam_core::identity::PeerError::NotFound(
+                peer_name.to_string(),
+            ))
         })?;
 
         if !file.is_file() {
@@ -283,7 +285,7 @@ impl App {
                 let saved = summary
                     .final_name
                     .as_deref()
-                    .map(crate::untrusted::name)
+                    .map(beam_core::untrusted::name)
                     .unwrap_or_else(|| "the peer did not say".to_string());
                 let skipped = if summary.bytes_skipped > 0 {
                     format!(
@@ -316,7 +318,7 @@ impl App {
         assume_yes: bool,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let partials = crate::transfer::PartialStore::new(self.store.tmp_path());
+        let partials = beam_core::transfer::PartialStore::new(self.store.tmp_path());
         let summaries = partials
             .list(DEFAULT_MAX_AGE)
             .map_err(|e| CommandError::Partial(Box::new(e)))?;
@@ -374,14 +376,14 @@ impl App {
 
     fn clear_transfers(
         &self,
-        partials: &crate::transfer::PartialStore,
-        summaries: &[crate::transfer::PartialSummary],
+        partials: &beam_core::transfer::PartialStore,
+        summaries: &[beam_core::transfer::PartialSummary],
         id: Option<&str>,
         assume_yes: bool,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
         // An id may be given in the abbreviated form `beam transfers` prints.
-        let targets: Vec<&crate::transfer::PartialSummary> = match id {
+        let targets: Vec<&beam_core::transfer::PartialSummary> = match id {
             Some(prefix) => {
                 let matched: Vec<_> = summaries
                     .iter()
@@ -473,7 +475,7 @@ impl EitherReporter {
 }
 
 impl Reporter for EitherReporter {
-    fn report(&mut self, progress: crate::transfer::Progress) {
+    fn report(&mut self, progress: beam_core::transfer::Progress) {
         match self {
             EitherReporter::Terminal(reporter) => reporter.report(progress),
             EitherReporter::Silent(reporter) => reporter.report(progress),

@@ -9,14 +9,14 @@
 
 use std::time::{Duration, Instant};
 
-use beam::config::Relay;
-use beam::identity::{Identity, KnownPeers, Peer};
-use beam::invite::Invite;
-use beam::pairing::{
+use beam_core::config::Relay;
+use beam_core::identity::{Identity, KnownPeers, Peer};
+use beam_core::invite::Invite;
+use beam_core::pairing::{
     CodeSlot, CodeUnavailable, Confirm, ConfirmRequest, Event, Network, PairError, Pairing,
     PairingCode, PairingError, Role, Timeouts, join, wait,
 };
-use beam::transport::endpoint::{Bind, endpoint_id};
+use beam_core::transport::endpoint::{Bind, endpoint_id};
 use ed25519_dalek::VerifyingKey;
 use tokio::sync::mpsc;
 

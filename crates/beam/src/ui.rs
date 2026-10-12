@@ -8,7 +8,7 @@ use std::io::{self, BufRead, Write};
 /// are ours, but some carry a peer's text, and a detail line is exactly where a
 /// forged fingerprint would be printed (ADR-0034).
 pub fn field(out: &mut dyn Write, label: &str, value: &str) -> io::Result<()> {
-    writeln!(out, "  {label:<13} {}", crate::untrusted::text(value))
+    writeln!(out, "  {label:<13} {}", beam_core::untrusted::text(value))
 }
 
 /// Writes a simple aligned table. An empty `rows` prints the headers only.

@@ -1,33 +1,39 @@
-GO      ?= go
-BIN     ?= bin
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -X beam/internal/cli.version=$(VERSION)
+# beam's everyday commands. Every target covers the whole workspace: the
+# core (crates/beam-core) and the front ends (crates/beam), ADR-0048.
+# (Until ADR-0010 this file drove the Go implementation.)
 
-.PHONY: all build test vet fmt fmt-check tidy check clean
+CARGO ?= cargo
+
+.PHONY: all build release test fmt fmt-check clippy check audit clean
 
 all: check build
 
 build:
-	$(GO) build -ldflags "$(LDFLAGS)" -o $(BIN)/ ./cmd/...
+	$(CARGO) build --workspace
+
+# The `beam` binary, optimised and stripped: target/release/beam(.exe).
+release:
+	$(CARGO) build --release -p beam
 
 test:
-	$(GO) test ./...
-
-vet:
-	$(GO) vet ./...
+	$(CARGO) test --workspace
 
 fmt:
-	$(GO) fmt ./...
+	$(CARGO) fmt --all
 
 fmt-check:
-	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+	$(CARGO) fmt --all --check
 
-tidy:
-	$(GO) mod tidy
+clippy:
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 # What CI runs, and what must pass before a milestone is called done.
-check: fmt-check vet test
+check: fmt-check clippy test
+
+# Every dependency against the RustSec advisories, as the CI audit job does.
+# Needs `cargo install cargo-audit --locked` once.
+audit:
+	$(CARGO) audit
 
 clean:
-	$(GO) clean
-	rm -rf $(BIN)
+	$(CARGO) clean

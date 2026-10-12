@@ -1,7 +1,7 @@
 //! `beam ui`: what plain `beam` opens (ADR-0043).
 
 use super::{App, CommandError, Io};
-use crate::config::{self, Config, UiMode};
+use beam_core::config::{self, Config, UiMode};
 
 /// The values `beam ui` takes.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]

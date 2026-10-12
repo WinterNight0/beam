@@ -1,5 +1,5 @@
 //! Pairing from the full-screen view (ADR-0043): the same
-//! [`pairing::join`](crate::pairing::join) and [`wait`](crate::pairing::wait)
+//! [`pairing::join`](beam_core::pairing::join) and [`wait`](beam_core::pairing::wait)
 //! that `beam pair` runs, on a background thread, with the view asking the
 //! questions.
 //!
@@ -21,17 +21,17 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::actions::{
+use beam_core::actions::{
     self,
     pair::{PairFailure, PairRequest},
 };
-use crate::identity::Store;
-use crate::invite::Invite;
-use crate::pairing::{
+use beam_core::identity::Store;
+use beam_core::invite::Invite;
+use beam_core::pairing::{
     Confirm, ConfirmRequest, Event, PairError, PairingCode, PairingError, Timeouts,
 };
-use crate::transport::endpoint::Bind;
-use crate::untrusted;
+use beam_core::transport::endpoint::Bind;
+use beam_core::untrusted;
 
 /// How long the joiner has to type the code, as in `beam pair`.
 const CODE_ENTRY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -286,12 +286,12 @@ mod tests {
             timeout: Duration::from_millis(50),
         };
         let request = ConfirmRequest {
-            role: crate::pairing::Role::Joiner,
+            role: beam_core::pairing::Role::Joiner,
             name: "alice".to_string(),
-            peer_fingerprint: crate::identity::Identity::generate("a")
+            peer_fingerprint: beam_core::identity::Identity::generate("a")
                 .unwrap()
                 .fingerprint(),
-            own_fingerprint: crate::identity::Identity::generate("b")
+            own_fingerprint: beam_core::identity::Identity::generate("b")
                 .unwrap()
                 .fingerprint(),
         };
@@ -342,7 +342,7 @@ mod tests {
     fn home(name: &str) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
-        let identity = crate::identity::Identity::generate(name).unwrap();
+        let identity = beam_core::identity::Identity::generate(name).unwrap();
         store.save_identity(&identity, false).unwrap();
         std::fs::write(
             store.config_path(),

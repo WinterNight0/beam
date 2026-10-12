@@ -7,16 +7,17 @@ use std::time::Duration;
 use super::desk::{PromptDesk, Question};
 use super::terminal::{Keyboard, TerminalReporter};
 use super::{App, CommandError, Io};
-use crate::actions::inbox::{self, ConnectError, FindError, Inbox, InboxEvent};
-use crate::actions::receive::{self, Place, ReceiveError};
-use crate::agent::ipc::{Client, ClientMsg};
-use crate::agent::status::{self, Running};
-use crate::agent::{self, service};
-use crate::config::{self, Config};
-use crate::transfer::{Progress, Reporter};
-use crate::transport::PathKind;
-use crate::transport::endpoint::Bind;
-use crate::{ui, untrusted};
+use crate::ui;
+use beam_core::actions::inbox::{self, ConnectError, FindError, Inbox, InboxEvent};
+use beam_core::actions::receive::{self, Place, ReceiveError};
+use beam_core::agent::ipc::{Client, ClientMsg};
+use beam_core::agent::status::{self, Running};
+use beam_core::agent::{self, service};
+use beam_core::config::{self, Config};
+use beam_core::transfer::{Progress, Reporter};
+use beam_core::transport::PathKind;
+use beam_core::transport::endpoint::Bind;
+use beam_core::untrusted;
 
 /// The warning shown before router port mapping is turned on for the agent.
 const PORT_MAPPING_WARNING: &str = "\

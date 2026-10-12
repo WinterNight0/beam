@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beam::identity::{Identity, KnownPeers, Peer, encode_public_key};
-use beam::transfer::frame::{read_message, write_message};
-use beam::transfer::message::{Message, RejectReason, TransferId, TransferRequest};
-use beam::transfer::{
+use beam_core::identity::{Identity, KnownPeers, Peer, encode_public_key};
+use beam_core::transfer::frame::{read_message, write_message};
+use beam_core::transfer::message::{Message, RejectReason, TransferId, TransferRequest};
+use beam_core::transfer::{
     ChunkBitmap, PartialStore, Prompt, PromptRequest, ReceiveOptions, ReceiveSummary, SendOptions,
     SilentReporter, TransferError, receive_file, send_file,
 };
@@ -133,7 +133,7 @@ impl World {
         &self,
         prompt: ScriptedPrompt,
     ) -> (
-        Result<beam::transfer::SendSummary, TransferError>,
+        Result<beam_core::transfer::SendSummary, TransferError>,
         Result<ReceiveSummary, TransferError>,
     ) {
         let (client, server) = tokio::io::duplex(128 * 1024);
@@ -181,7 +181,7 @@ impl World {
             .await
         });
 
-        let plan = beam::transfer::ChunkPlan::new(self.payload.len() as u64, SMALL_CHUNK);
+        let plan = beam_core::transfer::ChunkPlan::new(self.payload.len() as u64, SMALL_CHUNK);
         let request = TransferRequest {
             transfer_id: TransferId::generate().expect("id"),
             sender_public_key: encode_public_key(&self.sender.verifying_key()),
@@ -189,7 +189,7 @@ impl World {
             size: self.payload.len() as u64,
             chunk_size: SMALL_CHUNK,
             chunk_count: plan.chunk_count(),
-            file_sha256: beam::transfer::sha256_hex(&self.payload),
+            file_sha256: beam_core::transfer::sha256_hex(&self.payload),
         };
         write_message(&mut client, &Message::TransferRequest(request))
             .await
@@ -205,15 +205,15 @@ impl World {
             let body = &self.payload[offset..offset + plan.len_of(index) as usize];
             write_message(
                 &mut client,
-                &Message::ChunkStart(beam::transfer::ChunkStart {
+                &Message::ChunkStart(beam_core::transfer::ChunkStart {
                     index,
                     len: body.len() as u32,
-                    sha256: beam::transfer::sha256_hex(body),
+                    sha256: beam_core::transfer::sha256_hex(body),
                 }),
             )
             .await
             .expect("write chunk start");
-            for slice in body.chunks(beam::transfer::MAX_CHUNK_DATA) {
+            for slice in body.chunks(beam_core::transfer::MAX_CHUNK_DATA) {
                 write_message(
                     &mut client,
                     &Message::ChunkData {
@@ -240,7 +240,7 @@ impl World {
     }
 }
 
-fn only_partial(world: &World) -> beam::transfer::PartialSummary {
+fn only_partial(world: &World) -> beam_core::transfer::PartialSummary {
     let mut list = world
         .partials()
         .list(Duration::from_secs(3600))
@@ -407,7 +407,7 @@ async fn a_malformed_have_bitmap_aborts_the_sender() {
         };
         write_message(
             &mut server,
-            &Message::Accept(beam::transfer::Accept {
+            &Message::Accept(beam_core::transfer::Accept {
                 transfer_id,
                 have_bitmap: Some(bitmap),
             }),
@@ -486,13 +486,13 @@ async fn a_second_session_for_the_same_partial_is_refused() {
 
     // Hold the partial the way a running session would.
     let partial = only_partial(&world);
-    let key = beam::transfer::PartialKey {
+    let key = beam_core::transfer::PartialKey {
         peer_fingerprint: world.sender.fingerprint(),
-        file_sha256: beam::transfer::sha256_hex(&world.payload),
+        file_sha256: beam_core::transfer::sha256_hex(&world.payload),
         size: world.payload.len() as u64,
         chunk_size: SMALL_CHUNK,
     };
-    let plan = beam::transfer::ChunkPlan::new(world.payload.len() as u64, SMALL_CHUNK);
+    let plan = beam_core::transfer::ChunkPlan::new(world.payload.len() as u64, SMALL_CHUNK);
     let _held = world
         .partials()
         .open(&key, "payload.bin", plan)
@@ -527,14 +527,14 @@ async fn a_second_session_for_the_same_partial_is_refused() {
 // ---------------------------------------------------------------------------
 
 /// Opens (or reopens) the partial for `payload` from the world's sender.
-async fn open_partial(world: &World, chunk_size: u32) -> beam::transfer::Partial {
-    let key = beam::transfer::PartialKey {
+async fn open_partial(world: &World, chunk_size: u32) -> beam_core::transfer::Partial {
+    let key = beam_core::transfer::PartialKey {
         peer_fingerprint: world.sender.fingerprint(),
-        file_sha256: beam::transfer::sha256_hex(&world.payload),
+        file_sha256: beam_core::transfer::sha256_hex(&world.payload),
         size: world.payload.len() as u64,
         chunk_size,
     };
-    let plan = beam::transfer::ChunkPlan::new(world.payload.len() as u64, chunk_size);
+    let plan = beam_core::transfer::ChunkPlan::new(world.payload.len() as u64, chunk_size);
     world
         .partials()
         .open(&key, "payload.bin", plan)
@@ -542,12 +542,17 @@ async fn open_partial(world: &World, chunk_size: u32) -> beam::transfer::Partial
         .expect("open the partial")
 }
 
-async fn store(world: &World, partial: &mut beam::transfer::Partial, chunk_size: u32, index: u32) {
-    let plan = beam::transfer::ChunkPlan::new(world.payload.len() as u64, chunk_size);
+async fn store(
+    world: &World,
+    partial: &mut beam_core::transfer::Partial,
+    chunk_size: u32,
+    index: u32,
+) {
+    let plan = beam_core::transfer::ChunkPlan::new(world.payload.len() as u64, chunk_size);
     let offset = plan.offset_of(index) as usize;
     let body = &world.payload[offset..offset + plan.len_of(index) as usize];
     partial
-        .store_chunk(index, body, &beam::transfer::sha256_hex(body))
+        .store_chunk(index, body, &beam_core::transfer::sha256_hex(body))
         .await
         .expect("store a chunk");
 }
@@ -615,7 +620,7 @@ async fn chunks_lost_to_power_failure_are_dropped_not_trusted() {
 /// which bounds what power loss can cost.
 #[tokio::test]
 async fn a_full_batch_of_chunks_is_flushed_without_being_asked() {
-    let batch = beam::transfer::FLUSH_EVERY_CHUNKS;
+    let batch = beam_core::transfer::FLUSH_EVERY_CHUNKS;
     let world = world(SMALL_CHUNK as usize * (batch + 2));
 
     let mut partial = open_partial(&world, SMALL_CHUNK).await;
@@ -638,8 +643,8 @@ async fn a_full_batch_of_chunks_is_flushed_without_being_asked() {
 #[tokio::test]
 async fn a_full_batch_of_bytes_is_flushed_without_being_asked() {
     let chunk = 16 * 1024 * 1024;
-    let batch = (beam::transfer::FLUSH_EVERY / u64::from(chunk)) as u32;
-    assert!((batch as usize) < beam::transfer::FLUSH_EVERY_CHUNKS);
+    let batch = (beam_core::transfer::FLUSH_EVERY / u64::from(chunk)) as u32;
+    assert!((batch as usize) < beam_core::transfer::FLUSH_EVERY_CHUNKS);
     let world = world(chunk as usize * (batch as usize + 1));
 
     let mut partial = open_partial(&world, chunk).await;
@@ -726,7 +731,7 @@ async fn data_before_accept_cannot_destroy_an_existing_partial() {
     let sender_key = encode_public_key(&world.sender.verifying_key());
     let payload = world.payload.clone();
     let rude = tokio::spawn(async move {
-        let plan = beam::transfer::ChunkPlan::new(payload.len() as u64, SMALL_CHUNK);
+        let plan = beam_core::transfer::ChunkPlan::new(payload.len() as u64, SMALL_CHUNK);
         let request = TransferRequest {
             transfer_id: TransferId::generate().expect("id"),
             sender_public_key: sender_key,
@@ -734,17 +739,17 @@ async fn data_before_accept_cannot_destroy_an_existing_partial() {
             size: payload.len() as u64,
             chunk_size: SMALL_CHUNK,
             chunk_count: plan.chunk_count(),
-            file_sha256: beam::transfer::sha256_hex(&payload),
+            file_sha256: beam_core::transfer::sha256_hex(&payload),
         };
         write_message(&mut client, &Message::TransferRequest(request))
             .await
             .expect("write request");
         write_message(
             &mut client,
-            &Message::ChunkStart(beam::transfer::ChunkStart {
+            &Message::ChunkStart(beam_core::transfer::ChunkStart {
                 index: 0,
                 len: SMALL_CHUNK,
-                sha256: beam::transfer::sha256_hex(&payload[..SMALL_CHUNK as usize]),
+                sha256: beam_core::transfer::sha256_hex(&payload[..SMALL_CHUNK as usize]),
             }),
         )
         .await
@@ -815,14 +820,14 @@ async fn a_file_that_fails_its_final_hash_is_discarded_and_never_written() {
         .await
     });
 
-    let plan = beam::transfer::ChunkPlan::new(world.payload.len() as u64, SMALL_CHUNK);
+    let plan = beam_core::transfer::ChunkPlan::new(world.payload.len() as u64, SMALL_CHUNK);
     let transfer_id = TransferId::generate().expect("id");
 
     // The lie: a whole-file hash that belongs to different contents. Every
     // chunk hash below is honest, so the receiver has no reason to object until
     // it checks the assembled file.
-    let promised = beam::transfer::sha256_hex(b"some other file entirely");
-    assert_ne!(promised, beam::transfer::sha256_hex(&world.payload));
+    let promised = beam_core::transfer::sha256_hex(b"some other file entirely");
+    assert_ne!(promised, beam_core::transfer::sha256_hex(&world.payload));
 
     write_message(
         &mut client,
@@ -849,15 +854,15 @@ async fn a_file_that_fails_its_final_hash_is_discarded_and_never_written() {
         let body = &world.payload[offset..offset + plan.len_of(index) as usize];
         write_message(
             &mut client,
-            &Message::ChunkStart(beam::transfer::ChunkStart {
+            &Message::ChunkStart(beam_core::transfer::ChunkStart {
                 index,
                 len: body.len() as u32,
-                sha256: beam::transfer::sha256_hex(body),
+                sha256: beam_core::transfer::sha256_hex(body),
             }),
         )
         .await
         .expect("write chunk start");
-        for slice in body.chunks(beam::transfer::MAX_CHUNK_DATA) {
+        for slice in body.chunks(beam_core::transfer::MAX_CHUNK_DATA) {
             write_message(
                 &mut client,
                 &Message::ChunkData {
@@ -877,7 +882,7 @@ async fn a_file_that_fails_its_final_hash_is_discarded_and_never_written() {
 
     write_message(
         &mut client,
-        &Message::Complete(beam::transfer::Complete {
+        &Message::Complete(beam_core::transfer::Complete {
             transfer_id,
             final_name: None,
         }),

@@ -16,9 +16,9 @@ use super::input::{Edit, Input};
 use super::palette::{self, Palette, Place, Suggestion};
 use super::pending::{Link, Owner, Pending, Receiving, Switch};
 use super::send::Sending;
-use crate::agent::status::Running;
-use crate::identity::{MAX_NAME_LEN, Store, StoreError};
-use crate::untrusted;
+use beam_core::agent::status::Running;
+use beam_core::identity::{MAX_NAME_LEN, Store, StoreError};
+use beam_core::untrusted;
 
 /// The tabs along the top, as in Discord's Friends page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,7 +239,7 @@ pub struct Snapshot {
     pub friends: Vec<Friend>,
     pub agent: Agent,
     /// What came and went, oldest first, its strings cleaned for drawing.
-    pub history: Vec<crate::history::Entry>,
+    pub history: Vec<beam_core::history::Entry>,
     /// Who runs the agent's receiver, when one runs.
     pub owner: Owner,
     /// Whether `beam listen` runs in this beam home.
@@ -268,7 +268,7 @@ impl Snapshot {
                 None
             }
         };
-        let history: Vec<crate::history::Entry> = crate::history::read(store)
+        let history: Vec<beam_core::history::Entry> = beam_core::history::read(store)
             .into_iter()
             .map(|mut e| {
                 e.peer = untrusted::name(&e.peer);
@@ -285,7 +285,7 @@ impl Snapshot {
                 .iter()
                 .rev()
                 .find(|e| {
-                    e.fingerprint == fingerprint && e.outcome != crate::history::Outcome::Failed
+                    e.fingerprint == fingerprint && e.outcome != beam_core::history::Outcome::Failed
                 })
                 .map(|e| e.at)
         };
@@ -310,7 +310,7 @@ impl Snapshot {
             }
         };
         let mut owner = Owner::Background;
-        let agent = match crate::agent::status::read(store) {
+        let agent = match beam_core::agent::status::read(store) {
             Running::Yes(status) => {
                 if status.in_view {
                     owner = if status.pid == std::process::id() {
@@ -327,8 +327,8 @@ impl Snapshot {
             Running::No => Agent::Stopped,
         };
         let listen_elsewhere = !matches!(
-            crate::listen_status::read(store),
-            crate::listen_status::Listening::No
+            beam_core::listen_status::read(store),
+            beam_core::listen_status::Listening::No
         );
         Self {
             me,

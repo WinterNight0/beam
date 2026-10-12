@@ -8,11 +8,11 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use beam::cli::desk::{DeskPrompt, testing};
-use beam::identity::{Identity, KnownPeers, Peer, encode_public_key};
-use beam::pairing::choose_name;
-use beam::transfer::frame::{read_message, write_message};
-use beam::transfer::message::{Cancel, Message, RejectReason, TransferId, TransferRequest};
-use beam::transfer::{
+use beam_core::identity::{Identity, KnownPeers, Peer, encode_public_key};
+use beam_core::pairing::choose_name;
+use beam_core::transfer::frame::{read_message, write_message};
+use beam_core::transfer::message::{Cancel, Message, RejectReason, TransferId, TransferRequest};
+use beam_core::transfer::{
     ReceiveOptions, SendOptions, SilentReporter, TransferError, receive_file, send_file, sha256_hex,
 };
 
@@ -57,7 +57,7 @@ async fn send_named(
     name: &str,
 ) -> (
     String,
-    Result<beam::transfer::ReceiveSummary, TransferError>,
+    Result<beam_core::transfer::ReceiveSummary, TransferError>,
 ) {
     let bytes = b"contents".to_vec();
     let (mut client, server) = tokio::io::duplex(64 * 1024);
@@ -97,7 +97,7 @@ async fn send_named(
         if let Ok(Message::Accept(_)) = read_message(&mut client).await {
             write_message(
                 &mut client,
-                &Message::ChunkStart(beam::transfer::message::ChunkStart {
+                &Message::ChunkStart(beam_core::transfer::message::ChunkStart {
                     index: 0,
                     len: bytes.len() as u32,
                     sha256: sha256_hex(&bytes),
@@ -112,7 +112,7 @@ async fn send_named(
             let transfer_id = TransferId::from_bytes([0; 16]);
             let _ = write_message(
                 &mut client,
-                &Message::Complete(beam::transfer::message::Complete {
+                &Message::Complete(beam_core::transfer::message::Complete {
                     transfer_id,
                     final_name: None,
                 }),
@@ -169,9 +169,9 @@ async fn a_name_with_a_bidi_override_is_refused_before_the_prompt() {
     assert!(
         matches!(
             result,
-            Err(TransferError::Name(beam::transfer::NameError::BidiControl(
-                '\u{202E}'
-            )))
+            Err(TransferError::Name(
+                beam_core::transfer::NameError::BidiControl('\u{202E}')
+            ))
         ),
         "{result:?}"
     );
@@ -252,7 +252,7 @@ fn a_hostile_hint_becomes_a_plain_name() {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
             "{hint:?} became {name:?}"
         );
-        beam::identity::validate_name(&name).unwrap();
+        beam_core::identity::validate_name(&name).unwrap();
     }
 }
 
@@ -260,19 +260,19 @@ fn a_hostile_hint_becomes_a_plain_name() {
 #[test]
 fn the_pairing_prompt_cannot_be_driven_by_the_name() {
     let (desk, typed, screen) = testing::desk();
-    let request = beam::pairing::ConfirmRequest {
-        role: beam::pairing::Role::Waiter,
+    let request = beam_core::pairing::ConfirmRequest {
+        role: beam_core::pairing::Role::Waiter,
         name: "x\u{1B}[2J\u{202E}".into(),
-        peer_fingerprint: beam::identity::Fingerprint::of(
+        peer_fingerprint: beam_core::identity::Fingerprint::of(
             &Identity::generate("a").unwrap().verifying_key(),
         ),
-        own_fingerprint: beam::identity::Fingerprint::of(
+        own_fingerprint: beam_core::identity::Fingerprint::of(
             &Identity::generate("b").unwrap().verifying_key(),
         ),
     };
     let asking = std::thread::spawn(move || {
         let mut prompt = DeskPrompt::new(desk, Duration::from_secs(5));
-        beam::pairing::Confirm::confirm(&mut prompt, &request)
+        beam_core::pairing::Confirm::confirm(&mut prompt, &request)
     });
     screen.wait_for("Type \"yes\"", PATIENCE);
     typed.send("no".into()).unwrap();
@@ -318,7 +318,7 @@ async fn a_cancel_reason_cannot_carry_escapes() {
 /// the sender prints is ours.
 #[test]
 fn reject_reasons_are_not_free_text() {
-    let parsed: Result<beam::transfer::message::Reject, _> = serde_json::from_str(
+    let parsed: Result<beam_core::transfer::message::Reject, _> = serde_json::from_str(
         r#"{"transfer_id":"00112233445566778899aabbccddeeff","reason":"\u001b[2Jdeclined"}"#,
     );
     assert!(parsed.is_err());

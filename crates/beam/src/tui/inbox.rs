@@ -13,9 +13,9 @@
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use crate::actions::inbox::{Address, ConnectError, Inbox, InboxEvent};
+use beam_core::actions::inbox::{Address, ConnectError, Inbox, InboxEvent};
 
-pub use crate::actions::inbox::RequestView;
+pub use beam_core::actions::inbox::RequestView;
 
 /// What the agent said.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,15 +151,15 @@ pub(super) mod tests {
         use std::time::Duration;
 
         use super::super::*;
-        use crate::agent::status::{self, Running};
-        use crate::agent::{self, AgentOptions};
-        use crate::config::Relay;
-        use crate::identity::{Identity, Peer, Store};
-        use crate::invite::Invite;
-        use crate::pairing::Network;
-        use crate::transfer::{SendOptions, SilentReporter, TransferError};
-        use crate::transport::dial::{dial_transfer, send_on};
-        use crate::transport::endpoint::{self, Bind};
+        use beam_core::agent::status::{self, Running};
+        use beam_core::agent::{self, AgentOptions};
+        use beam_core::config::Relay;
+        use beam_core::identity::{Identity, Peer, Store};
+        use beam_core::invite::Invite;
+        use beam_core::pairing::Network;
+        use beam_core::transfer::{SendOptions, SilentReporter, TransferError};
+        use beam_core::transport::dial::{dial_transfer, send_on};
+        use beam_core::transport::endpoint::{self, Bind};
 
         pub(in crate::tui) struct Home {
             _tmp: tempfile::TempDir,
@@ -238,7 +238,8 @@ pub(super) mod tests {
             from: &Home,
             at: iroh::EndpointAddr,
             bytes: &[u8],
-        ) -> tokio::task::JoinHandle<Result<crate::transfer::SendSummary, TransferError>> {
+        ) -> tokio::task::JoinHandle<Result<beam_core::transfer::SendSummary, TransferError>>
+        {
             let path = from.files.join("report.pdf");
             std::fs::write(&path, bytes).unwrap();
             let identity = from.identity.clone();
@@ -249,7 +250,7 @@ pub(super) mod tests {
                 let connection = dial_transfer(&endpoint, at).await.expect("dial the agent");
                 let mut options = SendOptions::new(
                     path,
-                    crate::identity::encode_public_key(&identity.verifying_key()),
+                    beam_core::identity::encode_public_key(&identity.verifying_key()),
                 );
                 options.accept_timeout = Duration::from_secs(60);
                 let result = send_on(&connection, &mut options, &mut SilentReporter).await;
@@ -276,7 +277,10 @@ pub(super) mod tests {
 
         async fn request_from_bob(
             accept: bool,
-        ) -> (Home, Result<crate::transfer::SendSummary, TransferError>) {
+        ) -> (
+            Home,
+            Result<beam_core::transfer::SendSummary, TransferError>,
+        ) {
             let (alice, bob) = (home("alice"), home("bob"));
             pair(&alice, "bob", &bob, "alice");
             let (status, _stop) = start_agent(&alice).await;
@@ -316,10 +320,13 @@ pub(super) mod tests {
             result.expect("sent");
             let saved = std::fs::read(alice.inbox.join("report.pdf")).unwrap();
             assert_eq!(saved, b"the quarterly numbers");
-            let history = crate::history::read(&alice.store);
+            let history = beam_core::history::read(&alice.store);
             assert_eq!(history.len(), 1, "{history:?}");
-            assert_eq!(history[0].direction, crate::history::Direction::Received);
-            assert_eq!(history[0].outcome, crate::history::Outcome::Done);
+            assert_eq!(
+                history[0].direction,
+                beam_core::history::Direction::Received
+            );
+            assert_eq!(history[0].outcome, beam_core::history::Outcome::Done);
             assert_eq!(
                 (history[0].peer.as_str(), history[0].file.as_str()),
                 ("bob", "report.pdf")
@@ -331,9 +338,9 @@ pub(super) mod tests {
             let (alice, result) = request_from_bob(false).await;
             assert!(result.is_err(), "{result:?}");
             assert!(!alice.inbox.join("report.pdf").exists());
-            let history = crate::history::read(&alice.store);
+            let history = beam_core::history::read(&alice.store);
             assert_eq!(history.len(), 1, "{history:?}");
-            assert_eq!(history[0].outcome, crate::history::Outcome::Declined);
+            assert_eq!(history[0].outcome, beam_core::history::Outcome::Declined);
             assert_eq!(history[0].file, "report.pdf", "the declined file is named");
         }
     }
