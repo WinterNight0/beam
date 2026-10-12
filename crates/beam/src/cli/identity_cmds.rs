@@ -80,7 +80,7 @@ impl App {
             )));
         }
 
-        let hostname = hostname();
+        let hostname = crate::identity::hostname();
         let identity = Identity::generate(&hostname).map_err(|e| StoreError::Key {
             path: self.store.private_key_path(),
             source: e,
@@ -253,19 +253,6 @@ pub(super) fn write_json<T: Serialize>(io: &mut Io<'_>, value: &T) -> Result<(),
     let text = serde_json::to_string_pretty(value)?;
     writeln!(io.out, "{text}")?;
     Ok(())
-}
-
-/// A best-effort machine name for the public key comment. It is cosmetic, so a
-/// missing value is not an error.
-pub(crate) fn hostname() -> String {
-    for key in ["COMPUTERNAME", "HOSTNAME"] {
-        if let Ok(name) = std::env::var(key)
-            && !name.trim().is_empty()
-        {
-            return name;
-        }
-    }
-    String::new()
 }
 
 /// The part of `whoami` about a running `listen`: its invite and the pairing

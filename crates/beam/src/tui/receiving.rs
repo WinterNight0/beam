@@ -101,7 +101,7 @@ fn run(
         accept_timeout: agent::AGENT_ACCEPT_TIMEOUT,
         port_mapping: config.agent_port_mapping,
         notify,
-        echo: false,
+        echo: None,
         in_view: true,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()

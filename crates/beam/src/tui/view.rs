@@ -384,7 +384,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some(out) = app.sending.as_ref().filter(|s| s.running()) {
         let what = match out.stage {
             Stage::Moving { done, total, .. } if total > 0 => {
-                format!("{} %", crate::ui::percent(done, total))
+                format!("{} %", crate::text::percent(done, total))
             }
             Stage::Waiting => "waiting".to_string(),
             _ => "…".to_string(),
@@ -397,7 +397,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     if let Some(live) = app.receiving {
         right.push(Span::styled(
-            format!(" ⇣ {} % ", crate::ui::percent(live.done, live.total)),
+            format!(" ⇣ {} % ", crate::text::percent(live.done, live.total)),
             Style::new().bg(ACCENT).fg(Color::White).bold(),
         ));
         right.push(Span::raw(" "));
@@ -552,7 +552,7 @@ fn draw_friends(frame: &mut Frame, area: Rect, app: &mut App) {
             middle.push(Line::from(vec![
                 Span::styled(" ← ", Style::new().fg(ACCENT).bold()),
                 Span::styled(p.request.file_name.clone(), Style::new().bold()),
-                Span::raw(format!("  {}  ", crate::ui::format_bytes(p.request.size))),
+                Span::raw(format!("  {}  ", crate::text::format_bytes(p.request.size))),
                 Span::styled(" WAITING ", Style::new().bg(DANGER).fg(Color::White).bold()),
                 Span::styled(
                     format!("  {} left · Enter to answer", countdown(p.expires)),
@@ -750,7 +750,7 @@ fn transfers(friend: Option<&Friend>, history: &[crate::history::Entry]) -> Vec<
         let mut spans = vec![
             Span::styled(arrow, arrow_style.bold()),
             Span::styled(e.file.clone(), Style::new().bold()),
-            Span::raw(format!("  {}  ", crate::ui::format_bytes(e.size))),
+            Span::raw(format!("  {}  ", crate::text::format_bytes(e.size))),
             Span::styled(
                 format!(
                     "{}{mark}",
@@ -872,7 +872,7 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(
                     format!(
                         " {} · {} left",
-                        crate::ui::format_bytes(p.request.size),
+                        crate::text::format_bytes(p.request.size),
                         countdown(p.expires)
                     ),
                     Style::new().fg(MUTED),
@@ -914,8 +914,8 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
             Span::styled("Receiving  ", Style::new().fg(MUTED)),
             Span::raw(format!(
                 "{} of {}  {path}",
-                crate::ui::format_bytes(live.done),
-                crate::ui::format_bytes(live.total)
+                crate::text::format_bytes(live.done),
+                crate::text::format_bytes(live.total)
             )),
         ]));
         let width = status.width.saturating_sub(8) as u64;
@@ -930,7 +930,7 @@ fn draw_pending(frame: &mut Frame, area: Rect, app: &mut App) {
             ),
             Span::raw(format!(
                 " {:>3} %",
-                crate::ui::percent(live.done, live.total)
+                crate::text::percent(live.done, live.total)
             )),
         ]));
         lines.push(Line::from(""));
@@ -947,11 +947,11 @@ fn stage_words(stage: &Stage, peer: &str) -> String {
     match *stage {
         Stage::Starting | Stage::Dialling => format!("looking for {peer}…"),
         Stage::Hashing { done, total } => {
-            format!("reading the file {} %", crate::ui::percent(done, total))
+            format!("reading the file {} %", crate::text::percent(done, total))
         }
         Stage::Waiting => format!("waiting for {peer} to accept"),
         Stage::Moving { done, total, .. } if total > 0 => {
-            format!("sending {} %", crate::ui::percent(done, total))
+            format!("sending {} %", crate::text::percent(done, total))
         }
         Stage::Moving { .. } => "accepted".to_string(),
         Stage::Checking { .. } => format!("{peer} is checking the file"),
@@ -968,7 +968,7 @@ fn bar(done: u64, total: u64, width: u16) -> Line<'static> {
             "░".repeat((width - filled) as usize),
             Style::new().fg(BORDER),
         ),
-        Span::raw(format!(" {:>3} %", crate::ui::percent(done, total))),
+        Span::raw(format!(" {:>3} %", crate::text::percent(done, total))),
     ])
 }
 
@@ -1136,7 +1136,7 @@ fn draw_browse(frame: &mut Frame, area: Rect, areas: &mut Areas, b: &Browser) {
                     (
                         Span::raw(name),
                         Span::styled(
-                            format!("{:>10}  {when:>12}", crate::ui::format_bytes(entry.size)),
+                            format!("{:>10}  {when:>12}", crate::text::format_bytes(entry.size)),
                             Style::new().fg(MUTED),
                         ),
                     )
@@ -1472,7 +1472,7 @@ fn draw_accept(
         ]),
         Line::from(vec![
             Span::styled("Size   ", Style::new().fg(MUTED)),
-            Span::raw(crate::ui::format_bytes(request.size)),
+            Span::raw(crate::text::format_bytes(request.size)),
         ]),
     ];
     if let Some(resume) = &request.resume {

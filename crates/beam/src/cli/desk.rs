@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::pairing::{ConfirmRequest, Role};
 use crate::transfer::PromptRequest;
-use crate::{ui, untrusted};
+use crate::{text, ui, untrusted};
 
 /// Set while a question is on screen, so a progress line does not redraw over
 /// it. Read by `terminal::TerminalReporter`.
@@ -87,15 +87,15 @@ impl Question {
                 ui::field(out, "Fingerprint", &request.fingerprint)?;
                 // Cut in the middle if long, so the extension stays in view.
                 ui::field(out, "File", &untrusted::name(&request.file_name))?;
-                ui::field(out, "Size", &ui::format_bytes(request.size))?;
+                ui::field(out, "Size", &text::format_bytes(request.size))?;
                 if let Some(resume) = &request.resume {
                     let mut already = format!(
                         "{} ({}%)",
-                        ui::format_bytes(resume.have_bytes),
-                        ui::percent(resume.have_bytes, request.size)
+                        text::format_bytes(resume.have_bytes),
+                        text::percent(resume.have_bytes, request.size)
                     );
                     if let Some(age) = resume.age {
-                        already.push_str(&format!(", from {}", ui::format_age(age)));
+                        already.push_str(&format!(", from {}", text::format_age(age)));
                     }
                     ui::field(out, "Already have", &already)?;
                 }

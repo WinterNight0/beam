@@ -176,7 +176,7 @@ These are accepted on purpose, with their reasons, in
 | 2026-10-02 | F-2: a fixed port with router port mapping makes `listen` findable by scanning; anyone can use up its pairing codes | Low | **Open**, planned: R-8 |
 | 2026-10-02 | F-3: an invite could name any `http://` or local relay URL, making beam connect to local services or talk to a relay in plain text | Low | **Fixed**: invites accept only `https://` relays on public hosts (ADR-0038) |
 | 2026-10-02 | F-4: CI token had default permissions; actions referenced by movable tags; no automatic dependency audit | Low | **Fixed**: read-only token, actions pinned to commits, `cargo audit` job |
-| 2026-10-12 | F-5: in the full-screen view, the message for a failed send was drawn without cleaning. It can quote network error text, including the reason a peer gives for closing a connection, so a hostile paired device could put control characters on the screen. `beam send` was not affected (it cleans when it prints) | Low | **Fixed**: the view cleans it too; `tui::sending::tests::failure_messages_for_the_view_carry_no_control_characters` |
+| 2026-10-12 | F-5: in the full-screen view, the message for a failed send was drawn without cleaning. It can quote network error text, including the reason a peer gives for closing a connection, so a hostile paired device could put control characters on the screen. `beam send` was not affected (it cleans when it prints) | Low | **Fixed**: the messages now come back cleaned from the one place every front end takes them (`actions::messages`); `actions::messages::tests::messages_come_back_cleaned` |
 | M6 | Impersonation, terminal injection, hostile-peer limits | — | Fixed and tested in M6; `threat-model.md` |
 
 ## 8. Reporting a vulnerability

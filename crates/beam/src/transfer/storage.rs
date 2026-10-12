@@ -96,8 +96,8 @@ pub fn check_space(
     if partial_available < partial_needed {
         return Err(SpaceError::Insufficient {
             where_: format!("partial transfers ({})", partial_dir.display()),
-            needed: crate::ui::format_bytes(partial_needed),
-            available: crate::ui::format_bytes(partial_available),
+            needed: crate::text::format_bytes(partial_needed),
+            available: crate::text::format_bytes(partial_available),
         });
     }
 
@@ -112,8 +112,8 @@ pub fn check_space(
     if destination_available < destination_needed {
         return Err(SpaceError::Insufficient {
             where_: format!("the destination ({})", destination_dir.display()),
-            needed: crate::ui::format_bytes(destination_needed),
-            available: crate::ui::format_bytes(destination_available),
+            needed: crate::text::format_bytes(destination_needed),
+            available: crate::text::format_bytes(destination_available),
         });
     }
 

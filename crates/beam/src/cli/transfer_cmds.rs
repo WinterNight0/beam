@@ -17,6 +17,7 @@ use super::desk::{DeskPrompt, PromptDesk};
 use super::terminal::{Keyboard, TerminalReporter};
 use super::{App, CommandError, Io};
 use crate::identity::{Identity, KnownPeers, encode_public_key};
+use crate::text;
 use crate::transfer::{
     DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialError, ReceiveOptions, Reporter, SendOptions,
     SilentReporter, TransferError, TransferId, receive_file, send_file,
@@ -186,7 +187,7 @@ impl App {
                             let how = if summary.resumed {
                                 format!(
                                     " (resumed; {} received this time)",
-                                    ui::format_bytes(summary.received_now)
+                                    text::format_bytes(summary.received_now)
                                 )
                             } else {
                                 String::new()
@@ -194,7 +195,7 @@ impl App {
                             writeln!(
                                 io.out,
                                 "Received {} from {} ({}), saved as {}{}",
-                                ui::format_bytes(summary.bytes),
+                                text::format_bytes(summary.bytes),
                                 summary.peer_name,
                                 summary.fingerprint,
                                 summary.final_name,
@@ -287,7 +288,7 @@ impl App {
                 let skipped = if summary.bytes_skipped > 0 {
                     format!(
                         " ({} was already there)",
-                        ui::format_bytes(summary.bytes_skipped)
+                        text::format_bytes(summary.bytes_skipped)
                     )
                 } else {
                     String::new()
@@ -295,7 +296,7 @@ impl App {
                 writeln!(
                     io.out,
                     "Sent {} to {peer_name}, saved on their side as {saved}{skipped}",
-                    ui::format_bytes(summary.bytes_sent)
+                    text::format_bytes(summary.bytes_sent)
                 )?;
             }
             io.out.flush()?;
@@ -350,13 +351,13 @@ impl App {
             .map(|p| {
                 let age = match (p.expired, p.age()) {
                     (true, _) => "expired".to_string(),
-                    (false, Some(age)) => ui::format_age(age),
+                    (false, Some(age)) => text::format_age(age),
                     (false, None) => "-".to_string(),
                 };
                 vec![
                     p.id[..8.min(p.id.len())].to_string(),
                     p.file_name.clone(),
-                    ui::format_bytes(p.size),
+                    text::format_bytes(p.size),
                     format!("{}%", p.percent()),
                     age,
                 ]
@@ -415,8 +416,8 @@ impl App {
                     &format!(
                         "{} ({} of {})",
                         target.file_name,
-                        ui::format_bytes(target.have_bytes),
-                        ui::format_bytes(target.size)
+                        text::format_bytes(target.have_bytes),
+                        text::format_bytes(target.size)
                     ),
                 )?;
             }

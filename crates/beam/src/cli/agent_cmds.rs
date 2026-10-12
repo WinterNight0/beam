@@ -79,7 +79,7 @@ impl App {
             accept_timeout: AGENT_ACCEPT_TIMEOUT,
             port_mapping: config.agent_port_mapping,
             notify: true,
-            echo: true,
+            echo: Some(print_line),
             in_view: false,
         };
         let _ = io;
@@ -499,4 +499,9 @@ async fn stop_signal() {
     }
     #[cfg(not(unix))]
     super::net_cmds::interrupted().await;
+}
+
+/// How `beam agent` run in a terminal shows what the agent does.
+fn print_line(line: &str) {
+    println!("{line}");
 }

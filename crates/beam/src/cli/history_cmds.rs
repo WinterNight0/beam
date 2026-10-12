@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use super::{App, CommandError, Io};
 use crate::history::{self, Direction, Outcome};
-use crate::{ui, untrusted};
+use crate::{text, ui, untrusted};
 
 /// The `--json` shape of one entry. File and peer names are given as stored;
 /// a program reading them is responsible for showing them safely.
@@ -85,7 +85,7 @@ impl App {
                     history::ago(e.at, now),
                     format!("{way} {}", untrusted::name(&e.peer)),
                     untrusted::name(&e.file),
-                    ui::format_bytes(e.size),
+                    text::format_bytes(e.size),
                     result,
                 ]
             })

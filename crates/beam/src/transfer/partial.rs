@@ -153,7 +153,7 @@ pub struct PartialSummary {
 impl PartialSummary {
     /// How far along this partial is, 0-100.
     pub fn percent(&self) -> u8 {
-        crate::ui::percent(self.have_bytes, self.size)
+        crate::text::percent(self.have_bytes, self.size)
     }
 
     /// How long ago it was last written to.

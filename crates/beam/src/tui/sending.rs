@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
+use crate::actions::messages;
 use crate::config::Config;
 use crate::history;
 use crate::identity::{Fingerprint, Store, encode_public_key};
@@ -18,7 +19,7 @@ use crate::invite;
 use crate::transfer::{Progress, Reporter, SendOptions};
 use crate::transport::dial::{dial_transfer, interrupt, send_on};
 use crate::transport::endpoint::{self, Bind};
-use crate::{ui, untrusted};
+use crate::{text, untrusted};
 
 /// What the sending thread tells the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,23 +76,6 @@ impl Outgoing {
     }
 }
 
-/// Why the friend could not be reached, as `beam send` says it. Cleaned
-/// here because the view draws it as it is, and the reason can quote the
-/// network: a peer chooses the reason it gives for closing a connection.
-/// (`beam send` cleans when it prints; this text never passes there.)
-fn unreachable(
-    peer: &str,
-    key: &ed25519_dalek::VerifyingKey,
-    error: crate::transport::dial::DialError,
-) -> String {
-    untrusted::lines(&crate::cli::net_cmds::unreachable_message(peer, key, error).to_string())
-}
-
-/// A refusal from the friend, as `beam send` says it, cleaned for the view.
-fn refused(peer: &str, error: crate::transfer::TransferError) -> String {
-    untrusted::lines(&crate::cli::net_cmds::refused_message(peer, error).to_string())
-}
-
 /// Passes the engine's progress to the view.
 struct ToView<'a>(&'a Sender<SendUpdate>);
 
@@ -144,12 +128,12 @@ fn run(
             let _ = updates.send(SendUpdate::Dialling);
             let connection = dial_transfer(&endpoint, peer_addr).await.map_err(|e| {
                 ended = Some((history::Outcome::Failed, Some("not reachable".to_string())));
-                unreachable(&peer_name, &peer_key, e)
+                messages::unreachable(&peer_name, &peer_key, e)
             })?;
             *live.lock().expect("not poisoned") = Some(connection.clone());
             let sent = send_on(&connection, &mut options, &mut ToView(updates)).await;
             ended = Some(history::send_outcome(&sent));
-            sent.map_err(|e| refused(&peer_name, e))
+            sent.map_err(|e| messages::refused(&peer_name, e))
         };
         let outcome = tokio::select! {
             outcome = attempt => outcome,
@@ -194,14 +178,14 @@ fn run(
     let skipped = if summary.bytes_skipped > 0 {
         format!(
             " ({} was already there)",
-            ui::format_bytes(summary.bytes_skipped)
+            text::format_bytes(summary.bytes_skipped)
         )
     } else {
         String::new()
     };
     Ok(format!(
         "Sent {} to {peer_name}, saved on their side as {saved}{skipped}.",
-        ui::format_bytes(summary.bytes_sent)
+        text::format_bytes(summary.bytes_sent)
     ))
 }
 
@@ -434,32 +418,6 @@ mod tests {
             .unwrap();
         assert_eq!(code, crate::cli::EXIT_OK, "{err}");
         only_carol_got_it(&two, "for-carol.txt");
-    }
-
-    /// What the view shows when a send fails can quote the other side (the
-    /// reason a peer gives for closing, a cancel reason); none of it may
-    /// reach the screen as control characters (ADR-0035).
-    #[test]
-    fn failure_messages_for_the_view_carry_no_control_characters() {
-        use crate::transfer::TransferError;
-        use crate::transport::dial::DialError;
-        let key = crate::identity::Identity::generate("x")
-            .unwrap()
-            .verifying_key();
-        let hostile = "closed by peer: \u{1b}[2J\u{1b}]0;owned\u{7}gone";
-        let not_reached = unreachable("alice", &key, DialError::Unreachable(hostile.into()));
-        assert!(not_reached.contains("alice is not reachable") || not_reached.contains("alice ("));
-        for shown in [
-            not_reached,
-            refused("alice", TransferError::Cancelled(hostile.into())),
-            refused("alice", TransferError::BadRequest(hostile.into())),
-        ] {
-            assert!(shown.contains("gone"), "the reason is still there: {shown}");
-            assert!(
-                !shown.chars().any(|c| c.is_control() && c != '\n'),
-                "{shown:?}"
-            );
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

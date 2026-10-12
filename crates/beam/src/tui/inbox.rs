@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use crate::agent::ipc::{AgentMsg, Client, ClientMsg, RequestInfo};
-use crate::{ui, untrusted};
+use crate::{text, untrusted};
 
 /// A transfer request, ready to draw.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,13 +34,13 @@ impl From<RequestInfo> for RequestView {
         let resume = r.resume.as_ref().map(|x| {
             let age = x
                 .age_secs
-                .map(|s| format!(", from {}", ui::format_age(Duration::from_secs(s))))
+                .map(|s| format!(", from {}", text::format_age(Duration::from_secs(s))))
                 .unwrap_or_default();
             format!(
                 "continues: {} of {} ({} %) already here{age}",
-                ui::format_bytes(x.have_bytes),
-                ui::format_bytes(r.size),
-                ui::percent(x.have_bytes, r.size)
+                text::format_bytes(x.have_bytes),
+                text::format_bytes(r.size),
+                text::percent(x.have_bytes, r.size)
             )
         });
         let fingerprint = r.fingerprint.trim_start_matches("SHA256:").to_string();
@@ -275,7 +275,7 @@ pub(super) mod tests {
                 accept_timeout: Duration::from_secs(60),
                 port_mapping: false,
                 notify: false,
-                echo: false,
+                echo: None,
                 in_view: false,
             };
             let (identity, store) = (home.identity.clone(), home.store.clone());

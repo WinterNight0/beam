@@ -6,8 +6,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::text;
 use crate::transfer::{Progress, Reporter};
-use crate::ui;
 
 /// Lines typed at the keyboard.
 ///
@@ -203,9 +203,9 @@ impl Reporter for TerminalReporter {
             Progress::Hashing { done, total } => {
                 let text = format!(
                     "Hashing {} of {} ({}%)",
-                    ui::format_bytes(done),
-                    ui::format_bytes(total),
-                    ui::percent(done, total)
+                    text::format_bytes(done),
+                    text::format_bytes(total),
+                    text::percent(done, total)
                 );
                 self.draw(&text, false);
             }
@@ -220,9 +220,9 @@ impl Reporter for TerminalReporter {
                 let text = format!(
                     "{} {} of {} ({}%)",
                     path.label(),
-                    ui::format_bytes(done),
-                    ui::format_bytes(total),
-                    ui::percent(done, total)
+                    text::format_bytes(done),
+                    text::format_bytes(total),
+                    text::percent(done, total)
                 );
                 self.draw(&text, done >= total);
             }
@@ -237,9 +237,9 @@ impl Reporter for TerminalReporter {
             Progress::PeerVerifying { done, total } => {
                 let text = format!(
                     "The peer is verifying the file: {} of {} ({}%)",
-                    ui::format_bytes(done),
-                    ui::format_bytes(total),
-                    ui::percent(done, total)
+                    text::format_bytes(done),
+                    text::format_bytes(total),
+                    text::percent(done, total)
                 );
                 self.draw(&text, done >= total);
             }

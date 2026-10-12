@@ -393,7 +393,7 @@ fn create_identity(store: &Store) -> Done {
     if store.has_identity() {
         return Done::Message("This device already has its identity.".to_string());
     }
-    let made = crate::identity::Identity::generate(&crate::cli::identity_cmds::hostname())
+    let made = crate::identity::Identity::generate(&crate::identity::hostname())
         .map_err(|e| e.to_string())
         .and_then(|identity| {
             store

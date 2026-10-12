@@ -16,6 +16,7 @@ use super::terminal::Keyboard;
 use super::terminal::TerminalReporter;
 use super::transfer_cmds::{EitherReporter, ReceiveJson, SendJson, reporter_for};
 use super::{App, CommandError, Io};
+use crate::actions::messages;
 use crate::config::Config;
 use crate::history;
 use crate::identity::{Fingerprint, encode_public_key};
@@ -24,12 +25,10 @@ use crate::listen_status::Board;
 use crate::listener::{ListenEvent, ListenOptions};
 use crate::pairing::rotation::NewCodeReason;
 use crate::pairing::{Network, Policy, Timeouts};
-use crate::transfer::{
-    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore, RejectReason, SendOptions, TransferError,
-};
-use crate::transport::dial::{DialError, dial_transfer, interrupt, send_on};
+use crate::transfer::{DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore, SendOptions};
+use crate::transport::dial::{dial_transfer, interrupt, send_on};
 use crate::transport::endpoint::{self, Bind};
-use crate::{ui, untrusted};
+use crate::{text, ui, untrusted};
 
 impl App {
     fn network(&self, loopback: bool) -> Result<Network, CommandError> {
@@ -205,7 +204,7 @@ impl App {
                 let connection = dial_transfer(&endpoint, peer_addr).await.map_err(|e| {
                     *ended.lock().expect("not poisoned") =
                         Some((history::Outcome::Failed, Some("not reachable".to_string())));
-                    unreachable_message(&peer_name, &peer_key, e)
+                    CommandError::Message(messages::unreachable(&peer_name, &peer_key, e))
                 })?;
                 *live.lock().expect("not poisoned") = Some(connection.clone());
                 if !self.json {
@@ -216,7 +215,7 @@ impl App {
                 let sent = send_on(&connection, &mut options, &mut reporter).await;
                 reporter.finish();
                 *ended.lock().expect("not poisoned") = Some(history::send_outcome(&sent));
-                sent.map_err(|e| refused_message(&peer_name, e))
+                sent.map_err(|e| CommandError::Message(messages::refused(&peer_name, e)))
             };
             // Ctrl+C: tell the receiver, so it does not wait for a timeout,
             // and say so here (ADR-0041).
@@ -259,7 +258,7 @@ impl App {
                 let skipped = if summary.bytes_skipped > 0 {
                     format!(
                         " ({} was already there)",
-                        ui::format_bytes(summary.bytes_skipped)
+                        text::format_bytes(summary.bytes_skipped)
                     )
                 } else {
                     String::new()
@@ -267,7 +266,7 @@ impl App {
                 writeln!(
                     io.out,
                     "Sent {} to {peer_name}, saved on their side as {saved}{skipped}",
-                    ui::format_bytes(summary.bytes_sent)
+                    text::format_bytes(summary.bytes_sent)
                 )?;
             }
             io.out.flush()?;
@@ -317,66 +316,6 @@ fn interrupted_message(peer: &str, told: bool) -> CommandError {
     } else {
         format!("cancelled: you stopped beam (Ctrl+C) before {peer} was reached; nothing was sent.")
     })
-}
-
-/// Why `send` could not reach the peer, in words that say what to do.
-pub(crate) fn unreachable_message(
-    peer: &str,
-    key: &ed25519_dalek::VerifyingKey,
-    error: DialError,
-) -> CommandError {
-    let fingerprint = Fingerprint::of(key).short();
-    CommandError::Message(match error {
-        DialError::Unreachable(why) => format!(
-            "{peer} ({fingerprint}) is not reachable ({why}).\n       \
-             Either {peer} is not running `beam listen`, {peer} is somewhere beam was not\n       \
-             told about, or {peer}'s key has changed because it ran `beam init` again.\n       \
-             beam never follows a key change by itself.\n\n       \
-             If {peer} is listening, ask for the invite it shows now and run\n           \
-             beam pair <{peer}'s invite> --name {peer}\n       \
-             That only updates where to find {peer}; it cannot change {peer}'s key.\n\n       \
-             WARNING: if {peer} now has a new key, someone could be impersonating {peer}.\n       \
-             Check the new fingerprint with {peer} in person before you re-pair:\n           \
-             beam remove {peer}\n           \
-             beam pair <{peer}'s new invite> --name {peer}"
-        ),
-        DialError::NoAddress => format!(
-            "beam does not know where to find {peer} ({fingerprint}): no relay is set in\n       \
-             config.toml and no address was saved for {peer}. Ask for the invite `beam listen`\n       \
-             shows on {peer} and run\n           \
-             beam pair <{peer}'s invite> --name {peer}"
-        ),
-        other => other.to_string(),
-    })
-}
-
-/// A refusal from the peer, said the way a person would say it.
-pub(crate) fn refused_message(peer: &str, error: TransferError) -> CommandError {
-    match error {
-        TransferError::PeerInterrupted => CommandError::Message(format!(
-            "{peer} stopped beam on their side (Ctrl+C), so the transfer was cancelled.\n       \
-             Anything {peer} already received is kept: send the same file again later to resume."
-        )),
-        TransferError::Rejected(RejectReason::Busy) => {
-            CommandError::Message(format!("{peer} is receiving another file; try again later"))
-        }
-        TransferError::Rejected(RejectReason::UnknownPeer) => CommandError::Message(format!(
-            "{peer} does not recognise this device's key.\n       \
-             Either {peer} removed this device, or this device's key changed since pairing\n       \
-             because `beam init` was run again here.\n\n       \
-             WARNING: a changed key is exactly what an impersonator would present, so {peer}\n       \
-             must not simply accept it. To re-pair, compare fingerprints in person:\n           \
-             on {peer}:  beam remove <this device>, then beam listen\n           \
-             here:     beam remove {peer}, then beam pair <{peer}'s invite> --name {peer}"
-        )),
-        TransferError::Rejected(RejectReason::Declined) => {
-            CommandError::Message(format!("{peer} declined the transfer"))
-        }
-        TransferError::Rejected(RejectReason::Expired) => CommandError::Message(format!(
-            "{peer} did not answer within a minute; the transfer was not accepted"
-        )),
-        other => other.into(),
-    }
 }
 
 /// Prints what `listen` hears. Runs on the listener's tasks, so it writes to
@@ -540,7 +479,7 @@ impl Screen {
                 let how = if summary.resumed {
                     format!(
                         " (resumed; {} received this time)",
-                        ui::format_bytes(summary.received_now)
+                        text::format_bytes(summary.received_now)
                     )
                 } else {
                     String::new()
@@ -548,7 +487,7 @@ impl Screen {
                 writeln!(
                     out,
                     "Received {} from {} ({}), saved as {}{}",
-                    ui::format_bytes(summary.bytes),
+                    text::format_bytes(summary.bytes),
                     untrusted::name(&summary.peer_name),
                     summary.fingerprint,
                     untrusted::name(&summary.final_name),

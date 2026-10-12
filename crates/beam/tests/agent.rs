@@ -98,7 +98,7 @@ async fn start_agent(home: &Home, accept_timeout: Duration) -> Running_ {
         accept_timeout,
         port_mapping: false,
         notify: false,
-        echo: false,
+        echo: None,
         in_view: false,
     };
     let (identity, store) = (home.identity.clone(), home.store.clone());
@@ -506,7 +506,7 @@ async fn a_second_agent_in_the_same_home_is_refused() {
         accept_timeout: Duration::from_secs(60),
         port_mapping: false,
         notify: false,
-        echo: false,
+        echo: None,
         in_view: false,
     };
     let second = agent::run(
