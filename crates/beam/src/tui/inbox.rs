@@ -283,13 +283,27 @@ pub(super) mod tests {
             (alice, result)
         }
 
+        /// The receiver's history, once its line is there. The agent answers
+        /// the sender first and writes the line just after, so the sender
+        /// can finish a moment before it exists.
+        async fn history_of(home: &Home) -> Vec<beam_core::history::Entry> {
+            for _ in 0..100 {
+                let history = beam_core::history::read(&home.store);
+                if !history.is_empty() {
+                    return history;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            beam_core::history::read(&home.store)
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn accepting_in_the_view_saves_the_file() {
             let (alice, result) = request_from_bob(true).await;
             result.expect("sent");
             let saved = std::fs::read(alice.inbox.join("report.pdf")).unwrap();
             assert_eq!(saved, b"the quarterly numbers");
-            let history = beam_core::history::read(&alice.store);
+            let history = history_of(&alice).await;
             assert_eq!(history.len(), 1, "{history:?}");
             assert_eq!(
                 history[0].direction,
@@ -307,7 +321,7 @@ pub(super) mod tests {
             let (alice, result) = request_from_bob(false).await;
             assert!(result.is_err(), "{result:?}");
             assert!(!alice.inbox.join("report.pdf").exists());
-            let history = beam_core::history::read(&alice.store);
+            let history = history_of(&alice).await;
             assert_eq!(history.len(), 1, "{history:?}");
             assert_eq!(history[0].outcome, beam_core::history::Outcome::Declined);
             assert_eq!(history[0].file, "report.pdf", "the declined file is named");
