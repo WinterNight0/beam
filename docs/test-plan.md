@@ -690,6 +690,9 @@ without a screen (`iced_test`: find text, click by label), in
 | Shell | `the_rail_changes_the_page`, `the_theme_switches_between_midnight_and_daylight`, `the_status_bar_says_whether_anything_receives`, `the_relay_is_shown_by_its_host` |
 | Narrow windows (tiling compositors ignore the minimum size) | `a_narrow_window_keeps_the_status_bar_to_one_line` |
 | Avatar colours | `a_friends_colour_comes_from_their_fingerprint` |
+| Rename (Patch #3) | `rename_changes_the_name_and_keeps_the_friend_selected`, `a_refused_rename_says_why_and_changes_nothing`; shared with the CLI and view: `beam-core` `actions::friends::tests` |
+| Remove starts on Keep (`Ask`) | `remove_starts_on_keep_so_enter_escape_and_keep_remove_nothing`, `only_a_click_on_remove_removes` |
+| Friend detail | `copy_puts_the_fingerprint_on_the_clipboard_and_says_so`, `a_friends_recent_activity_is_listed_with_its_result`, `recently_active_friends_are_grouped_first` |
 
 Not automated: how the window looks. Checked by hand on Windows 11 and on
 Arch Linux under Niri (Wayland), at full and half width.

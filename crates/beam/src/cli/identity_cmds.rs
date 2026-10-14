@@ -201,9 +201,8 @@ impl App {
         new_name: &str,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let mut known = self.store.load_known_peers()?;
-        known.rename(old_name, new_name)?;
-        self.store.save_known_peers(&known)?;
+        beam_core::actions::friends::rename(&self.store, old_name, new_name)
+            .map_err(friend_error)?;
         writeln!(io.out, "Renamed {old_name} to {new_name}.")?;
         Ok(())
     }
@@ -214,7 +213,7 @@ impl App {
         assume_yes: bool,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let mut known = self.store.load_known_peers()?;
+        let known = self.store.load_known_peers()?;
         let peer = known
             .lookup(name)
             .ok_or_else(|| PeerError::NotFound(name.to_string()))?;
@@ -231,10 +230,17 @@ impl App {
             }
         }
 
-        known.remove(&peer_name)?;
-        self.store.save_known_peers(&known)?;
+        beam_core::actions::friends::remove(&self.store, &peer_name).map_err(friend_error)?;
         writeln!(io.out, "Removed {peer_name}.")?;
         Ok(())
+    }
+}
+
+/// The shared action's error, as the command has always reported it.
+fn friend_error(e: beam_core::actions::friends::FriendError) -> CommandError {
+    match e {
+        beam_core::actions::friends::FriendError::Store(e) => e.into(),
+        beam_core::actions::friends::FriendError::Peer(e) => e.into(),
     }
 }
 

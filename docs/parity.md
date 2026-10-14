@@ -20,7 +20,7 @@ terminal · — not offered · *planned* not built yet.
 | Create this device's identity (never replaces one) | `beam init` | ✔ first-run welcome | ✔ first-run welcome | `actions::identity` |
 | See this device: name, fingerprint, invite | `beam whoami` | ✔ header; ⌨ `whoami` | ✔ Settings and status bar (invite: *planned*) | `identity`, `listen_status`, `beam-model::snapshot` |
 | List friends, last seen | `beam peers` | ✔ Friends tab | ✔ Friends page, with search | `beam-model::snapshot` |
-| Rename / remove a friend (Remove starts on Keep) | `beam rename`, `beam remove` | ✔ `r`, `x` | *planned* | `beam-model::ask` |
+| Rename / remove a friend (Remove starts on Keep) | `beam rename`, `beam remove` | ✔ `r`, `x` | ✔ Rename, Remove on a friend | `actions::friends`, `beam-model::ask` |
 | Pair by pasting an invite (fingerprint check starts on No) | `beam pair <INVITE>` | ✔ Add friend | *planned* | `actions::pair`, `beam-model::ask` |
 | Pair by showing your invite | `beam pair --wait`, `beam listen` | ✔ Show my invite | *planned* | `actions::pair` |
 | Update where a friend is (a relay move needs a yes) | `beam pair <INVITE>` | ✔ Add friend | *planned* | `actions::pair::save_location` |

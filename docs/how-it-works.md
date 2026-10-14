@@ -620,6 +620,7 @@ crates/beam-core/src/
     inbox.rs           the link to a running agent; cleaned requests
     messages.rs        what beam says when a send cannot go ahead
     identity.rs        first run: make this device's identity, never replace it
+    friends.rs         rename and remove a friend (CLI, view and GUI)
 crates/beam-core/tests/  integration and security tests of the core;
                        layers.rs (the layers), no_n0_discovery.rs (S-17)
 

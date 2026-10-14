@@ -191,3 +191,152 @@ fn a_friends_colour_comes_from_their_fingerprint() {
         .collect();
     assert_eq!(colours.len(), theme::TINTS.len(), "every colour is used");
 }
+
+// ---------------------------------------------------------------- Patch #3
+
+fn key(named: keyboard::key::Named) -> Message {
+    Message::Key(keyboard::Key::Named(named))
+}
+
+#[test]
+fn rename_changes_the_name_and_keeps_the_friend_selected() {
+    let (_tmp, store) = home(true, &["alice"]);
+    let mut gui = Gui::for_home(store.clone());
+    click(&mut gui, "Rename");
+    assert!(shows(&gui, "A new name for alice on this device"));
+    let _ = gui.update(Message::RenameText("ali".into()));
+    let _ = gui.update(key(keyboard::key::Named::Enter));
+    assert!(gui.dialog.is_none());
+    assert_eq!(gui.selected.as_deref(), Some("ali"));
+    let known = store.load_known_peers().unwrap();
+    assert!(known.lookup("ali").is_some() && known.lookup("alice").is_none());
+}
+
+/// A refused name keeps the form open with the reason, and changes nothing.
+#[test]
+fn a_refused_rename_says_why_and_changes_nothing() {
+    let (_tmp, store) = home(true, &["alice", "bob"]);
+    let mut gui = Gui::for_home(store.clone());
+    let _ = gui.update(Message::Rename("alice".into()));
+    let _ = gui.update(Message::RenameText("bob".into()));
+    let _ = gui.update(Message::ConfirmRename);
+    assert!(matches!(
+        gui.dialog,
+        Some(Dialog::Rename { error: Some(_), .. })
+    ));
+    assert!(store.load_known_peers().unwrap().lookup("alice").is_some());
+    let _ = gui.update(key(keyboard::key::Named::Escape));
+    assert!(gui.dialog.is_none());
+}
+
+/// The safe default (`Ask`): the Remove question starts on Keep, so Enter
+/// keeps the friend, as do Escape and the Keep button.
+#[test]
+fn remove_starts_on_keep_so_enter_escape_and_keep_remove_nothing() {
+    for answer in [
+        key(keyboard::key::Named::Enter),
+        key(keyboard::key::Named::Escape),
+        Message::AnswerRemove(Choice::No),
+    ] {
+        let (_tmp, store) = home(true, &["alice"]);
+        let mut gui = Gui::for_home(store.clone());
+        click(&mut gui, "Remove");
+        let Some(Dialog::Remove(ask)) = &gui.dialog else {
+            panic!("no Remove question");
+        };
+        assert_eq!(ask.focus(), Choice::No, "starts on Keep");
+        let _ = gui.update(answer.clone());
+        assert!(gui.dialog.is_none(), "{answer:?}");
+        assert!(
+            store.load_known_peers().unwrap().lookup("alice").is_some(),
+            "{answer:?} removed alice"
+        );
+    }
+}
+
+#[test]
+fn only_a_click_on_remove_removes() {
+    let (_tmp, store) = home(true, &["alice", "bob"]);
+    let mut gui = Gui::for_home(store.clone());
+    let _ = gui.update(Message::Remove("alice".into()));
+    // The dialog's own Remove button (the header one is behind the veil).
+    let _ = gui.update(Message::AnswerRemove(Choice::Yes));
+    assert!(store.load_known_peers().unwrap().lookup("alice").is_none());
+    assert_eq!(gui.selected.as_deref(), Some("bob"), "selection moves on");
+    assert!(matches!(gui.notice, Some((_, Tone::Success))));
+}
+
+#[test]
+fn copy_puts_the_fingerprint_on_the_clipboard_and_says_so() {
+    let (_tmp, store) = home(true, &["alice"]);
+    let mut gui = Gui::for_home(store);
+    click(&mut gui, "Copy");
+    assert_eq!(
+        gui.notice.as_ref().map(|(w, _)| w.as_str()),
+        Some("Fingerprint copied.")
+    );
+}
+
+fn record(store: &Store, name: &str, at: u64, file: &str, outcome: beam_core::history::Outcome) {
+    let fingerprint = store
+        .load_known_peers()
+        .unwrap()
+        .lookup(name)
+        .unwrap()
+        .fingerprint()
+        .hex();
+    beam_core::history::record(
+        store,
+        &beam_core::history::Entry {
+            at,
+            direction: beam_core::history::Direction::Sent,
+            peer: name.into(),
+            fingerprint,
+            file: file.into(),
+            size: 2048,
+            outcome,
+            note: None,
+        },
+    );
+}
+
+#[test]
+fn a_friends_recent_activity_is_listed_with_its_result() {
+    let (_tmp, store) = home(true, &["alice"]);
+    let now = beam_core::history::unix_now();
+    record(
+        &store,
+        "alice",
+        now - 3600,
+        "report.pdf",
+        beam_core::history::Outcome::Done,
+    );
+    record(
+        &store,
+        "alice",
+        now - 60,
+        "keys.txt",
+        beam_core::history::Outcome::Declined,
+    );
+    let gui = Gui::for_home(store);
+    assert!(shows(&gui, "report.pdf"));
+    assert!(shows(&gui, "keys.txt"));
+    assert!(shows(&gui, "declined by them"), "the core's own words");
+}
+
+/// Friends who answered this week come first, under their own heading.
+#[test]
+fn recently_active_friends_are_grouped_first() {
+    let (_tmp, store) = home(true, &["alice", "bob"]);
+    let now = beam_core::history::unix_now();
+    record(
+        &store,
+        "bob",
+        now - 600,
+        "a.txt",
+        beam_core::history::Outcome::Done,
+    );
+    let gui = Gui::for_home(store);
+    assert!(shows(&gui, "RECENTLY ACTIVE"));
+    assert!(shows(&gui, "EVERYONE ELSE"));
+}

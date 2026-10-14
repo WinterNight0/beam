@@ -347,18 +347,12 @@ fn connect_inbox(store: &Store, link: &mut Option<inbox::InboxLink>, app: &mut A
 fn carry_out(store: &Store, effect: Effect) -> Done {
     let fail = |e: &dyn std::fmt::Display| untrusted::text(&e.to_string());
     let result = match effect {
-        Effect::Rename { from, to } => (|| {
-            let mut known = store.load_known_peers().map_err(|e| fail(&e))?;
-            known.rename(&from, &to).map_err(|e| fail(&e))?;
-            store.save_known_peers(&known).map_err(|e| fail(&e))?;
-            Ok(format!("Renamed {from} to {to}."))
-        })(),
-        Effect::Remove { name } => (|| {
-            let mut known = store.load_known_peers().map_err(|e| fail(&e))?;
-            known.remove(&name).map_err(|e| fail(&e))?;
-            store.save_known_peers(&known).map_err(|e| fail(&e))?;
-            Ok(format!("Removed {name}."))
-        })(),
+        Effect::Rename { from, to } => beam_core::actions::friends::rename(store, &from, &to)
+            .map(|()| format!("Renamed {from} to {to}."))
+            .map_err(|e| fail(&e)),
+        Effect::Remove { name } => beam_core::actions::friends::remove(store, &name)
+            .map(|()| format!("Removed {name}."))
+            .map_err(|e| fail(&e)),
         Effect::Copy { what, text } => Ok(match clipboard::copy(&text) {
             clipboard::Copied::System => format!("Copied {what}."),
             clipboard::Copied::Terminal => format!("Copied {what} (through the terminal)."),

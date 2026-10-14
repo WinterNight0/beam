@@ -145,7 +145,8 @@ crates/beam-core/      L1 core + L2 actions. No terminal or GUI library.
   src/listener.rs      `listen` as a service; src/agent/ the background agent
   src/history.rs, config.rs, untrusted.rs, text.rs
   src/actions/         one copy of each flow: send, pair, receive, inbox, messages,
-                       identity (first-run create, never replaces)
+                       identity (first-run create, never replaces), friends
+                       (rename, remove)
   tests/               core integration and security tests; tests/layers.rs
 crates/beam-model/     L3 what a screen shows: snapshot, requests, sending,
                        ask (every yes/no question starts on No). Depends on
@@ -297,7 +298,9 @@ In this order, each step with its tests (ADR-0048):
   #1 skeleton (device + friends via `Snapshot`, Refresh); #2 assets and shell
   (ADR-0051; theme from the enterprise mock-up; rail, friends list + identity,
   status bar, Midnight/Daylight, first-run create via `actions::identity`,
-  width-aware layout for tiling compositors); then friends, pairing,
+  width-aware layout for tiling compositors); #3 friends (groups, recent
+  activity, Copy, rename, remove starting on Keep via `Ask`, through the new
+  shared `actions::friends`, which the CLI and view use too); then pairing,
   receiving (Accept starts on Decline), sending (OS picker), history and
   settings. **No release yet**: the core grows first; later a second download
   with `beam`, tags `gui-v*`. `spike/gui-iced` is gitignored, the testing

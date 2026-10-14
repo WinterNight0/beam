@@ -1,16 +1,18 @@
 //! What the window draws. Words, layout and styles only: every string from
 //! `beam-model` arrives cleaned (ADR-0034), and nothing here changes state.
 
-use beam_core::history::{self, Direction, Outcome};
+use beam_core::history::{self, Direction, Entry, Outcome};
+use beam_core::text::format_bytes;
+use beam_model::Choice;
 use beam_model::snapshot::{Agent, Friend, Snapshot};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, center, column, container, mouse_area, row, rule, scrollable, space, stack, text,
-    text_input,
+    button, center, column, container, mouse_area, opaque, row, rule, scrollable, space, stack,
+    text, text_input, tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Padding};
+use iced::{Alignment, Color, Element, Fill, FillPortion, Padding};
 
-use crate::app::{Gui, Message, Page, Tone};
+use crate::app::{Dialog, Gui, Message, Page, Tone};
 use crate::icons;
 use crate::theme::{self, BOLD, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
 
@@ -72,11 +74,9 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
         .height(Fill)
         .into()
     };
-    let frame = column![body, status_bar(gui, snapshot)];
-    match &gui.notice {
-        None => frame.into(),
-        Some((words, tone)) => stack![
-            frame,
+    let mut layers = stack![column![body, status_bar(gui, snapshot)]];
+    if let Some((words, tone)) = &gui.notice {
+        layers = layers.push(
             container(toast(p, words, *tone))
                 .align_right(Fill)
                 .align_bottom(Fill)
@@ -85,9 +85,19 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
                     right: 20.0,
                     ..Padding::ZERO
                 }),
-        ]
-        .into(),
+        );
     }
+    if let Some(open) = &gui.dialog {
+        let card = match open {
+            Dialog::Rename { from, to, error } => rename_dialog(p, from, to, error.as_deref()),
+            Dialog::Remove(ask) => {
+                remove_dialog(p, &ask.question().name, &ask.question().fingerprint)
+            }
+        };
+        // Clicks do not reach the window behind a dialog.
+        layers = layers.push(opaque(center(card).style(theme::veil(p, 1.0))));
+    }
+    layers.into()
 }
 
 // ---------------------------------------------------------------------------
@@ -305,30 +315,45 @@ fn friend_pane<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message>
                 .center_x(Fill),
         );
     } else {
-        list = list.push(group_label(p, "ALL FRIENDS", matching.len()));
-        for f in matching {
-            let selected = gui.selected.as_deref() == Some(f.name.as_str());
-            list = list.push(
-                button(
-                    row![
-                        avatar(p, &f.name, theme::tint_for(&f.fingerprint), 34.0, None),
-                        column![
-                            text(&f.name).font(SEMIBOLD).size(MD),
-                            text(format!("Last seen {}", last_seen(f, now)))
-                                .size(SM)
-                                .color(p.subtext),
+        // Friends who answered in the last week first: who you are most
+        // likely looking for.
+        const RECENT: u64 = 7 * 86_400;
+        let recent = |f: &&Friend| {
+            f.last_seen
+                .is_some_and(|at| now.saturating_sub(at) < RECENT)
+        };
+        let (active, others): (Vec<&Friend>, Vec<&Friend>) = matching.into_iter().partition(recent);
+        let both = !active.is_empty() && !others.is_empty();
+        for (label, group) in [("RECENTLY ACTIVE", active), ("EVERYONE ELSE", others)] {
+            if group.is_empty() {
+                continue;
+            }
+            let label = if both { label } else { "ALL FRIENDS" };
+            list = list.push(group_label(p, label, group.len()));
+            for f in group {
+                let selected = gui.selected.as_deref() == Some(f.name.as_str());
+                list = list.push(
+                    button(
+                        row![
+                            avatar(p, &f.name, theme::tint_for(&f.fingerprint), 34.0, None),
+                            column![
+                                text(&f.name).font(SEMIBOLD).size(MD),
+                                text(format!("Last seen {}", last_seen(f, now)))
+                                    .size(SM)
+                                    .color(p.subtext),
+                            ]
+                            .spacing(1)
+                            .width(Fill),
                         ]
-                        .spacing(1)
-                        .width(Fill),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                )
-                .width(Fill)
-                .padding([7, 8])
-                .style(theme::list_item(p, selected))
-                .on_press(Message::Select(f.name.clone())),
-            );
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Fill)
+                    .padding([7, 8])
+                    .style(theme::list_item(p, selected))
+                    .on_press(Message::Select(f.name.clone())),
+                );
+            }
         }
     }
     container(
@@ -385,30 +410,63 @@ fn friend_detail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Messag
             .align_y(Alignment::Center)
             .into()
     };
+    let actions = row![
+        tip(
+            p,
+            button(
+                row![icon(icons::EDIT, 13), text("Rename").size(MD)]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+            )
+            .padding([7, 14])
+            .style(theme::secondary(p))
+            .on_press(Message::Rename(f.name.clone())),
+            "A new name on this device only; they never see it",
+        ),
+        tip(
+            p,
+            button(
+                row![icon(icons::DELETE, 13), text("Remove").size(MD)]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+            )
+            .padding([7, 14])
+            .style(theme::danger(p))
+            .on_press(Message::Remove(f.name.clone())),
+            "Forget this friend's key; you can pair again later",
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let who = row![
+        avatar(p, &f.name, theme::tint_for(&f.fingerprint), 48.0, None),
+        column![
+            title,
+            text(format!(
+                "Short ID {}  ·  paired {}  ·  last seen {}",
+                f.short_id,
+                f.added,
+                last_seen(f, now)
+            ))
+            .size(MD)
+            .color(p.subtext),
+        ]
+        .spacing(4)
+        .width(Fill),
+    ]
+    .spacing(16)
+    .align_y(Alignment::Center);
+    let head: Element<'_, Message> = if room < 780.0 {
+        column![who, actions].spacing(12).into()
+    } else {
+        row![who, actions]
+            .spacing(16)
+            .align_y(Alignment::Center)
+            .into()
+    };
     let header = toolbar(
         p,
-        column![
-            breadcrumb(p, "Friends", &f.name),
-            row![
-                avatar(p, &f.name, theme::tint_for(&f.fingerprint), 48.0, None),
-                column![
-                    title,
-                    text(format!(
-                        "Short ID {}  ·  paired {}  ·  last seen {}",
-                        f.short_id,
-                        f.added,
-                        last_seen(f, now)
-                    ))
-                    .size(MD)
-                    .color(p.subtext),
-                ]
-                .spacing(4)
-                .width(Fill),
-            ]
-            .spacing(16)
-            .align_y(Alignment::Center),
-        ]
-        .spacing(10),
+        column![breadcrumb(p, "Friends", &f.name), head].spacing(10),
     );
 
     // What came and went with this friend, from history.jsonl.
@@ -439,9 +497,22 @@ fn friend_detail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Messag
         row(tiles).spacing(12).into()
     };
 
+    let copy = tip(
+        p,
+        button(
+            row![icon(icons::COPY, 12), text("Copy").size(SM)]
+                .spacing(6)
+                .align_y(Alignment::Center),
+        )
+        .padding([4, 10])
+        .style(theme::ghost(p))
+        .on_press(Message::CopyFingerprint(f.fingerprint.clone())),
+        "Copy the full fingerprint, to compare it with theirs",
+    );
     let identity = section(
         p,
         "Identity",
+        Some(copy),
         column![
             text("Fingerprint (SHA-256 of their public key)")
                 .size(SM)
@@ -464,10 +535,34 @@ fn friend_detail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Messag
         .spacing(12),
     );
 
+    // Newest first, the last few; the History page will hold the rest.
+    let recent: Vec<&Entry> = snapshot
+        .history
+        .iter()
+        .rev()
+        .filter(|e| e.fingerprint == f.fingerprint)
+        .take(5)
+        .collect();
+    let activity = section(
+        p,
+        "Recent activity",
+        None,
+        if recent.is_empty() {
+            empty(
+                p,
+                icons::HISTORY,
+                "Nothing yet",
+                "Files you send to or receive from this friend are listed here.",
+            )
+        } else {
+            activity_table(p, &recent, now)
+        },
+    );
+
     column![
         header,
         scrollable(
-            column![stats, identity]
+            column![stats, identity, activity]
                 .spacing(16)
                 .padding(Padding::new(24.0).top(18.0))
         )
@@ -703,10 +798,15 @@ fn group_label<'a>(p: &'static Pal, label: &'a str, count: usize) -> Element<'a,
 fn section<'a>(
     p: &'static Pal,
     title: &'a str,
+    trailing: Option<Element<'a, Message>>,
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
+    let mut head = row![text(title).font(SEMIBOLD).size(MD).width(Fill)].align_y(Alignment::Center);
+    if let Some(trailing) = trailing {
+        head = head.push(trailing);
+    }
     container(column![
-        container(text(title).font(SEMIBOLD).size(MD))
+        container(head)
             .padding([8, 16])
             .width(Fill)
             .style(theme::card_header(p)),
@@ -822,6 +922,221 @@ fn setting<'a>(
     )
     .padding([14, 16])
     .into()
+}
+
+fn tip<'a>(
+    p: &'static Pal,
+    content: impl Into<Element<'a, Message>>,
+    words: &'a str,
+) -> Element<'a, Message> {
+    tooltip(
+        content,
+        container(text(words).size(SM))
+            .padding([5, 9])
+            .style(theme::card(p)),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .into()
+}
+
+/// A friend's recent transfers: direction, file, size, result, when.
+fn activity_table<'a>(p: &'static Pal, rows: &[&'a Entry], now: u64) -> Element<'a, Message> {
+    let header = row![
+        space::horizontal().width(FillPortion(1)),
+        column_head(p, "FILE", 6),
+        column_head(p, "SIZE", 2),
+        column_head(p, "RESULT", 3),
+        column_head(p, "WHEN", 3),
+    ]
+    .spacing(12);
+    let lines = rows.iter().map(|e| {
+        let (glyph, tint) = match e.direction {
+            Direction::Sent => (icons::UPLOAD, p.accent),
+            Direction::Received => (icons::DOWNLOAD, p.success),
+        };
+        let (rtint, rglyph) = match e.outcome {
+            Outcome::Done => (p.success, icons::CHECK),
+            Outcome::Declined => (p.warning, icons::CLOSE),
+            Outcome::Cancelled => (p.faint, icons::CLOSE),
+            Outcome::Failed => (p.danger, icons::WARNING),
+        };
+        let mut file = column![text(&e.file).size(MD)];
+        if let Some(note) = &e.note {
+            file = file.push(text(note).size(XS).color(p.faint));
+        }
+        row![
+            // A fixed tile, centred in its column (not stretched to it).
+            container(
+                container(center(icon(glyph, 12)))
+                    .width(26)
+                    .height(26)
+                    .style(theme::icon_tile(p, tint))
+            )
+            .center_x(FillPortion(1)),
+            file.width(FillPortion(6)),
+            text(format_bytes(e.size))
+                .size(MD)
+                .color(p.subtext)
+                .width(FillPortion(2)),
+            container(chip(
+                p,
+                rtint,
+                rglyph,
+                history::outcome_word(e.outcome, e.direction)
+            ))
+            .width(FillPortion(3)),
+            text(history::ago(e.at, now))
+                .size(MD)
+                .color(p.subtext)
+                .width(FillPortion(3)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .into()
+    });
+    column![
+        container(header).padding(Padding::ZERO.bottom(8.0)),
+        column(lines).spacing(10)
+    ]
+    .into()
+}
+
+fn column_head<'a>(p: &'static Pal, name: &'a str, share: u16) -> Element<'a, Message> {
+    text(name)
+        .size(XS)
+        .font(BOLD)
+        .color(p.faint)
+        .width(FillPortion(share))
+        .into()
+}
+
+/// A dialog: title bar with an icon and a close button, body, and a footer
+/// strip holding the buttons, the safe one on the right and highlighted.
+fn dialog<'a>(
+    p: &'static Pal,
+    glyph: char,
+    title: &'a str,
+    body: impl Into<Element<'a, Message>>,
+    footer: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(column![
+        container(
+            row![
+                icon(glyph, 14).color(p.accent),
+                text(title).font(SEMIBOLD).size(LG).width(Fill),
+                button(icon(icons::CLOSE, 10))
+                    .padding(8)
+                    .style(theme::ghost(p))
+                    .on_press(Message::CloseDialog),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding(Padding::new(8.0).left(20.0)),
+        rule::horizontal(1).style(move |_| rule::Style {
+            color: p.divider,
+            radius: 0.0.into(),
+            fill_mode: rule::FillMode::Full,
+            snap: true,
+        }),
+        container(body).padding([20, 22]),
+        container(footer)
+            .padding([12, 22])
+            .width(Fill)
+            .style(theme::dialog_footer(p)),
+    ])
+    .width(500)
+    .style(theme::dialog(p))
+    .into()
+}
+
+fn rename_dialog<'a>(
+    p: &'static Pal,
+    from: &'a str,
+    to: &'a str,
+    error: Option<&'a str>,
+) -> Element<'a, Message> {
+    let mut body = column![
+        text(format!("A new name for {from} on this device")).size(MD),
+        text_input("Name", to)
+            .id(crate::app::RENAME_INPUT)
+            .on_input(Message::RenameText)
+            .on_submit(Message::ConfirmRename)
+            .padding(10)
+            .size(MD)
+            .style(theme::input(p)),
+    ]
+    .spacing(10);
+    body = body.push(match error {
+        Some(why) => notice(p, p.danger, icons::WARNING, why),
+        None => text("Names are local nicknames: your friend never sees this one.")
+            .size(SM)
+            .color(p.subtext)
+            .into(),
+    });
+    dialog(
+        p,
+        icons::EDIT,
+        "Rename friend",
+        body,
+        row![
+            space::horizontal(),
+            button(text("Cancel").size(MD))
+                .padding([7, 18])
+                .style(theme::secondary(p))
+                .on_press(Message::CloseDialog),
+            button(text("Rename").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press_maybe((!to.trim().is_empty()).then_some(Message::ConfirmRename)),
+        ]
+        .spacing(8),
+    )
+}
+
+/// Remove a friend? Keep is the highlighted, safe answer (`Ask` starts on
+/// No), and Enter or Escape keep them; only a click on Remove removes.
+fn remove_dialog<'a>(p: &'static Pal, name: &'a str, fingerprint: &'a str) -> Element<'a, Message> {
+    dialog(
+        p,
+        icons::DELETE,
+        "Remove friend",
+        column![
+            row![
+                avatar(p, name, theme::tint_for(fingerprint), 40.0, None),
+                column![
+                    text(format!("Remove {name}?")).font(SEMIBOLD).size(LG),
+                    text(format!("SHA256:{}", short(fingerprint)))
+                        .font(MONO)
+                        .size(SM)
+                        .color(p.subtext),
+                ]
+                .spacing(2),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+            text(
+                "beam forgets their key: neither of you can send to the other \
+                 until you pair again. Your history with them is kept."
+            )
+            .size(MD)
+            .color(p.subtext),
+        ]
+        .spacing(14),
+        row![
+            space::horizontal(),
+            button(text("Remove").size(MD))
+                .padding([7, 18])
+                .style(theme::danger(p))
+                .on_press(Message::AnswerRemove(Choice::Yes)),
+            button(text("Keep").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::AnswerRemove(Choice::No)),
+        ]
+        .spacing(8),
+    )
 }
 
 fn toast<'a>(p: &'static Pal, words: &'a str, tone: Tone) -> Element<'a, Message> {

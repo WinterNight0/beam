@@ -6,6 +6,7 @@
 //! never uses it. Nothing here prints, draws or reads a key: a front end is
 //! handed plain text and events, and decides how to show them.
 
+pub mod friends;
 pub mod identity;
 pub mod inbox;
 pub mod messages;

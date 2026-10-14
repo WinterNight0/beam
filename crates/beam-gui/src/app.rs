@@ -3,17 +3,21 @@
 //!
 //! GUI EX Patch #2: the shell. Navigation rail, the friends list and a
 //! friend's identity, this device, the status bar, Midnight/Daylight, and
-//! the first-run "Create this device's identity". Everything is read through
+//! the first-run "Create this device's identity". Patch #3: friends: groups,
+//! recent activity, Copy, rename, and remove behind a question that starts
+//! on Keep (`beam_model::Ask`). Everything is read and changed through
 //! `beam-model` and `beam-core`; the pages still to come say so.
 
 use std::time::Duration;
 
+use beam_core::actions::friends;
 use beam_core::actions::identity::{Created, create};
 use beam_core::config::{Config, Relay};
 use beam_core::identity::Store;
 use beam_core::untrusted;
 use beam_model::snapshot::Snapshot;
-use iced::{Element, Subscription, Task, window};
+use beam_model::{Ask, Choice, ask::RemoveFriend};
+use iced::{Element, Subscription, Task, keyboard, window};
 
 use crate::theme::{self, Pal};
 
@@ -55,6 +59,23 @@ pub struct Gui {
     /// windows themselves and ignore the minimum size, so the layout adapts.
     pub(crate) width: f32,
     pub(crate) notice: Option<(String, Tone)>,
+    /// The one question or form open over the window, if any.
+    pub(crate) dialog: Option<Dialog>,
+}
+
+/// What can be open over the window. One at a time, like the view's pop-ups.
+#[derive(Debug)]
+pub enum Dialog {
+    /// A new nickname for `from`. `error` is why the last try was refused,
+    /// cleaned.
+    Rename {
+        from: String,
+        to: String,
+        error: Option<String>,
+    },
+    /// Remove this friend? An `Ask`: it starts on Keep, and Enter or Escape
+    /// keep them. Only a click on Remove removes.
+    Remove(Ask<RemoveFriend>),
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +90,21 @@ pub enum Message {
     Refresh,
     Resized(f32),
     DismissNotice,
+    /// Copy a friend's full fingerprint, to paste where they can compare it.
+    CopyFingerprint(String),
+    Rename(String),
+    RenameText(String),
+    ConfirmRename,
+    Remove(String),
+    /// The answer to the Remove question.
+    AnswerRemove(Choice),
+    CloseDialog,
+    /// Enter or Escape, for the open dialog.
+    Key(keyboard::Key),
 }
+
+/// The rename form's text box, so it can be focused when the form opens.
+pub(crate) const RENAME_INPUT: &str = "rename";
 
 /// The window's size when it opens, and the smallest a stacking window
 /// manager lets it get. A tiling one may go smaller; the layout copes.
@@ -106,6 +141,7 @@ impl Gui {
             dark: true,
             width: SIZE.0,
             notice: None,
+            dialog: None,
         }
     }
 
@@ -177,8 +213,119 @@ impl Gui {
             Message::Refresh => self.reload(),
             Message::Resized(width) => self.width = width,
             Message::DismissNotice => self.notice = None,
+            Message::CopyFingerprint(hex) => {
+                self.notice = Some(("Fingerprint copied.".into(), Tone::Info));
+                return iced::clipboard::write(format!("SHA256:{hex}"));
+            }
+            Message::Rename(name) => {
+                self.dialog = Some(Dialog::Rename {
+                    to: name.clone(),
+                    from: name,
+                    error: None,
+                });
+                // Ready to type over: focused, the old name selected.
+                return Task::batch([
+                    iced::widget::operation::focus(RENAME_INPUT),
+                    iced::widget::operation::select_all(RENAME_INPUT),
+                ]);
+            }
+            Message::RenameText(text) => {
+                if let Some(Dialog::Rename { to, error, .. }) = &mut self.dialog {
+                    *to = text;
+                    *error = None;
+                }
+            }
+            Message::ConfirmRename => self.rename(),
+            Message::Remove(name) => {
+                let fingerprint = self
+                    .friend(&name)
+                    .map(|f| f.fingerprint.clone())
+                    .unwrap_or_default();
+                self.dialog = Some(Dialog::Remove(Ask::new(RemoveFriend { name, fingerprint })));
+            }
+            Message::AnswerRemove(answer) => self.answer_remove(answer),
+            Message::CloseDialog => self.dialog = None,
+            Message::Key(key) => return self.on_key(key),
         }
         Task::none()
+    }
+
+    /// Enter and Escape on a dialog. On the Remove question both keep the
+    /// friend: Enter answers the highlighted choice, which starts on Keep.
+    fn on_key(&mut self, key: keyboard::Key) -> Task<Message> {
+        use keyboard::key::Named;
+        let keyboard::Key::Named(named) = key else {
+            return Task::none();
+        };
+        match (&self.dialog, named) {
+            (Some(Dialog::Remove(ask)), Named::Enter) => {
+                let answer = ask.focus();
+                self.answer_remove(answer);
+            }
+            (Some(Dialog::Rename { .. }), Named::Enter) => self.rename(),
+            (Some(_), Named::Escape) => self.dialog = None,
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn rename(&mut self) {
+        let Some(Dialog::Rename { from, to, .. }) = &self.dialog else {
+            return;
+        };
+        let (from, to) = (from.clone(), to.trim().to_string());
+        if to == from {
+            self.dialog = None;
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        match friends::rename(store, &from, &to) {
+            Ok(()) => {
+                self.dialog = None;
+                if self.selected.as_deref() == Some(from.as_str()) {
+                    self.selected = Some(to.clone());
+                }
+                self.notice = Some((format!("Renamed {from} to {to}."), Tone::Success));
+                self.reload();
+            }
+            // Stays open with the reason, so the name can be fixed.
+            Err(e) => {
+                if let Some(Dialog::Rename { error, .. }) = &mut self.dialog {
+                    *error = Some(untrusted::text(&e.to_string()));
+                }
+            }
+        }
+    }
+
+    fn answer_remove(&mut self, answer: Choice) {
+        let Some(Dialog::Remove(ask)) = self.dialog.take() else {
+            return;
+        };
+        if answer == Choice::No {
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        let name = ask.into_question().name;
+        self.notice = Some(match friends::remove(store, &name) {
+            Ok(()) => (
+                format!("Removed {name}. Pair again to send to each other."),
+                Tone::Success,
+            ),
+            Err(e) => (
+                format!(
+                    "Could not remove {name}: {}",
+                    untrusted::text(&e.to_string())
+                ),
+                Tone::Problem,
+            ),
+        });
+        self.reload();
+    }
+
+    pub(crate) fn friend(&self, name: &str) -> Option<&beam_model::snapshot::Friend> {
+        self.snapshot
+            .as_ref()
+            .and_then(|s| s.friends.iter().find(|f| f.name == name))
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -188,6 +335,10 @@ impl Gui {
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             window::resize_events().map(|(_, size)| Message::Resized(size.width)),
+            keyboard::listen().filter_map(|event| match event {
+                keyboard::Event::KeyPressed { key, .. } => Some(Message::Key(key)),
+                _ => None,
+            }),
             // Friends paired or removed in a terminal show up by themselves.
             iced::time::every(Duration::from_secs(2)).map(|_| Message::Refresh),
         ])
