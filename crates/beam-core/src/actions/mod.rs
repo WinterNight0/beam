@@ -16,4 +16,6 @@ pub mod pair_worker;
 pub mod receive;
 pub mod send;
 pub mod send_worker;
+pub mod service;
+pub mod settings;
 pub mod switch;

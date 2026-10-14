@@ -625,6 +625,8 @@ crates/beam-core/src/
     switch.rs          the Receiving switch's receiver (the agent's, in a window)
     inbox_link.rs      a window's link to the receiver: requests, answers
     send_worker.rs     a send on a thread for windows; each front end words it
+    settings.rs        receive folder and router port mapping, saved in config.toml
+    service.rs         the background agent: at sign-in, start, stop
 crates/beam-core/tests/  integration and security tests of the core;
                        layers.rs (the layers), no_n0_discovery.rs (S-17)
 

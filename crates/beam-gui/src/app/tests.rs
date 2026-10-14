@@ -86,7 +86,7 @@ fn the_rail_changes_the_page() {
     click(&mut gui, "Transfers");
     assert!(shows(&gui, "Nothing going out"));
     click(&mut gui, "History");
-    assert!(shows(&gui, "Not in this window yet"));
+    assert!(shows(&gui, "Clear history"));
 }
 
 #[test]
@@ -95,9 +95,12 @@ fn the_theme_switches_between_midnight_and_daylight() {
     let mut gui = Gui::for_home(store);
     assert!(gui.dark, "Midnight first");
     let _ = gui.update(Message::Page(Page::Settings));
-    click(&mut gui, "Daylight");
+    assert!(shows(&gui, "Appearance"));
+    // The switch is below the fold of a long page, where the simulator
+    // cannot click; its message is what the buttons send.
+    let _ = gui.update(Message::Dark(false));
     assert!(!gui.dark);
-    click(&mut gui, "Midnight");
+    let _ = gui.update(Message::Dark(true));
     assert!(gui.dark);
 }
 
@@ -984,4 +987,133 @@ fn one_at_a_time_drops_propose_and_closing_asks() {
         panic!("no question: {:?}", bob.dialog);
     };
     assert_eq!(ask.focus(), Choice::No, "starts on Stay");
+}
+
+// ---------------------------------------------------------------- Patch #7
+
+fn config_of(store: &Store) -> beam_core::config::Config {
+    beam_core::config::Config::load(&store.config_path()).unwrap()
+}
+
+/// Router port mapping makes this device findable: turning it on is a
+/// question that starts on "Keep it off"; Enter and Escape keep it off.
+#[test]
+fn port_mapping_on_asks_and_starts_on_keep_it_off() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store.clone());
+    for no in [
+        key(keyboard::key::Named::Enter),
+        key(keyboard::key::Named::Escape),
+    ] {
+        let _ = gui.update(Message::Settings(SettingsMsg::PortMapping(true)));
+        let Some(Dialog::PortMapping(ask)) = &gui.dialog else {
+            panic!("no question: {:?}", gui.dialog);
+        };
+        assert_eq!(ask.focus(), Choice::No, "starts on Keep it off");
+        let _ = gui.update(no);
+        assert!(gui.dialog.is_none());
+        assert!(!config_of(&store).agent_port_mapping, "still off");
+    }
+    let _ = gui.update(Message::Settings(SettingsMsg::PortMapping(true)));
+    let _ = gui.update(Message::Settings(SettingsMsg::AnswerPortMapping(
+        Choice::Yes,
+    )));
+    assert!(config_of(&store).agent_port_mapping, "a click on Turn on");
+    let _ = gui.update(Message::Settings(SettingsMsg::PortMapping(false)));
+    assert!(
+        !config_of(&store).agent_port_mapping,
+        "off needs no question"
+    );
+}
+
+#[test]
+fn the_receive_folder_is_saved_and_reset() {
+    let (tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store.clone());
+    let folder = tmp.path().join("incoming");
+    let _ = gui.update(Message::Settings(SettingsMsg::FolderPicked(Some(
+        folder.clone(),
+    ))));
+    assert!(folder.is_dir());
+    assert!(config_of(&store).receive_dir.is_some());
+    let _ = gui.update(Message::Page(Page::Settings));
+    assert!(shows(&gui, "Use the default"));
+    let _ = gui.update(Message::Settings(SettingsMsg::DefaultFolder));
+    assert_eq!(config_of(&store).receive_dir, None);
+}
+
+/// Clearing the history starts on Keep.
+#[test]
+fn clearing_the_history_asks_and_starts_on_keep() {
+    let (_tmp, store) = home(true, &["alice"]);
+    let now = beam_core::history::unix_now();
+    record(
+        &store,
+        "alice",
+        now - 60,
+        "a.txt",
+        beam_core::history::Outcome::Done,
+    );
+    let mut gui = Gui::for_home(store.clone());
+    let _ = gui.update(Message::Settings(SettingsMsg::ClearHistory));
+    let Some(Dialog::ClearHistory(ask)) = &gui.dialog else {
+        panic!("no question: {:?}", gui.dialog);
+    };
+    assert_eq!(ask.focus(), Choice::No, "starts on Keep");
+    let _ = gui.update(key(keyboard::key::Named::Enter));
+    assert_eq!(beam_core::history::read(&store).len(), 1, "kept");
+    let _ = gui.update(Message::Settings(SettingsMsg::ClearHistory));
+    let _ = gui.update(Message::Settings(SettingsMsg::AnswerClear(Choice::Yes)));
+    assert!(beam_core::history::read(&store).is_empty());
+}
+
+#[test]
+fn history_filters_and_search_narrow_the_list() {
+    let (_tmp, store) = home(true, &["alice", "bob"]);
+    let now = beam_core::history::unix_now();
+    record(
+        &store,
+        "alice",
+        now - 300,
+        "report.pdf",
+        beam_core::history::Outcome::Done,
+    );
+    record(
+        &store,
+        "bob",
+        now - 200,
+        "keys.txt",
+        beam_core::history::Outcome::Declined,
+    );
+    let mut gui = Gui::for_home(store);
+    let _ = gui.update(Message::Page(Page::History));
+    assert!(shows(&gui, "2 of 2"));
+    let _ = gui.update(Message::Settings(SettingsMsg::Filter(
+        HistoryFilter::Declined,
+    )));
+    assert!(shows(&gui, "1 of 2") && shows(&gui, "keys.txt"));
+    let _ = gui.update(Message::Settings(SettingsMsg::Filter(HistoryFilter::All)));
+    let _ = gui.update(Message::Settings(SettingsMsg::Search("alice".into())));
+    assert!(shows(&gui, "1 of 2") && shows(&gui, "report.pdf"));
+}
+
+/// Without the beam program next to the window, the page says why the
+/// service controls are unavailable instead of registering beam-gui.
+#[test]
+fn the_service_controls_need_beam_beside_the_window() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store);
+    gui.beam_program = None;
+    let _ = gui.update(Message::Page(Page::Settings));
+    assert!(shows(&gui, "Background service"));
+    assert!(shows(&gui, "Not running"));
+
+    // The lookup itself: only a real file called beam counts.
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(settings::beam_in(dir.path()), None);
+    let beam = dir
+        .path()
+        .join(format!("beam{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&beam, b"").unwrap();
+    assert_eq!(settings::beam_in(dir.path()), Some(beam));
 }

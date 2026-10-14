@@ -8,12 +8,12 @@ use super::desk::{PromptDesk, Question};
 use super::terminal::{Keyboard, TerminalReporter};
 use super::{App, CommandError, Io};
 use crate::ui;
+use beam_core::actions;
 use beam_core::actions::inbox::{self, ConnectError, FindError, Inbox, InboxEvent};
 use beam_core::actions::receive::{self, Place, ReceiveError};
-use beam_core::agent::ipc::{Client, ClientMsg};
 use beam_core::agent::status::{self, Running};
 use beam_core::agent::{self, service};
-use beam_core::config::{self, Config};
+use beam_core::config::Config;
 use beam_core::transfer::{Progress, Reporter};
 use beam_core::transport::PathKind;
 use beam_core::transport::endpoint::Bind;
@@ -202,6 +202,7 @@ impl App {
                 self.store.load_identity()?;
                 service::enable(&exe, self.store.dir(), &here).map_err(fail)?;
                 writeln!(io.out, "The background agent will start at every login.")?;
+                // (Registering it is shared with the GUI: actions::service.)
                 if exe.components().any(|c| c.as_os_str() == "target") {
                     writeln!(
                         io.out,
@@ -227,67 +228,40 @@ impl App {
     }
 
     fn start_agent(&self, exe: &Path, here: &Path, io: &mut Io<'_>) -> Result<(), CommandError> {
-        if let Running::Yes(status) = status::read(&self.store) {
-            writeln!(
-                io.out,
-                "The background agent is already running, saving to {}.",
-                untrusted::name(&status.receive_dir)
-            )?;
-            return Ok(());
-        }
-        self.store.load_identity()?;
-        let config = self.config()?;
-        if config.receive_dir.is_none() && !cfg!(windows) {
-            writeln!(
-                io.out,
-                "Received files will be saved here, in {} (change it with `beam receive-dir`).",
-                here.display()
-            )?;
-        }
-        service::start(exe, here, self.store.dir())
-            .map_err(|e| CommandError::Message(e.to_string()))?;
-        // Wait for it to say it is up.
-        for _ in 0..50 {
-            if let Running::Yes(status) = status::read(&self.store) {
+        if !matches!(status::read(&self.store), Running::Yes(_)) {
+            self.store.load_identity()?;
+            let config = self.config()?;
+            if config.receive_dir.is_none() && !cfg!(windows) {
                 writeln!(
                     io.out,
-                    "The background agent is running. It saves files to {}.\n\
-                     When a paired device sends something you get a notification; answer in \
-                     a terminal with `beam inbox`.",
-                    untrusted::name(&status.receive_dir)
+                    "Received files will be saved here, in {} (change it with `beam receive-dir`).",
+                    here.display()
                 )?;
-                return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
-        Err(CommandError::Message(format!(
-            "the background agent did not start; its log is {}",
-            self.store.agent_log_path().display()
-        )))
+        match actions::service::start(&self.store, exe, here).map_err(service_error)? {
+            actions::service::Started::Already { receive_dir } => writeln!(
+                io.out,
+                "The background agent is already running, saving to {receive_dir}."
+            )?,
+            actions::service::Started::Now { receive_dir } => writeln!(
+                io.out,
+                "The background agent is running. It saves files to {receive_dir}.\n\
+                 When a paired device sends something you get a notification; answer in \
+                 a terminal with `beam inbox`."
+            )?,
+        }
+        Ok(())
     }
 
     fn stop_agent(&self, io: &mut Io<'_>) -> Result<(), CommandError> {
-        let Running::Yes(status) = status::read(&self.store) else {
-            writeln!(io.out, "The background agent is not running.")?;
-            return Ok(());
-        };
-        let runtime = self.runtime()?;
-        runtime
-            .block_on(async {
-                let (mut client, _) = Client::connect(status.port, &status.token).await?;
-                client.send(&ClientMsg::Stop).await
-            })
-            .map_err(|e| CommandError::Message(format!("could not reach the agent: {e}")))?;
-        for _ in 0..80 {
-            if !matches!(status::read(&self.store), Running::Yes(_)) {
-                writeln!(io.out, "The background agent stopped.")?;
-                return Ok(());
+        match actions::service::stop(&self.store).map_err(service_error)? {
+            actions::service::Stopped::NotRunning => {
+                writeln!(io.out, "The background agent is not running.")?;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            actions::service::Stopped::Now => writeln!(io.out, "The background agent stopped.")?,
         }
-        Err(CommandError::Message(
-            "the background agent was asked to stop but is still running".into(),
-        ))
+        Ok(())
     }
 
     fn service_status(&self, io: &mut Io<'_>) -> Result<(), CommandError> {
@@ -358,11 +332,10 @@ impl App {
 
     /// `beam service port-mapping on|off`.
     pub(super) fn port_mapping(&self, switch: Switch, io: &mut Io<'_>) -> Result<(), CommandError> {
-        let path = self.store.config_path();
-        let fail = |e: config::ConfigError| CommandError::Message(e.to_string());
+        let fail = |e: actions::settings::SettingsError| CommandError::Message(e.to_string());
         match switch {
             Switch::Off => {
-                config::set_value(&path, "agent_port_mapping", None).map_err(fail)?;
+                actions::settings::set_port_mapping(&self.store, false).map_err(fail)?;
                 writeln!(io.out, "Router port mapping for the agent is off.")?;
             }
             Switch::On => {
@@ -375,7 +348,7 @@ impl App {
                     writeln!(io.out, "Nothing was changed; it stays off.")?;
                     return Ok(());
                 }
-                config::set_value(&path, "agent_port_mapping", Some("true")).map_err(fail)?;
+                actions::settings::set_port_mapping(&self.store, true).map_err(fail)?;
                 writeln!(io.out, "Router port mapping for the agent is on.")?;
             }
         }
@@ -396,29 +369,15 @@ impl App {
         default: bool,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let config_path = self.store.config_path();
-        let fail = |e: config::ConfigError| CommandError::Message(e.to_string());
+        let fail = |e: actions::settings::SettingsError| CommandError::Message(e.to_string());
         if default {
-            config::set_value(&config_path, "receive_dir", None).map_err(fail)?;
+            actions::settings::set_receive_dir(&self.store, None).map_err(fail)?;
             writeln!(io.out, "Received files go to the default place again:")?;
         } else if let Some(path) = path {
-            let path = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .map_err(CommandError::Io)?
-                    .join(path)
-            };
-            std::fs::create_dir_all(&path).map_err(CommandError::Io)?;
-            let path = std::fs::canonicalize(&path).map_err(CommandError::Io)?;
-            let path = strip_verbatim(path);
-            let text = path.display().to_string();
-            config::set_value(
-                &config_path,
-                "receive_dir",
-                Some(&config::toml_string(&text)),
-            )
-            .map_err(fail)?;
+            let saved = actions::settings::set_receive_dir(&self.store, Some(&path))
+                .map_err(fail)?
+                .unwrap_or(path);
+            let text = saved.display().to_string();
             writeln!(io.out, "Received files will be saved to {text}")?;
             writeln!(
                 io.out,
@@ -462,16 +421,6 @@ impl App {
     }
 }
 
-/// `C:\x` rather than `\\?\C:\x`, which canonicalize returns on Windows and
-/// people do not recognise.
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    let text = path.display().to_string();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
-        _ => path,
-    }
-}
-
 /// What stops `beam agent`: Ctrl+C, or SIGTERM on Unix (what `systemctl
 /// stop` sends).
 async fn stop_signal() {
@@ -495,4 +444,12 @@ async fn stop_signal() {
 /// How `beam agent` run in a terminal shows what the agent does.
 fn print_line(line: &str) {
     println!("{line}");
+}
+
+/// The shared service action's failure, as the command has always told it.
+fn service_error(e: actions::service::ServiceFailure) -> CommandError {
+    match e {
+        actions::service::ServiceFailure::Store(e) => e.into(),
+        other => CommandError::Message(other.to_string()),
+    }
 }

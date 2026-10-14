@@ -150,7 +150,9 @@ crates/beam-core/      L1 core + L2 actions. No terminal or GUI library.
                        the view and the GUI; plan_join checks before network),
                        switch (the Receiving switch's receiver), inbox_link
                        (a window's link to the receiver), send_worker (a
-                       send on a thread; each front end words the result)
+                       send on a thread; each front end words the result),
+                       settings (receive folder, port mapping), service
+                       (background agent enable/disable/start/stop)
   tests/               core integration and security tests; tests/layers.rs
 crates/beam-model/     L3 what a screen shows: snapshot, requests, sending,
                        ask (every yes/no question starts on No). Depends on
@@ -317,7 +319,13 @@ In this order, each step with its tests (ADR-0048):
   the OS picker, `rfd =0.17.2` added; a dropped file only proposes, its
   question starts on "Don't send"; Transfers page with stages and Stop;
   one at a time; closing mid-send asks; the view's send worker moved to
-  `actions::send_worker`, which reports events each front end words); then
+  `actions::send_worker`, which reports events each front end words); #7
+  history and settings (History page with filters, search, Clear starting on
+  Keep; Settings: receive folder via the OS folder picker, relay and port
+  shown, router port mapping asking first and starting on "Keep it off",
+  background service run from the `beam` next to the GUI; `actions::settings`
+  and `actions::service` now shared with `beam receive-dir`/`beam service`);
+  then
   receiving (Accept starts on Decline), sending (OS picker), history and
   settings. **No release yet**: the core grows first; later a second download
   with `beam`, tags `gui-v*`. `spike/gui-iced` is gitignored, the testing

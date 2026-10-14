@@ -27,10 +27,12 @@ use beam_model::{
 pub(crate) mod pairing;
 pub(crate) mod receiving;
 pub(crate) mod sending;
+pub(crate) mod settings;
 use iced::{Element, Subscription, Task, keyboard, window};
 pub use pairing::{PairMsg, Pairing};
 pub use receiving::RecvMsg;
 pub use sending::SendMsg;
+pub use settings::{Filter as HistoryFilter, SettingsMsg};
 
 use crate::theme::{self, Pal};
 
@@ -89,6 +91,14 @@ pub struct Gui {
     pub(crate) outgoing: Option<sending::Running>,
     /// Where the send is, or how it ended (kept until dismissed).
     pub(crate) sending: Option<beam_model::sending::Sending>,
+    /// Whether the background agent starts at sign-in; read when the
+    /// Settings page opens and after a change (it asks the OS).
+    pub(crate) at_sign_in: bool,
+    pub(crate) history_filter: settings::Filter,
+    pub(crate) history_search: String,
+    /// The `beam` program next to this window, which the background
+    /// service runs; `None` if it is not there.
+    pub(crate) beam_program: Option<std::path::PathBuf>,
 }
 
 /// What can be open over the window. One at a time, like the view's pop-ups.
@@ -122,6 +132,10 @@ pub enum Dialog {
         friend: String,
         path: std::path::PathBuf,
     },
+    /// Turn router port mapping on? Starts on "Keep it off".
+    PortMapping(Ask<settings::PortMappingOn>),
+    /// Clear the whole history? Starts on Keep.
+    ClearHistory(Ask<settings::ClearHistory>),
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +164,7 @@ pub enum Message {
     Pair(PairMsg),
     Receive(RecvMsg),
     Send(SendMsg),
+    Settings(SettingsMsg),
     /// Enter or Escape, for the open dialog.
     Key(keyboard::Key),
 }
@@ -201,6 +216,12 @@ impl Gui {
             notify: true,
             outgoing: None,
             sending: None,
+            at_sign_in: false,
+            history_filter: settings::Filter::All,
+            history_search: String::new(),
+            beam_program: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().and_then(settings::beam_in)),
         }
     }
 
@@ -246,7 +267,12 @@ impl Gui {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Page(page) => self.page = page,
+            Message::Page(page) => {
+                if page == Page::Settings {
+                    self.at_sign_in = beam_core::actions::service::enabled();
+                }
+                self.page = page;
+            }
             Message::Select(name) => {
                 self.selected = Some(name);
                 self.page = Page::Friends;
@@ -311,6 +337,7 @@ impl Gui {
             Message::Pair(message) => return self.on_pair(message),
             Message::Receive(message) => return self.on_receive(message),
             Message::Send(message) => return self.on_send(message),
+            Message::Settings(message) => return self.on_settings(message),
             Message::Key(key) => return self.on_key(key),
         }
         Task::none()
@@ -348,6 +375,14 @@ impl Gui {
             Some(Dialog::Leave(ask, _)) if enter || escape => {
                 let choice = if enter { ask.focus() } else { Choice::No };
                 return self.on_receive(RecvMsg::AnswerLeave(choice));
+            }
+            Some(Dialog::PortMapping(ask)) if enter || escape => {
+                let choice = if enter { ask.focus() } else { Choice::No };
+                return self.on_settings(SettingsMsg::AnswerPortMapping(choice));
+            }
+            Some(Dialog::ClearHistory(ask)) if enter || escape => {
+                let choice = if enter { ask.focus() } else { Choice::No };
+                return self.on_settings(SettingsMsg::AnswerClear(choice));
             }
             // A drop may be an accident: Enter and Escape both send nothing.
             Some(Dialog::SendDropped { .. }) if enter || escape => {

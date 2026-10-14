@@ -15,7 +15,10 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Fill, FillPortion, Padding};
 
-use crate::app::{Dialog, Gui, Message, Page, PairMsg, Pairing, RecvMsg, SendMsg, Tone};
+use crate::app::{
+    Dialog, Gui, HistoryFilter, Message, Page, PairMsg, Pairing, RecvMsg, SendMsg, SettingsMsg,
+    Tone,
+};
 use crate::icons;
 use crate::theme::{self, BOLD, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
 
@@ -46,13 +49,7 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
             Page::Friends => row![friend_pane(gui, snapshot), friend_detail(gui, snapshot)].into(),
             Page::Transfers => transfers_page(gui, snapshot),
             Page::Inbox => inbox_page(gui, snapshot),
-            Page::History => later(
-                p,
-                icons::HISTORY,
-                "History",
-                "History in this window comes in a later version.",
-                "Meanwhile, in a terminal: beam history",
-            ),
+            Page::History => history_page(gui, snapshot),
             Page::Settings => settings(gui, snapshot),
         };
         row![
@@ -90,6 +87,8 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
             Dialog::StopReceiving(_) => stop_dialog(p),
             Dialog::Leave(..) => leave_dialog(p),
             Dialog::SendDropped { friend, path } => drop_dialog(p, friend, path),
+            Dialog::PortMapping(_) => port_mapping_dialog(p),
+            Dialog::ClearHistory(_) => clear_dialog(p),
         };
         // Clicks do not reach the window behind a dialog.
         layers = layers.push(opaque(center(card).style(theme::veil(p, 1.0))));
@@ -694,7 +693,13 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
             chip(p, p.success, icons::LOCK, "On this device only"),
         ));
     }
-    let mut body = column![appearance].spacing(16);
+    let mut body = column![
+        received_settings(gui),
+        network_settings(gui),
+        service_settings(gui, snapshot),
+        appearance
+    ]
+    .spacing(16);
     if !device.is_empty() {
         body = body.push(settings_group(p, "This device", device));
     }
@@ -707,7 +712,7 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
             page_title(
                 p,
                 "Settings",
-                "More settings come with the pages that use them."
+                "Saved in config.toml in your beam folder: the command line uses the same settings."
             )
         ),
         scrollable(
@@ -716,21 +721,6 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
                 .max_width(900)
         )
         .height(Fill),
-    ]
-    .into()
-}
-
-/// A page still to come: what it will do, and how to do it today.
-fn later<'a>(
-    p: &'static Pal,
-    glyph: char,
-    title: &'a str,
-    words: &'a str,
-    meanwhile: &'a str,
-) -> Element<'a, Message> {
-    column![
-        toolbar(p, page_title(p, title, words)),
-        container(empty(p, glyph, "Not in this window yet", meanwhile)).height(Fill),
     ]
     .into()
 }
@@ -2202,6 +2192,406 @@ fn drop_dialog<'a>(
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::Send(SendMsg::AnswerDrop(false))),
+        ]
+        .spacing(8),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// History and settings (GUI EX Patch #7)
+// ---------------------------------------------------------------------------
+
+fn history_page<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
+    let p = gui.pal();
+    let segment = |label: &'static str, filter: HistoryFilter| {
+        button(text(label).size(MD))
+            .padding([5, 12])
+            .style(theme::segment(p, gui.history_filter == filter))
+            .on_press(Message::Settings(SettingsMsg::Filter(filter)))
+    };
+    let controls = row![
+        container(
+            row![
+                segment("All", HistoryFilter::All),
+                segment("Sent", HistoryFilter::Sent),
+                segment("Received", HistoryFilter::Received),
+                segment("Declined", HistoryFilter::Declined),
+                segment("Problems", HistoryFilter::Problems),
+            ]
+            .spacing(2)
+        )
+        .padding(3)
+        .style(theme::segments(p)),
+        space::horizontal(),
+        text_input("Filter by file or friend", &gui.history_search)
+            .on_input(|t| Message::Settings(SettingsMsg::Search(t)))
+            .icon(text_input::Icon {
+                font: icons::FONT,
+                code_point: icons::FILTER,
+                size: Some(14.into()),
+                spacing: 8.0,
+                side: text_input::Side::Left,
+            })
+            .padding([7, 10])
+            .size(MD)
+            .width(260)
+            .style(theme::input(p)),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+
+    let needle = gui.history_search.to_lowercase();
+    let rows: Vec<&Entry> = snapshot
+        .history
+        .iter()
+        .rev()
+        .filter(|e| match gui.history_filter {
+            HistoryFilter::All => true,
+            HistoryFilter::Sent => e.direction == Direction::Sent,
+            HistoryFilter::Received => e.direction == Direction::Received,
+            HistoryFilter::Declined => e.outcome == Outcome::Declined,
+            HistoryFilter::Problems => matches!(e.outcome, Outcome::Failed | Outcome::Cancelled),
+        })
+        .filter(|e| {
+            needle.is_empty()
+                || e.file.to_lowercase().contains(&needle)
+                || e.peer.to_lowercase().contains(&needle)
+        })
+        .collect();
+    let shown = rows.len().min(200);
+    let table = if rows.is_empty() {
+        empty(
+            p,
+            icons::HISTORY,
+            if snapshot.history.is_empty() {
+                "Nothing yet"
+            } else {
+                "Nothing matches"
+            },
+            "Every file that comes or goes is listed here, newest first.",
+        )
+    } else {
+        history_table(p, &rows[..shown], history::unix_now())
+    };
+    column![
+        toolbar(
+            p,
+            row![
+                column![
+                    text("History").font(BOLD).size(XXL),
+                    text("What came and went on this device. Kept only here, in your beam folder (the newest 1000).")
+                        .size(MD)
+                        .color(p.subtext)
+                ]
+                .spacing(4)
+                .width(Fill),
+                button(
+                    row![icon(icons::DELETE, 12), text("Clear history").size(MD)]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                )
+                .padding([7, 14])
+                .style(theme::secondary(p))
+                .on_press_maybe(
+                    (!snapshot.history.is_empty())
+                        .then_some(Message::Settings(SettingsMsg::ClearHistory))
+                ),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center),
+        ),
+        scrollable(
+            column![
+                controls,
+                section(
+                    p,
+                    format!("{} of {}", rows.len(), snapshot.history.len()),
+                    None,
+                    table
+                ),
+            ]
+            .spacing(14)
+            .padding(Padding::new(24.0).top(18.0)),
+        )
+        .height(Fill),
+    ]
+    .into()
+}
+
+/// The whole history: direction, file, friend, size, result, when.
+fn history_table<'a>(p: &'static Pal, rows: &[&'a Entry], now: u64) -> Element<'a, Message> {
+    let header = row![
+        space::horizontal().width(FillPortion(1)),
+        column_head(p, "FILE", 5),
+        column_head(p, "FRIEND", 3),
+        column_head(p, "SIZE", 2),
+        column_head(p, "RESULT", 3),
+        column_head(p, "WHEN", 2),
+    ]
+    .spacing(12);
+    let lines = rows.iter().map(|e| {
+        let (glyph, tint) = match e.direction {
+            Direction::Sent => (icons::UPLOAD, p.accent),
+            Direction::Received => (icons::DOWNLOAD, p.success),
+        };
+        let (rtint, rglyph) = match e.outcome {
+            Outcome::Done => (p.success, icons::CHECK),
+            Outcome::Declined => (p.warning, icons::CLOSE),
+            Outcome::Cancelled => (p.faint, icons::CLOSE),
+            Outcome::Failed => (p.danger, icons::WARNING),
+        };
+        let mut file = column![text(&e.file).size(MD)];
+        if let Some(note) = &e.note {
+            file = file.push(text(note).size(XS).color(p.faint));
+        }
+        row![
+            container(
+                container(center(icon(glyph, 12)))
+                    .width(26)
+                    .height(26)
+                    .style(theme::icon_tile(p, tint))
+            )
+            .center_x(FillPortion(1)),
+            file.width(FillPortion(5)),
+            row![
+                avatar(p, &e.peer, theme::tint_for(&e.fingerprint), 22.0, None),
+                text(&e.peer).size(MD)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .width(FillPortion(3)),
+            text(format_bytes(e.size))
+                .size(MD)
+                .color(p.subtext)
+                .width(FillPortion(2)),
+            container(chip(
+                p,
+                rtint,
+                rglyph,
+                history::outcome_word(e.outcome, e.direction)
+            ))
+            .width(FillPortion(3)),
+            text(history::ago(e.at, now))
+                .size(MD)
+                .color(p.subtext)
+                .width(FillPortion(2)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .into()
+    });
+    column![
+        container(header).padding(Padding::ZERO.bottom(8.0)),
+        column(lines).spacing(10)
+    ]
+    .into()
+}
+
+fn received_settings(gui: &Gui) -> Element<'_, Message> {
+    let p = gui.pal();
+    let chosen = gui.config.as_ref().and_then(|c| c.receive_dir.clone());
+    let shown = match &chosen {
+        Some(dir) => beam_core::untrusted::name(&dir.display().to_string()),
+        None if cfg!(windows) => format!(
+            "{} (your Downloads folder; the default)",
+            beam_core::untrusted::name(
+                &beam_core::agent::receive_dir(None).0.display().to_string()
+            )
+        ),
+        None => "Not chosen: the background agent would save where it was started".into(),
+    };
+    settings_group(
+        p,
+        "Received files",
+        vec![setting(
+            p,
+            "Save received files to",
+            "Used by the background agent, the Receiving switch, and beam listen without --out.",
+            column![
+                container(text(shown).font(MONO).size(SM))
+                    .padding([7, 10])
+                    .max_width(380)
+                    .style(theme::code_block(p)),
+                row![
+                    button(text("Browse…").size(MD))
+                        .padding([6, 12])
+                        .style(theme::secondary(p))
+                        .on_press(Message::Settings(SettingsMsg::ChooseFolder)),
+                    button(text("Use the default").size(MD))
+                        .padding([6, 12])
+                        .style(theme::ghost(p))
+                        .on_press_maybe(
+                            chosen
+                                .is_some()
+                                .then_some(Message::Settings(SettingsMsg::DefaultFolder))
+                        ),
+                ]
+                .spacing(8),
+            ]
+            .spacing(8)
+            .align_x(Alignment::End)
+            .into(),
+        )],
+    )
+}
+
+fn network_settings(gui: &Gui) -> Element<'_, Message> {
+    let p = gui.pal();
+    let mapping = gui.config.as_ref().is_some_and(|c| c.agent_port_mapping);
+    let port = gui
+        .config
+        .as_ref()
+        .map_or_else(|| "unknown".into(), |c| c.port.to_string());
+    column![
+        settings_group(
+            p,
+            "Network",
+            vec![
+                setting(
+                    p,
+                    "Relay",
+                    "Helps two devices find each other; files go direct whenever they can.",
+                    text(gui.relay_label()).font(MONO).size(SM).into(),
+                ),
+                setting(
+                    p,
+                    "Listening port (UDP)",
+                    "Fixed, so this device's invite stays the same.",
+                    text(port).font(MONO).size(SM).into(),
+                ),
+                setting(
+                    p,
+                    "Router port mapping",
+                    "Lets friends reach the background agent directly. It also makes this device findable by scanning.",
+                    toggler(mapping)
+                        .on_toggle(|on| Message::Settings(SettingsMsg::PortMapping(on)))
+                        .size(20)
+                        .style(theme::switch(p))
+                        .into(),
+                ),
+            ],
+        ),
+        text("The relay and the port are changed in config.toml in your beam folder; they affect every friend.")
+            .size(SM)
+            .color(p.subtext),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn service_settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
+    let p = gui.pal();
+    let beam = gui.beam_beside();
+    let folder = gui.agent_folder();
+    let running = matches!(snapshot.agent, Agent::Running { .. });
+    let background = running && snapshot.owner == Owner::Background;
+    let can_start = beam.is_some() && folder.is_some();
+    let state = match (&snapshot.agent, snapshot.owner) {
+        (Agent::Running { .. }, Owner::Background) => chip(p, p.success, icons::CHECK, "Running"),
+        (Agent::Running { .. }, _) => chip(p, p.info, icons::INFO, "A beam window receives"),
+        (Agent::Unreadable, _) => chip(p, p.faint, icons::WARNING, "Unknown"),
+        (Agent::Stopped, _) => chip(p, p.faint, icons::CLOSE, "Not running"),
+    };
+    let mut rows = vec![
+        setting(
+            p,
+            "Start at sign-in",
+            "Runs beam's background agent for your user only (never as an administrator), so friends can send while this window is closed. Every file still waits for your answer.",
+            toggler(gui.at_sign_in)
+                .on_toggle_maybe(
+                    (can_start || gui.at_sign_in)
+                        .then_some(|on| Message::Settings(SettingsMsg::AtSignIn(on))),
+                )
+                .size(20)
+                .style(theme::switch(p))
+                .into(),
+        ),
+        setting(
+            p,
+            "Now",
+            "Requests to the background agent show up in the Inbox.",
+            row![
+                state,
+                button(text(if background { "Stop" } else { "Start" }).size(MD))
+                    .padding([6, 12])
+                    .style(theme::secondary(p))
+                    .on_press_maybe(if background {
+                        Some(Message::Settings(SettingsMsg::StopAgent))
+                    } else if !running && can_start {
+                        Some(Message::Settings(SettingsMsg::StartAgent))
+                    } else {
+                        None
+                    }),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+        ),
+    ];
+    let why = match (&beam, &folder) {
+        (None, _) => Some(
+            "The background agent is the beam program, which is not next to beam-gui here. Install them together to use it from this page.",
+        ),
+        (_, None) => Some("Choose where received files go first: the agent saves there."),
+        _ => None,
+    };
+    if let Some(why) = why {
+        rows.push(notice(p, p.info, icons::INFO, why));
+    }
+    settings_group(p, "Background service", rows)
+}
+
+/// Router port mapping on? "Keep it off" is highlighted (the CLI's y/N).
+fn port_mapping_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+    dialog(
+        p,
+        icons::ROUTER,
+        "Turn on router port mapping?",
+        column![
+            notice(
+                p,
+                p.warning,
+                icons::WARNING,
+                "Your router will forward a port to this computer while the background agent runs. Anyone scanning the internet can then find that beam runs here.",
+            ),
+            text("Paired friends can usually reach you without it, through the relay. Turn it on only if direct connections fail.")
+                .size(MD)
+                .color(p.subtext),
+        ]
+        .spacing(12),
+        row![
+            space::horizontal(),
+            button(text("Turn on").size(MD))
+                .padding([7, 18])
+                .style(theme::secondary(p))
+                .on_press(Message::Settings(SettingsMsg::AnswerPortMapping(Choice::Yes))),
+            button(text("Keep it off").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::Settings(SettingsMsg::AnswerPortMapping(Choice::No))),
+        ]
+        .spacing(8),
+    )
+}
+
+/// Clear the whole history? Keep is highlighted.
+fn clear_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+    dialog(
+        p,
+        icons::DELETE,
+        "Clear history?",
+        text("Every line of what came and went on this device is deleted. Friends and files are not touched.")
+            .size(MD),
+        row![
+            space::horizontal(),
+            button(text("Clear").size(MD))
+                .padding([7, 18])
+                .style(theme::danger(p))
+                .on_press(Message::Settings(SettingsMsg::AnswerClear(Choice::Yes))),
+            button(text("Keep").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::Settings(SettingsMsg::AnswerClear(Choice::No))),
         ]
         .spacing(8),
     )

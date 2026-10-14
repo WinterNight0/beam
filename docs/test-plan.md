@@ -697,6 +697,7 @@ without a screen (`iced_test`: find text, click by label), in
 | Receiving (Patch #5), a real sender against the window's switch | `a_request_waits_and_enter_on_the_question_declines` (never opens by itself; a stray Enter answers nothing; starts on Decline; nothing saved), `a_click_on_accept_receives_the_file`, `escape_on_the_question_leaves_the_request_waiting`, `a_waiting_request_shows_on_the_rail_and_in_the_inbox` |
 | Stop or close while a file arrives | `stopping_or_closing_mid_file_asks_and_starts_on_no` |
 | Sending (Patch #6), two windows: bob's sends to alice's switch | `a_send_waits_for_their_yes_then_arrives` (nothing arrives before the yes), `a_declined_send_says_so`, `stop_while_waiting_withdraws_the_request`, `one_at_a_time_drops_propose_and_closing_asks` (a drop asks and Enter sends nothing; closing mid-send starts on Stay) |
+| History and settings (Patch #7) | `port_mapping_on_asks_and_starts_on_keep_it_off`, `the_receive_folder_is_saved_and_reset`, `clearing_the_history_asks_and_starts_on_keep`, `history_filters_and_search_narrow_the_list`, `the_service_controls_need_beam_beside_the_window`; shared with the CLI: `beam-core` `actions::settings::tests` (enabling the service is not tested: it writes to the registry) |
 | Friend detail | `copy_puts_the_fingerprint_on_the_clipboard_and_says_so`, `a_friends_recent_activity_is_listed_with_its_result`, `recently_active_friends_are_grouped_first` |
 
 Not automated: how the window looks. Checked by hand on Windows 11 and on
