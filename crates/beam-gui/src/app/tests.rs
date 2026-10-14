@@ -1151,6 +1151,7 @@ fn removing_by_keyboard_starts_on_keep_and_tab_moves_the_mark() {
     let _ = gui.update(key(keyboard::key::Named::Escape));
     assert_eq!(store.load_known_peers().unwrap().peers().len(), 1, "kept");
 
+    // beam's default: Remove on the left, Keep (purple) on the right.
     let _ = gui.update(key(keyboard::key::Named::Delete));
     let _ = gui.update(key(keyboard::key::Named::ArrowLeft));
     let _ = gui.update(key(keyboard::key::Named::ArrowRight));
@@ -1161,8 +1162,14 @@ fn removing_by_keyboard_starts_on_keep_and_tab_moves_the_mark() {
         "Right put the mark back on Keep"
     );
 
+    // The other setting swaps the sides, and the arrows follow them.
+    let _ = gui.update(Message::Emphasis(Emphasis::Action));
     let _ = gui.update(key(keyboard::key::Named::Delete));
-    let _ = gui.update(key(keyboard::key::Named::ArrowLeft));
+    let Some(Dialog::Remove(ask)) = &gui.dialog else {
+        panic!("no question");
+    };
+    assert_eq!(ask.focus(), Choice::No, "still starts on Keep");
+    let _ = gui.update(key(keyboard::key::Named::ArrowRight));
     let _ = gui.update(key(keyboard::key::Named::Enter));
     assert!(store.load_known_peers().unwrap().peers().is_empty());
 }

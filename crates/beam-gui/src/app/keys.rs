@@ -5,7 +5,8 @@
 //! box took the key: typing in a search box never switches pages.
 //!
 //! On a question, the marked answer is the one Enter gives. It starts on
-//! the safe one (`Ask` starts on No); Tab, or Left and Right, move it, so
+//! the safe one (`Ask` starts on No), whichever answer the Appearance
+//! setting makes purple; Tab, or Left and Right, move it, so
 //! a yes by keyboard is as deliberate as a click. Escape is always the
 //! safe answer ("later" on the Accept question).
 
@@ -147,9 +148,10 @@ impl Gui {
     fn dialog_key(&mut self, key: Key, mods: Modifiers) -> Task<Message> {
         let steer = match key.as_ref() {
             Key::Named(Named::Tab) => Some(Steer::Flip),
-            // The risky answer is on the left, the safe one on the right.
-            Key::Named(Named::ArrowLeft) => Some(Steer::Onto(Choice::Yes)),
-            Key::Named(Named::ArrowRight) => Some(Steer::Onto(Choice::No)),
+            // Onto the answer on that side, wherever the setting puts it
+            // (`Emphasis`, `view::answers`).
+            Key::Named(Named::ArrowLeft) => Some(Steer::Onto(self.emphasis.left())),
+            Key::Named(Named::ArrowRight) => Some(Steer::Onto(self.emphasis.left().other())),
             _ => None,
         };
         if let Some(steer) = steer {

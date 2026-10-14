@@ -17,11 +17,11 @@ use iced::{Alignment, Color, Element, Fill, FillPortion, Padding};
 
 use crate::app::keys::{FRIEND_SEARCH, HISTORY_SEARCH};
 use crate::app::{
-    Dialog, Gui, HistoryFilter, Message, Page, PairMsg, Pairing, RecvMsg, SendMsg, SettingsMsg,
-    Tone,
+    Dialog, Emphasis, Gui, HistoryFilter, Mark, Message, Page, PairMsg, Pairing, RecvMsg, SendMsg,
+    SettingsMsg, Tone,
 };
 use crate::icons;
-use crate::theme::{self, BOLD, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
+use crate::theme::{self, BOLD, FONT, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
 
 /// The navigation rail: its width, the equal gutter left and right of each
 /// item, and the box an item's icon is centred in.
@@ -89,16 +89,18 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
                 p,
                 &ask.question().name,
                 &ask.question().fingerprint,
-                ask.focus(),
+                gui.mark(ask.focus()),
             ),
             Dialog::Pair(state) => pairing_dialog(gui, state),
-            Dialog::RelayMove(ask) => relay_dialog(p, ask.question(), ask.focus()),
-            Dialog::Accept(ask) => accept_dialog(gui, ask.question(), ask.focus()),
-            Dialog::StopReceiving(ask) => stop_dialog(p, ask.focus()),
-            Dialog::Leave(ask, _) => leave_dialog(p, ask.focus()),
-            Dialog::SendDropped { friend, path } => drop_dialog(p, friend, path),
-            Dialog::PortMapping(ask) => port_mapping_dialog(p, ask.focus()),
-            Dialog::ClearHistory(ask) => clear_dialog(p, ask.focus()),
+            Dialog::RelayMove(ask) => relay_dialog(p, ask.question(), gui.mark(ask.focus())),
+            Dialog::Accept(ask) => accept_dialog(gui, ask.question(), gui.mark(ask.focus())),
+            Dialog::StopReceiving(ask) => stop_dialog(p, gui.mark(ask.focus())),
+            Dialog::Leave(ask, _) => leave_dialog(p, gui.mark(ask.focus())),
+            Dialog::SendDropped { friend, path } => {
+                drop_dialog(p, friend, path, gui.mark(Choice::No))
+            }
+            Dialog::PortMapping(ask) => port_mapping_dialog(p, gui.mark(ask.focus())),
+            Dialog::ClearHistory(ask) => clear_dialog(p, gui.mark(ask.focus())),
         };
         // Clicks do not reach the window behind a dialog.
         layers = layers.push(opaque(center(card).style(theme::veil(p, 1.0))));
@@ -658,6 +660,12 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
         .style(theme::segment(p, gui.dark == dark))
         .on_press(Message::Dark(dark))
     };
+    let emphasis = |label: &'static str, emphasis: Emphasis| {
+        button(text(label).size(MD))
+            .padding([5, 12])
+            .style(theme::segment(p, gui.emphasis == emphasis))
+            .on_press(Message::Emphasis(emphasis))
+    };
     let zoom = row![
         button(text("−").size(MD))
             .padding([5, 12])
@@ -697,6 +705,21 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
                 "Zoom",
                 "Larger or smaller text and controls, on top of the screen's own scaling (Ctrl+= and Ctrl+-).",
                 zoom.into(),
+            ),
+            setting(
+                p,
+                "Highlighted answer",
+                "Which answer of a question is purple and on the right. Enter starts on the safe answer either way.",
+                container(
+                    row![
+                        emphasis("Safe answer", Emphasis::Safe),
+                        emphasis("Action", Emphasis::Action)
+                    ]
+                    .spacing(2),
+                )
+                .padding(3)
+                .style(theme::segments(p))
+                .into(),
             ),
         ],
     );
@@ -1095,7 +1118,8 @@ fn column_head<'a>(p: &'static Pal, name: &'a str, share: u16) -> Element<'a, Me
 }
 
 /// A dialog: title bar with an icon and a close button, body, and a footer
-/// strip holding the buttons, the safe one on the right and highlighted.
+/// strip holding the buttons (`answers`: no on the left, the action on the
+/// right).
 fn dialog<'a>(
     p: &'static Pal,
     glyph: char,
@@ -1178,13 +1202,13 @@ fn rename_dialog<'a>(
     )
 }
 
-/// Remove a friend? Keep is the highlighted, safe answer (`Ask` starts on
-/// No), and Enter or Escape keep them; only a click on Remove removes.
+/// Remove a friend? Enter starts on Keep, the safe answer (`Ask` starts on
+/// No), and Escape keeps them too.
 fn remove_dialog<'a>(
     p: &'static Pal,
     name: &'a str,
     fingerprint: &'a str,
-    focus: Choice,
+    mark: Mark,
 ) -> Element<'a, Message> {
     dialog(
         p,
@@ -1214,15 +1238,10 @@ fn remove_dialog<'a>(
         .spacing(14),
         answers(
             p,
-            focus,
-            button(text("Remove").size(MD))
-                .padding([7, 18])
-                .style(theme::danger(p))
-                .on_press(Message::AnswerRemove(Choice::Yes)),
-            button(text("Keep").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::AnswerRemove(Choice::No)),
+            mark,
+            Act::Destroy,
+            ("Remove", Some(Message::AnswerRemove(Choice::Yes))),
+            ("Keep", Message::AnswerRemove(Choice::No)),
         ),
     )
 }
@@ -1534,7 +1553,7 @@ fn pairing_dialog<'a>(gui: &'a Gui, state: &'a Pairing) -> Element<'a, Message> 
             row![space::horizontal(), cancel(p, "Cancel")],
         ),
         Pairing::Confirm { ask, compared } => {
-            let (q, focus) = (ask.question(), ask.focus());
+            let (q, mark) = (ask.question(), gui.mark(ask.focus()));
             dialog(
                 p,
                 icons::SHIELD,
@@ -1558,16 +1577,10 @@ fn pairing_dialog<'a>(gui: &'a Gui, state: &'a Pairing) -> Element<'a, Message> 
                 .spacing(12),
                 answers(
                     p,
-                    focus,
-                    button(text("Pair").size(MD))
-                        .padding([7, 18])
-                        .style(theme::secondary(p))
-                        .on_press_maybe(compared.then_some(pair(PairMsg::Answer(Choice::Yes)))),
-                    // The safe answer, highlighted; Escape chooses it.
-                    button(text("Don't pair").font(SEMIBOLD).size(MD))
-                        .padding([7, 18])
-                        .style(theme::primary(p))
-                        .on_press(pair(PairMsg::Answer(Choice::No))),
+                    mark,
+                    Act::Build,
+                    ("Pair", compared.then_some(pair(PairMsg::Answer(Choice::Yes)))),
+                    ("Don't pair", pair(PairMsg::Answer(Choice::No))),
                 ),
             )
         }
@@ -1601,9 +1614,9 @@ fn fingerprint_card<'a>(p: &'static Pal, whose: &str, hex: &str) -> Element<'a, 
     .into()
 }
 
-/// An invite would move a paired friend to another relay. Keep is the
-/// highlighted, safe answer (ADR-0038).
-fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove, focus: Choice) -> Element<'a, Message> {
+/// An invite would move a paired friend to another relay. Enter starts on
+/// Keep, the safe answer (ADR-0038).
+fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove, mark: Mark) -> Element<'a, Message> {
     dialog(
         p,
         icons::GLOBE,
@@ -1635,15 +1648,10 @@ fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove, focus: Choice) -> Element
         .spacing(10),
         answers(
             p,
-            focus,
-            button(text("Move").size(MD))
-                .padding([7, 18])
-                .style(theme::secondary(p))
-                .on_press(Message::Pair(PairMsg::AnswerRelay(Choice::Yes))),
-            button(text("Keep the current relay").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::Pair(PairMsg::AnswerRelay(Choice::No))),
+            mark,
+            Act::Build,
+            ("Move", Some(Message::Pair(PairMsg::AnswerRelay(Choice::Yes)))),
+            ("Keep the current relay", Message::Pair(PairMsg::AnswerRelay(Choice::No))),
         ),
     )
 }
@@ -1854,9 +1862,10 @@ fn inbox_page<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> 
     .into()
 }
 
-/// May this friend send this file? Decline is highlighted: Enter declines,
-/// Escape decides later, and only a click on Accept accepts (rule 1).
-fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming, focus: Choice) -> Element<'a, Message> {
+/// May this friend send this file? Enter starts on Decline, Escape decides
+/// later; Accept is the action on the right, and needs a click or a
+/// deliberate move of the mark (rule 1).
+fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming, mark: Mark) -> Element<'a, Message> {
     let p = gui.pal();
     let r = &q.request;
     let saved_to = match &gui.snapshot.as_ref().map(|s| &s.agent) {
@@ -1935,21 +1944,16 @@ fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming, focus: Choice) -> Element<'a
         .spacing(16),
         answers(
             p,
-            focus,
-            button(text("Accept").size(MD))
-                .padding([7, 18])
-                .style(theme::secondary(p))
-                .on_press(Message::Receive(RecvMsg::Answer(Choice::Yes))),
-            button(text("Decline").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::Receive(RecvMsg::Answer(Choice::No))),
+            mark,
+            Act::Build,
+            ("Accept", Some(Message::Receive(RecvMsg::Answer(Choice::Yes)))),
+            ("Decline", Message::Receive(RecvMsg::Answer(Choice::No))),
         ),
     )
 }
 
-/// A file is arriving: stop anyway? Keep receiving is the highlighted answer.
-fn stop_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
+/// A file is arriving: stop anyway? Enter starts on Keep receiving.
+fn stop_dialog<'a>(p: &'static Pal, mark: Mark) -> Element<'a, Message> {
     dialog(
         p,
         icons::WARNING,
@@ -1958,21 +1962,16 @@ fn stop_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
             .size(MD),
         answers(
             p,
-            focus,
-            button(text("Stop").size(MD))
-                .padding([7, 18])
-                .style(theme::danger(p))
-                .on_press(Message::Receive(RecvMsg::AnswerStop(Choice::Yes))),
-            button(text("Keep receiving").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::Receive(RecvMsg::AnswerStop(Choice::No))),
+            mark,
+            Act::Destroy,
+            ("Stop", Some(Message::Receive(RecvMsg::AnswerStop(Choice::Yes)))),
+            ("Keep receiving", Message::Receive(RecvMsg::AnswerStop(Choice::No))),
         ),
     )
 }
 
-/// A file is arriving: close beam anyway? Stay is the highlighted answer.
-fn leave_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
+/// A file is arriving: close beam anyway? Enter starts on Stay.
+fn leave_dialog<'a>(p: &'static Pal, mark: Mark) -> Element<'a, Message> {
     dialog(
         p,
         icons::WARNING,
@@ -1981,15 +1980,10 @@ fn leave_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
             .size(MD),
         answers(
             p,
-            focus,
-            button(text("Close anyway").size(MD))
-                .padding([7, 18])
-                .style(theme::danger(p))
-                .on_press(Message::Receive(RecvMsg::AnswerLeave(Choice::Yes))),
-            button(text("Stay").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::Receive(RecvMsg::AnswerLeave(Choice::No))),
+            mark,
+            Act::Destroy,
+            ("Close anyway", Some(Message::Receive(RecvMsg::AnswerLeave(Choice::Yes)))),
+            ("Stay", Message::Receive(RecvMsg::AnswerLeave(Choice::No))),
         ),
     )
 }
@@ -2202,12 +2196,13 @@ fn sending_card<'a>(p: &'static Pal, s: &'a Sending) -> Element<'a, Message> {
     card.into()
 }
 
-/// A file was dropped on a friend's page. A drop may be an accident, so the
-/// highlighted answer sends nothing; Enter and Escape choose it too.
+/// A file was dropped on a friend's page. A drop may be an accident, so
+/// Enter and Escape send nothing; only a click on Send sends.
 fn drop_dialog<'a>(
     p: &'static Pal,
     friend: &'a str,
     path: &'a std::path::Path,
+    mark: Mark,
 ) -> Element<'a, Message> {
     let file = path
         .file_name()
@@ -2226,18 +2221,13 @@ fn drop_dialog<'a>(
                 .color(p.subtext),
         ]
         .spacing(8),
-        row![
-            space::horizontal(),
-            button(text("Send").size(MD))
-                .padding([7, 18])
-                .style(theme::secondary(p))
-                .on_press(Message::Send(SendMsg::AnswerDrop(true))),
-            button(text("Don't send").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::Send(SendMsg::AnswerDrop(false))),
-        ]
-        .spacing(8),
+        answers(
+            p,
+            mark,
+            Act::Build,
+            ("Send", Some(Message::Send(SendMsg::AnswerDrop(true)))),
+            ("Don't send", Message::Send(SendMsg::AnswerDrop(false))),
+        ),
     )
 }
 
@@ -2600,8 +2590,8 @@ fn service_settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Mes
     settings_group(p, "Background service", rows)
 }
 
-/// Router port mapping on? "Keep it off" is highlighted (the CLI's y/N).
-fn port_mapping_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
+/// Router port mapping on? Enter starts on "Keep it off" (the CLI's y/N).
+fn port_mapping_dialog<'a>(p: &'static Pal, mark: Mark) -> Element<'a, Message> {
     dialog(
         p,
         icons::ROUTER,
@@ -2620,21 +2610,16 @@ fn port_mapping_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Messag
         .spacing(12),
         answers(
             p,
-            focus,
-            button(text("Turn on").size(MD))
-                .padding([7, 18])
-                .style(theme::secondary(p))
-                .on_press(Message::Settings(SettingsMsg::AnswerPortMapping(Choice::Yes))),
-            button(text("Keep it off").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::Settings(SettingsMsg::AnswerPortMapping(Choice::No))),
+            mark,
+            Act::Build,
+            ("Turn on", Some(Message::Settings(SettingsMsg::AnswerPortMapping(Choice::Yes)))),
+            ("Keep it off", Message::Settings(SettingsMsg::AnswerPortMapping(Choice::No))),
         ),
     )
 }
 
-/// Clear the whole history? Keep is highlighted.
-fn clear_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
+/// Clear the whole history? Enter starts on Keep.
+fn clear_dialog<'a>(p: &'static Pal, mark: Mark) -> Element<'a, Message> {
     dialog(
         p,
         icons::DELETE,
@@ -2643,15 +2628,10 @@ fn clear_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
             .size(MD),
         answers(
             p,
-            focus,
-            button(text("Clear").size(MD))
-                .padding([7, 18])
-                .style(theme::danger(p))
-                .on_press(Message::Settings(SettingsMsg::AnswerClear(Choice::Yes))),
-            button(text("Keep").font(SEMIBOLD).size(MD))
-                .padding([7, 18])
-                .style(theme::primary(p))
-                .on_press(Message::Settings(SettingsMsg::AnswerClear(Choice::No))),
+            mark,
+            Act::Destroy,
+            ("Clear", Some(Message::Settings(SettingsMsg::AnswerClear(Choice::Yes)))),
+            ("Keep", Message::Settings(SettingsMsg::AnswerClear(Choice::No))),
         ),
     )
 }
@@ -2660,26 +2640,74 @@ fn clear_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
 // Polish (GUI EX Patch #8)
 // ---------------------------------------------------------------------------
 
-/// A question's two answers: the risky one, then the safe one, which is
-/// highlighted. The ring marks what Enter gives: it starts on the safe one,
-/// and Tab or the arrows move it (`app/keys.rs`).
+/// What a question's yes does, for its colour: red when it removes or
+/// stops something.
+#[derive(Clone, Copy)]
+enum Act {
+    Build,
+    Destroy,
+}
+
+/// A question's two answers. Which one is purple and on the right is a
+/// setting (`Emphasis`): the safe answer, as beam started, or the action, as
+/// most desktops place it. The ring marks what Enter gives: it starts on
+/// no, the safe answer (`Ask`), whichever is purple; Tab or the arrows move
+/// it (`app/keys.rs`).
 fn answers<'a>(
     p: &'static Pal,
-    focus: Choice,
-    yes: impl Into<Element<'a, Message>>,
-    no: impl Into<Element<'a, Message>>,
+    mark: Mark,
+    act: Act,
+    yes: (&'a str, Option<Message>),
+    no: (&'a str, Message),
 ) -> Element<'a, Message> {
+    let answer = |label: &'a str, on_press: Option<Message>, style: theme::B, main: bool| {
+        button(
+            text(label)
+                .font(if main { SEMIBOLD } else { FONT })
+                .size(MD),
+        )
+        .padding([7, 18])
+        .style(style)
+        .on_press_maybe(on_press)
+    };
     let ring = |answer: Element<'a, Message>, on: bool| {
         container(answer).padding(2).style(theme::focus_ring(p, on))
     };
-    row![
-        space::horizontal(),
-        ring(yes.into(), focus == Choice::Yes),
-        ring(no.into(), focus == Choice::No),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center)
-    .into()
+    let destroy = matches!(act, Act::Destroy);
+    let (yes_on, no_on) = (mark.focus == Choice::Yes, mark.focus == Choice::No);
+    let row = match mark.emphasis {
+        Emphasis::Safe => {
+            let yes_style = if destroy {
+                theme::danger(p)
+            } else {
+                theme::secondary(p)
+            };
+            row![
+                space::horizontal(),
+                ring(answer(yes.0, yes.1, yes_style, false).into(), yes_on),
+                ring(
+                    answer(no.0, Some(no.1), theme::primary(p), true).into(),
+                    no_on
+                ),
+            ]
+        }
+        Emphasis::Action => {
+            let yes_style = if destroy {
+                theme::danger(p)
+            } else {
+                theme::primary(p)
+            };
+            row![
+                space::horizontal(),
+                ring(
+                    answer(no.0, Some(no.1), theme::secondary(p), false).into(),
+                    no_on
+                ),
+                ring(answer(yes.0, yes.1, yes_style, !destroy).into(), yes_on),
+            ]
+        }
+    };
+    row.spacing(4).align_y(Alignment::Center).into()
 }
 
 /// Part of the beam folder could not be read, over every page.

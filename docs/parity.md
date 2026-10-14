@@ -34,7 +34,7 @@ terminal · — not offered · *planned* not built yet.
 | History, and clearing it | `beam history [--clear]` | ✔ Friends panel; ⌨ `history` | ✔ History page (filters, search); Clear starts on Keep | `history`, `beam-model::snapshot` |
 | Partial transfers, and clearing them | `beam transfers [--clear]` | ⌨ `transfers` | *planned* | `transfer::partial` |
 | Choose what plain `beam` opens | `beam ui cli\|tui` | ⌨ `ui` | — | `config` |
-| Everything by keyboard (every question starts marked on its safe answer) | ✔ | ✔ keys on each tab | ✔ shortcuts (Ctrl+1…5, Ctrl+F, Ctrl+N, Ctrl+O, F2, Delete, Up/Down), listed in Settings → Keyboard; Tab or the arrows move a question's mark | `beam-model::ask` |
+| Everything by keyboard (every question starts marked on its safe answer) | ✔ | ✔ keys on each tab | ✔ shortcuts (Ctrl+1…5, Ctrl+F, Ctrl+N, Ctrl+O, F2, Delete, Up/Down), listed in Settings → Keyboard; Tab or the arrows move a question's mark; which answer is purple is a setting (the safe one by default), Enter starts on the safe one either way | `beam-model::ask` |
 | Zoom | — (the terminal's own) | — (the terminal's own) | ✔ Ctrl+= / Ctrl+- / Ctrl+0, Settings → Appearance | — |
 | Copy, paste, mouse in old consoles | — | ✔ Ctrl+C / Ctrl+V, `m` (ADR-0047) | — | — |
 

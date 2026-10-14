@@ -191,7 +191,7 @@ pub fn theme(p: &Pal) -> Theme {
 }
 
 type C = Box<dyn Fn(&Theme) -> container::Style>;
-type B = Box<dyn Fn(&Theme, button::Status) -> button::Style>;
+pub type B = Box<dyn Fn(&Theme, button::Status) -> button::Style>;
 type I = Box<dyn Fn(&Theme, text_input::Status) -> text_input::Style>;
 type S = Box<dyn Fn(&Theme, toggler::Status) -> toggler::Style>;
 

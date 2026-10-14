@@ -327,7 +327,10 @@ In this order, each step with its tests (ADR-0048):
   and `actions::service` now shared with `beam receive-dir`/`beam service`);
   #8 polish (`app/keys.rs`: shortcuts by Latin letter, so any keyboard
   layout; a question's mark starts on the safe answer, Tab/arrows move it,
-  Enter gives it, Escape is safe, Enter on an unticked Pair waits; zoom
+  Enter gives it, Escape is safe, Enter on an unticked Pair waits;
+  Settings → Appearance → Highlighted answer: the safe answer purple on
+  the right (default) or the action (purple; red when it removes or
+  stops), only the look: the mark starts on no either way; zoom
   80–200% on top of the screen's scaling; under 760 px the friends list
   keeps only faces; an unreadable `known_peers` or identity is a banner on
   every page; `Snapshot::load` finds "last seen" in one pass). Renderer:

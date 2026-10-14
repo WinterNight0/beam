@@ -50,6 +50,36 @@ pub enum Page {
     Settings,
 }
 
+/// Which answer of a question is purple and on the right. Only the look:
+/// Enter's mark starts on the safe answer either way (`Ask` starts on No).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Emphasis {
+    /// The safe answer (Keep, Decline, Don't pair): beam's default.
+    #[default]
+    Safe,
+    /// The action (Accept, Pair; red when it removes or stops something),
+    /// as most desktops place it.
+    Action,
+}
+
+impl Emphasis {
+    /// The answer on the left, where Left points.
+    pub fn left(self) -> Choice {
+        match self {
+            Emphasis::Safe => Choice::Yes,
+            Emphasis::Action => Choice::No,
+        }
+    }
+}
+
+/// How a question's answers are drawn: which one Enter gives now, and
+/// which one is emphasised.
+#[derive(Debug, Clone, Copy)]
+pub struct Mark {
+    pub focus: Choice,
+    pub emphasis: Emphasis,
+}
+
 /// The tone of a notice: what it is about, not how loud it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -80,6 +110,8 @@ pub struct Gui {
     pub(crate) width: f32,
     /// Interface zoom (Ctrl+= / Ctrl+-), on top of the screen's scaling.
     pub(crate) zoom: f32,
+    /// Which answer of a question is purple and on the right.
+    pub(crate) emphasis: Emphasis,
     pub(crate) notice: Option<(String, Tone)>,
     /// The one question or form open over the window, if any.
     pub(crate) dialog: Option<Dialog>,
@@ -159,6 +191,8 @@ pub enum Message {
     Resized(f32),
     /// A new interface zoom, one of `ZOOMS`.
     Zoom(f32),
+    /// Which answer of a question is purple and on the right.
+    Emphasis(Emphasis),
     DismissNotice,
     /// Copy a friend's full fingerprint, to paste where they can compare it.
     CopyFingerprint(String),
@@ -219,6 +253,7 @@ impl Gui {
             dark: true,
             width: SIZE.0,
             zoom: 1.0,
+            emphasis: Emphasis::Safe,
             notice: None,
             dialog: None,
             worker: None,
@@ -313,6 +348,7 @@ impl Gui {
             }
             // Sizes arrive zoomed; kept as the screen has them.
             Message::Resized(width) => self.width = width * self.zoom,
+            Message::Emphasis(emphasis) => self.emphasis = emphasis,
             Message::Zoom(zoom) => self.zoom = zoom.clamp(ZOOMS[0], ZOOMS[ZOOMS.len() - 1]),
             Message::DismissNotice => self.notice = None,
             Message::CopyFingerprint(hex) => {
@@ -484,6 +520,14 @@ impl Gui {
             _ if self.compact() => 64.0,
             w if w < 1000.0 => 240.0,
             _ => 300.0,
+        }
+    }
+
+    /// How to draw a question whose mark is on `focus`.
+    pub(crate) fn mark(&self, focus: Choice) -> Mark {
+        Mark {
+            focus,
+            emphasis: self.emphasis,
         }
     }
 
