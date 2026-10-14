@@ -27,13 +27,15 @@ terminal · — not offered · *planned* not built yet.
 | Send a file | `beam send` | ✔ `s` + file browser; ⌨ `send` | ✔ Send a file (OS file picker), or drop a file on a friend's page (asks first); Transfers page with Stop | `actions::send_worker`, `actions::send`, `beam-model::sending` |
 | Receive with a prompt per file | `beam listen` | ⌨ `listen` (in a terminal) | *planned* | `listener` |
 | Receive while open, without a terminal | — (use `beam listen`) | ✔ Receiving switch | ✔ Receiving switch (Inbox); closing asks if a file arrives | `actions::switch`, `actions::receive`, `beam-model::requests` |
-| Answer requests (Accept starts on Decline) | `beam inbox` | ✔ Pending tab | ✔ Inbox, Review; Enter declines, Escape is later | `actions::inbox_link`, `beam-model::requests`, `beam-model::ask` |
+| Answer requests (Accept starts on Decline) | `beam inbox` | ✔ Pending tab | ✔ Inbox, Review; Enter gives the marked answer (it starts on Decline), Escape is later | `actions::inbox_link`, `beam-model::requests`, `beam-model::ask` |
 | Background agent: enable, start, stop, status | `beam service …` | ⌨ `service …` | ✔ Settings → Background service (runs the `beam` next to the GUI) | `actions::service`, `agent` |
 | Router port mapping for the agent (asks first) | `beam service port-mapping on` | ⌨ (in a terminal) | ✔ Settings → Network; the question starts on "Keep it off" | `actions::settings` |
 | Where received files go | `beam receive-dir` | ⌨ `receive-dir` | ✔ Settings → Received files (OS folder picker) | `actions::settings`, `config` |
 | History, and clearing it | `beam history [--clear]` | ✔ Friends panel; ⌨ `history` | ✔ History page (filters, search); Clear starts on Keep | `history`, `beam-model::snapshot` |
 | Partial transfers, and clearing them | `beam transfers [--clear]` | ⌨ `transfers` | *planned* | `transfer::partial` |
 | Choose what plain `beam` opens | `beam ui cli\|tui` | ⌨ `ui` | — | `config` |
+| Everything by keyboard (every question starts marked on its safe answer) | ✔ | ✔ keys on each tab | ✔ shortcuts (Ctrl+1…5, Ctrl+F, Ctrl+N, Ctrl+O, F2, Delete, Up/Down), listed in Settings → Keyboard; Tab or the arrows move a question's mark | `beam-model::ask` |
+| Zoom | — (the terminal's own) | — (the terminal's own) | ✔ Ctrl+= / Ctrl+- / Ctrl+0, Settings → Appearance | — |
 | Copy, paste, mouse in old consoles | — | ✔ Ctrl+C / Ctrl+V, `m` (ADR-0047) | — | — |
 
 ## Keeping it current

@@ -15,6 +15,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Fill, FillPortion, Padding};
 
+use crate::app::keys::{FRIEND_SEARCH, HISTORY_SEARCH};
 use crate::app::{
     Dialog, Gui, HistoryFilter, Message, Page, PairMsg, Pairing, RecvMsg, SendMsg, SettingsMsg,
     Tone,
@@ -52,6 +53,12 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
             Page::History => history_page(gui, snapshot),
             Page::Settings => settings(gui, snapshot),
         };
+        // Part of the beam folder could not be read: said on every page, so
+        // an empty list is never mistaken for "nothing there".
+        let page = match snapshot.problem.as_deref().or(gui.problem.as_deref()) {
+            Some(why) => column![problem_banner(p, why), page].into(),
+            None => page,
+        };
         row![
             rail(gui, snapshot),
             container(page)
@@ -78,17 +85,20 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
     if let Some(open) = &gui.dialog {
         let card = match open {
             Dialog::Rename { from, to, error } => rename_dialog(p, from, to, error.as_deref()),
-            Dialog::Remove(ask) => {
-                remove_dialog(p, &ask.question().name, &ask.question().fingerprint)
-            }
+            Dialog::Remove(ask) => remove_dialog(
+                p,
+                &ask.question().name,
+                &ask.question().fingerprint,
+                ask.focus(),
+            ),
             Dialog::Pair(state) => pairing_dialog(gui, state),
-            Dialog::RelayMove(ask) => relay_dialog(p, ask.question()),
-            Dialog::Accept(ask) => accept_dialog(gui, ask.question()),
-            Dialog::StopReceiving(_) => stop_dialog(p),
-            Dialog::Leave(..) => leave_dialog(p),
+            Dialog::RelayMove(ask) => relay_dialog(p, ask.question(), ask.focus()),
+            Dialog::Accept(ask) => accept_dialog(gui, ask.question(), ask.focus()),
+            Dialog::StopReceiving(ask) => stop_dialog(p, ask.focus()),
+            Dialog::Leave(ask, _) => leave_dialog(p, ask.focus()),
             Dialog::SendDropped { friend, path } => drop_dialog(p, friend, path),
-            Dialog::PortMapping(_) => port_mapping_dialog(p),
-            Dialog::ClearHistory(_) => clear_dialog(p),
+            Dialog::PortMapping(ask) => port_mapping_dialog(p, ask.focus()),
+            Dialog::ClearHistory(ask) => clear_dialog(p, ask.focus()),
         };
         // Clicks do not reach the window behind a dialog.
         layers = layers.push(opaque(center(card).style(theme::veil(p, 1.0))));
@@ -280,13 +290,17 @@ fn status_bar<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> 
         ),
         None => item(icons::WARNING, "config.toml unreadable".into(), p.danger),
     });
-    if let Some(config) = gui.config.as_ref().filter(|_| gui.width >= 1150.0) {
+    if let Some(config) = gui.config.as_ref().filter(|_| gui.layout_width() >= 1150.0) {
         bar = bar
             .push(sep())
             .push(item(icons::PLUG, format!("UDP {}", config.port), p.subtext));
     }
     bar = bar.push(space::horizontal());
-    if let Some(me) = snapshot.me.as_ref().filter(|_| gui.width >= 1000.0) {
+    if let Some(me) = snapshot
+        .me
+        .as_ref()
+        .filter(|_| gui.layout_width() >= 1000.0)
+    {
         bar = bar
             .push(item(
                 icons::KEY,
@@ -312,16 +326,25 @@ fn status_bar<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> 
 // ---------------------------------------------------------------------------
 
 fn friend_pane<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
+    if gui.compact() {
+        return friend_strip(gui);
+    }
     let p = gui.pal();
-    let needle = gui.search.to_lowercase();
     let now = history::unix_now();
-    let matching: Vec<&Friend> = snapshot
-        .friends
-        .iter()
-        .filter(|f| f.name.to_lowercase().contains(&needle))
-        .collect();
+    let (active, others) = gui.listed(now);
     let mut list = column![].spacing(2);
-    if snapshot.friends.is_empty() {
+    if snapshot.friends.is_empty() && snapshot.problem.is_some() {
+        list = list.push(
+            column![
+                text("Friends could not be read").font(SEMIBOLD).size(MD),
+                text("The problem is shown at the top. beam changed nothing.")
+                    .size(SM)
+                    .color(p.subtext),
+            ]
+            .spacing(4)
+            .padding(8),
+        );
+    } else if snapshot.friends.is_empty() {
         list = list.push(
             column![
                 text("No friends yet").font(SEMIBOLD).size(MD),
@@ -332,7 +355,7 @@ fn friend_pane<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message>
             .spacing(4)
             .padding(8),
         );
-    } else if matching.is_empty() {
+    } else if active.is_empty() && others.is_empty() {
         list = list.push(
             container(text("No friend matches.").size(MD).color(p.subtext))
                 .padding(16)
@@ -340,13 +363,7 @@ fn friend_pane<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message>
         );
     } else {
         // Friends who answered in the last week first: who you are most
-        // likely looking for.
-        const RECENT: u64 = 7 * 86_400;
-        let recent = |f: &&Friend| {
-            f.last_seen
-                .is_some_and(|at| now.saturating_sub(at) < RECENT)
-        };
-        let (active, others): (Vec<&Friend>, Vec<&Friend>) = matching.into_iter().partition(recent);
+        // likely looking for (`Gui::listed`).
         let both = !active.is_empty() && !others.is_empty();
         for (label, group) in [("RECENTLY ACTIVE", active), ("EVERYONE ELSE", others)] {
             if group.is_empty() {
@@ -396,6 +413,7 @@ fn friend_pane<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message>
             ]
             .align_y(Alignment::Center),
             text_input("Search friends", &gui.search)
+                .id(FRIEND_SEARCH)
                 .on_input(Message::Search)
                 .icon(text_input::Icon {
                     font: icons::FONT,
@@ -433,7 +451,7 @@ fn friend_detail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Messag
         );
     };
     let now = history::unix_now();
-    let room = gui.width - RAIL_WIDTH - gui.pane_width();
+    let room = gui.layout_width() - RAIL_WIDTH - gui.pane_width();
 
     // Below these content widths the header stacks rather than squeezing.
     let name = text(&f.name).font(BOLD).size(XXL).wrapping(Wrapping::None);
@@ -640,24 +658,47 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
         .style(theme::segment(p, gui.dark == dark))
         .on_press(Message::Dark(dark))
     };
+    let zoom = row![
+        button(text("−").size(MD))
+            .padding([5, 12])
+            .style(theme::secondary(p))
+            .on_press(Message::Zoom(gui.zoom_step(-1))),
+        container(text(format!("{:.0}%", gui.zoom * 100.0)).size(MD))
+            .width(56)
+            .center_x(56),
+        button(text("+").size(MD))
+            .padding([5, 12])
+            .style(theme::secondary(p))
+            .on_press(Message::Zoom(gui.zoom_step(1))),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
     let appearance = settings_group(
         p,
         "Appearance",
-        vec![setting(
-            p,
-            "Theme",
-            "Midnight (dark) or Daylight (light).",
-            container(
-                row![
-                    segment(icons::MOON, "Midnight", true),
-                    segment(icons::SUN, "Daylight", false)
-                ]
-                .spacing(2),
-            )
-            .padding(3)
-            .style(theme::segments(p))
-            .into(),
-        )],
+        vec![
+            setting(
+                p,
+                "Theme",
+                "Midnight (dark) or Daylight (light).",
+                container(
+                    row![
+                        segment(icons::MOON, "Midnight", true),
+                        segment(icons::SUN, "Daylight", false)
+                    ]
+                    .spacing(2),
+                )
+                .padding(3)
+                .style(theme::segments(p))
+                .into(),
+            ),
+            setting(
+                p,
+                "Zoom",
+                "Larger or smaller text and controls, on top of the screen's own scaling (Ctrl+= and Ctrl+-).",
+                zoom.into(),
+            ),
+        ],
     );
     let mut device = Vec::new();
     if let Some(me) = &snapshot.me {
@@ -697,14 +738,12 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
         received_settings(gui),
         network_settings(gui),
         service_settings(gui, snapshot),
-        appearance
+        appearance,
+        keyboard_settings(p),
     ]
     .spacing(16);
     if !device.is_empty() {
         body = body.push(settings_group(p, "This device", device));
-    }
-    if let Some(problem) = &gui.problem {
-        body = body.push(notice(p, p.danger, icons::WARNING, problem));
     }
     column![
         toolbar(
@@ -1141,7 +1180,12 @@ fn rename_dialog<'a>(
 
 /// Remove a friend? Keep is the highlighted, safe answer (`Ask` starts on
 /// No), and Enter or Escape keep them; only a click on Remove removes.
-fn remove_dialog<'a>(p: &'static Pal, name: &'a str, fingerprint: &'a str) -> Element<'a, Message> {
+fn remove_dialog<'a>(
+    p: &'static Pal,
+    name: &'a str,
+    fingerprint: &'a str,
+    focus: Choice,
+) -> Element<'a, Message> {
     dialog(
         p,
         icons::DELETE,
@@ -1168,8 +1212,9 @@ fn remove_dialog<'a>(p: &'static Pal, name: &'a str, fingerprint: &'a str) -> El
             .color(p.subtext),
         ]
         .spacing(14),
-        row![
-            space::horizontal(),
+        answers(
+            p,
+            focus,
             button(text("Remove").size(MD))
                 .padding([7, 18])
                 .style(theme::danger(p))
@@ -1178,8 +1223,7 @@ fn remove_dialog<'a>(p: &'static Pal, name: &'a str, fingerprint: &'a str) -> El
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::AnswerRemove(Choice::No)),
-        ]
-        .spacing(8),
+        ),
     )
 }
 
@@ -1490,7 +1534,7 @@ fn pairing_dialog<'a>(gui: &'a Gui, state: &'a Pairing) -> Element<'a, Message> 
             row![space::horizontal(), cancel(p, "Cancel")],
         ),
         Pairing::Confirm { ask, compared } => {
-            let q = ask.question();
+            let (q, focus) = (ask.question(), ask.focus());
             dialog(
                 p,
                 icons::SHIELD,
@@ -1512,19 +1556,19 @@ fn pairing_dialog<'a>(gui: &'a Gui, state: &'a Pairing) -> Element<'a, Message> 
                         .text_size(MD),
                 ]
                 .spacing(12),
-                row![
-                    space::horizontal(),
+                answers(
+                    p,
+                    focus,
                     button(text("Pair").size(MD))
                         .padding([7, 18])
                         .style(theme::secondary(p))
                         .on_press_maybe(compared.then_some(pair(PairMsg::Answer(Choice::Yes)))),
-                    // The safe answer, highlighted: Enter and Escape choose it.
+                    // The safe answer, highlighted; Escape chooses it.
                     button(text("Don't pair").font(SEMIBOLD).size(MD))
                         .padding([7, 18])
                         .style(theme::primary(p))
                         .on_press(pair(PairMsg::Answer(Choice::No))),
-                ]
-                .spacing(8),
+                ),
             )
         }
         Pairing::Failed(why) => dialog(
@@ -1559,7 +1603,7 @@ fn fingerprint_card<'a>(p: &'static Pal, whose: &str, hex: &str) -> Element<'a, 
 
 /// An invite would move a paired friend to another relay. Keep is the
 /// highlighted, safe answer (ADR-0038).
-fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove) -> Element<'a, Message> {
+fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove, focus: Choice) -> Element<'a, Message> {
     dialog(
         p,
         icons::GLOBE,
@@ -1589,8 +1633,9 @@ fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove) -> Element<'a, Message> {
             ),
         ]
         .spacing(10),
-        row![
-            space::horizontal(),
+        answers(
+            p,
+            focus,
             button(text("Move").size(MD))
                 .padding([7, 18])
                 .style(theme::secondary(p))
@@ -1599,8 +1644,7 @@ fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove) -> Element<'a, Message> {
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::Pair(PairMsg::AnswerRelay(Choice::No))),
-        ]
-        .spacing(8),
+        ),
     )
 }
 
@@ -1812,7 +1856,7 @@ fn inbox_page<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> 
 
 /// May this friend send this file? Decline is highlighted: Enter declines,
 /// Escape decides later, and only a click on Accept accepts (rule 1).
-fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming) -> Element<'a, Message> {
+fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming, focus: Choice) -> Element<'a, Message> {
     let p = gui.pal();
     let r = &q.request;
     let saved_to = match &gui.snapshot.as_ref().map(|s| &s.agent) {
@@ -1884,13 +1928,14 @@ fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming) -> Element<'a, Message> {
                 .style(theme::code_block(p)),
             ]
             .spacing(6),
-            text("Only accept files you are expecting. Enter declines; Escape decides later.")
+            text("Only accept files you are expecting. Enter gives the marked answer, Decline unless you move it with Tab; Escape decides later.")
                 .size(SM)
                 .color(p.subtext),
         ]
         .spacing(16),
-        row![
-            space::horizontal(),
+        answers(
+            p,
+            focus,
             button(text("Accept").size(MD))
                 .padding([7, 18])
                 .style(theme::secondary(p))
@@ -1899,21 +1944,21 @@ fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming) -> Element<'a, Message> {
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::Receive(RecvMsg::Answer(Choice::No))),
-        ]
-        .spacing(8),
+        ),
     )
 }
 
 /// A file is arriving: stop anyway? Keep receiving is the highlighted answer.
-fn stop_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+fn stop_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
     dialog(
         p,
         icons::WARNING,
         "Stop receiving?",
         text("A file is arriving. Stopping tells the sender; what arrived so far is kept, and they can send again to resume.")
             .size(MD),
-        row![
-            space::horizontal(),
+        answers(
+            p,
+            focus,
             button(text("Stop").size(MD))
                 .padding([7, 18])
                 .style(theme::danger(p))
@@ -1922,21 +1967,21 @@ fn stop_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::Receive(RecvMsg::AnswerStop(Choice::No))),
-        ]
-        .spacing(8),
+        ),
     )
 }
 
 /// A file is arriving: close beam anyway? Stay is the highlighted answer.
-fn leave_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+fn leave_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
     dialog(
         p,
         icons::WARNING,
         "Close beam?",
         text("A file is still arriving. Closing stops it; the sender is told, what arrived is kept, and they can send again to resume.")
             .size(MD),
-        row![
-            space::horizontal(),
+        answers(
+            p,
+            focus,
             button(text("Close anyway").size(MD))
                 .padding([7, 18])
                 .style(theme::danger(p))
@@ -1945,8 +1990,7 @@ fn leave_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::Receive(RecvMsg::AnswerLeave(Choice::No))),
-        ]
-        .spacing(8),
+        ),
     )
 }
 
@@ -2224,6 +2268,7 @@ fn history_page<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message
         .style(theme::segments(p)),
         space::horizontal(),
         text_input("Filter by file or friend", &gui.history_search)
+            .id(HISTORY_SEARCH)
             .on_input(|t| Message::Settings(SettingsMsg::Search(t)))
             .icon(text_input::Icon {
                 font: icons::FONT,
@@ -2270,6 +2315,18 @@ fn history_page<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message
             },
             "Every file that comes or goes is listed here, newest first.",
         )
+    } else if shown < rows.len() {
+        // A long list is cut, and says so rather than looking complete.
+        column![
+            text(format!(
+                "Showing the newest {shown}. Filter or search to find older ones, or run beam history in a terminal."
+            ))
+            .size(SM)
+            .color(p.subtext),
+            history_table(p, &rows[..shown], history::unix_now()),
+        ]
+        .spacing(10)
+        .into()
     } else {
         history_table(p, &rows[..shown], history::unix_now())
     };
@@ -2497,9 +2554,11 @@ fn service_settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Mes
             p,
             "Start at sign-in",
             "Runs beam's background agent for your user only (never as an administrator), so friends can send while this window is closed. Every file still waits for your answer.",
-            toggler(gui.at_sign_in)
+            // Off and still until the OS has answered.
+            toggler(gui.at_sign_in == Some(true))
                 .on_toggle_maybe(
-                    (can_start || gui.at_sign_in)
+                    gui.at_sign_in
+                        .is_some_and(|on| can_start || on)
                         .then_some(|on| Message::Settings(SettingsMsg::AtSignIn(on))),
                 )
                 .size(20)
@@ -2542,7 +2601,7 @@ fn service_settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Mes
 }
 
 /// Router port mapping on? "Keep it off" is highlighted (the CLI's y/N).
-fn port_mapping_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+fn port_mapping_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
     dialog(
         p,
         icons::ROUTER,
@@ -2559,8 +2618,9 @@ fn port_mapping_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
                 .color(p.subtext),
         ]
         .spacing(12),
-        row![
-            space::horizontal(),
+        answers(
+            p,
+            focus,
             button(text("Turn on").size(MD))
                 .padding([7, 18])
                 .style(theme::secondary(p))
@@ -2569,21 +2629,21 @@ fn port_mapping_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::Settings(SettingsMsg::AnswerPortMapping(Choice::No))),
-        ]
-        .spacing(8),
+        ),
     )
 }
 
 /// Clear the whole history? Keep is highlighted.
-fn clear_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+fn clear_dialog<'a>(p: &'static Pal, focus: Choice) -> Element<'a, Message> {
     dialog(
         p,
         icons::DELETE,
         "Clear history?",
         text("Every line of what came and went on this device is deleted. Friends and files are not touched.")
             .size(MD),
-        row![
-            space::horizontal(),
+        answers(
+            p,
+            focus,
             button(text("Clear").size(MD))
                 .padding([7, 18])
                 .style(theme::danger(p))
@@ -2592,7 +2652,149 @@ fn clear_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
                 .padding([7, 18])
                 .style(theme::primary(p))
                 .on_press(Message::Settings(SettingsMsg::AnswerClear(Choice::No))),
+        ),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Polish (GUI EX Patch #8)
+// ---------------------------------------------------------------------------
+
+/// A question's two answers: the risky one, then the safe one, which is
+/// highlighted. The ring marks what Enter gives: it starts on the safe one,
+/// and Tab or the arrows move it (`app/keys.rs`).
+fn answers<'a>(
+    p: &'static Pal,
+    focus: Choice,
+    yes: impl Into<Element<'a, Message>>,
+    no: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let ring = |answer: Element<'a, Message>, on: bool| {
+        container(answer).padding(2).style(theme::focus_ring(p, on))
+    };
+    row![
+        space::horizontal(),
+        ring(yes.into(), focus == Choice::Yes),
+        ring(no.into(), focus == Choice::No),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Part of the beam folder could not be read, over every page.
+fn problem_banner<'a>(p: &'static Pal, why: &str) -> Element<'a, Message> {
+    container(
+        row![
+            icon(icons::WARNING, 14).color(p.danger),
+            text(format!(
+                "beam could not read part of its folder, so some of what is shown may be missing: {why}"
+            ))
+            .size(MD)
+            .width(Fill),
+            button(text("Try again").size(MD))
+                .padding([5, 12])
+                .style(theme::secondary(p))
+                .on_press(Message::Refresh),
         ]
-        .spacing(8),
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([10, 16])
+    .width(Fill)
+    .style(theme::notice(p, p.danger))
+    .into()
+}
+
+/// A very narrow window (a tiling compositor's column): the friends list
+/// keeps only faces, with each name on hover.
+fn friend_strip(gui: &Gui) -> Element<'_, Message> {
+    let p = gui.pal();
+    let (active, others) = gui.listed(history::unix_now());
+    let mut list = column![].spacing(6).align_x(Alignment::Center);
+    for f in active.into_iter().chain(others) {
+        let selected = gui.selected.as_deref() == Some(f.name.as_str());
+        list = list.push(tooltip(
+            button(avatar(
+                p,
+                &f.name,
+                theme::tint_for(&f.fingerprint),
+                34.0,
+                None,
+            ))
+            .padding(5)
+            .style(theme::list_item(p, selected))
+            .on_press(Message::Select(f.name.clone())),
+            container(text(&f.name).size(SM))
+                .padding([5, 9])
+                .style(theme::card(p)),
+            tooltip::Position::Right,
+        ));
+    }
+    container(
+        column![
+            tip(
+                p,
+                button(icon(icons::ADD, 14))
+                    .padding(8)
+                    .style(theme::primary(p))
+                    .on_press(Message::AddFriend),
+                "Add a friend",
+            ),
+            scrollable(list).height(Fill),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center),
+    )
+    .padding([16, 8])
+    .width(gui.pane_width())
+    .height(Fill)
+    .style(theme::pane(p))
+    .into()
+}
+
+/// Every shortcut, where people look for them.
+fn keyboard_settings<'a>(p: &'static Pal) -> Element<'a, Message> {
+    let key = |keys: &'a str, what: &'a str| -> Element<'a, Message> {
+        container(
+            row![
+                text(what).size(MD).width(Fill),
+                container(text(keys).font(MONO).size(SM))
+                    .padding([3, 8])
+                    .style(theme::code_block(p)),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center),
+        )
+        .padding([10, 16])
+        .into()
+    };
+    settings_group(
+        p,
+        "Keyboard",
+        vec![
+            key(
+                "Ctrl+1 … Ctrl+5",
+                "Friends, Transfers, Inbox, History, Settings",
+            ),
+            key("Ctrl+F", "Search friends, or the history on its page"),
+            key("Up / Down", "The previous or next friend"),
+            key("Ctrl+N", "Add a friend"),
+            key("Ctrl+O", "Send a file to the selected friend"),
+            key(
+                "F2 / Delete",
+                "Rename or remove the selected friend (removing asks first)",
+            ),
+            key("Ctrl+= / Ctrl+- / Ctrl+0", "Zoom in, out, or back to 100%"),
+            key("F5", "Read the beam folder again"),
+            key(
+                "Enter / Tab / Esc",
+                "On a question: Enter gives the marked answer, which starts on the safe one; Tab or the arrows move the mark; Escape is the safe answer",
+            ),
+            key(
+                "Space",
+                "Tick \"we compared both fingerprints\" when pairing",
+            ),
+        ],
     )
 }

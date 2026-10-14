@@ -201,7 +201,15 @@ fn a_friends_colour_comes_from_their_fingerprint() {
 // ---------------------------------------------------------------- Patch #3
 
 fn key(named: keyboard::key::Named) -> Message {
-    Message::Key(keyboard::Key::Named(named))
+    Message::Key(keyboard::Key::Named(named), keyboard::Modifiers::empty())
+}
+
+/// Ctrl and a letter or digit, as the subscription hands it on.
+fn ctrl(c: &str) -> Message {
+    Message::Key(
+        keyboard::Key::Character(c.into()),
+        keyboard::Modifiers::CTRL,
+    )
 }
 
 #[test]
@@ -1116,4 +1124,259 @@ fn the_service_controls_need_beam_beside_the_window() {
         .join(format!("beam{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(&beam, b"").unwrap();
     assert_eq!(settings::beam_in(dir.path()), Some(beam));
+}
+
+// ---------------------------------------------------------------- Patch #8
+
+fn tab() -> Message {
+    key(keyboard::key::Named::Tab)
+}
+
+/// Without a mouse: Delete asks, the mark starts on Keep, and Escape keeps
+/// whatever the mark is on. A yes takes a deliberate move of the mark.
+#[test]
+fn removing_by_keyboard_starts_on_keep_and_tab_moves_the_mark() {
+    let (_tmp, store) = home(true, &["alice"]);
+    let mut gui = Gui::for_home(store.clone());
+    let _ = gui.update(key(keyboard::key::Named::Delete));
+    let Some(Dialog::Remove(ask)) = &gui.dialog else {
+        panic!("no question: {:?}", gui.dialog);
+    };
+    assert_eq!(ask.focus(), Choice::No, "starts on Keep");
+    let _ = gui.update(tab());
+    let Some(Dialog::Remove(ask)) = &gui.dialog else {
+        panic!("closed by Tab");
+    };
+    assert_eq!(ask.focus(), Choice::Yes, "Tab moved the mark");
+    let _ = gui.update(key(keyboard::key::Named::Escape));
+    assert_eq!(store.load_known_peers().unwrap().peers().len(), 1, "kept");
+
+    let _ = gui.update(key(keyboard::key::Named::Delete));
+    let _ = gui.update(key(keyboard::key::Named::ArrowLeft));
+    let _ = gui.update(key(keyboard::key::Named::ArrowRight));
+    let _ = gui.update(key(keyboard::key::Named::Enter));
+    assert_eq!(
+        store.load_known_peers().unwrap().peers().len(),
+        1,
+        "Right put the mark back on Keep"
+    );
+
+    let _ = gui.update(key(keyboard::key::Named::Delete));
+    let _ = gui.update(key(keyboard::key::Named::ArrowLeft));
+    let _ = gui.update(key(keyboard::key::Named::Enter));
+    assert!(store.load_known_peers().unwrap().peers().is_empty());
+}
+
+/// Every question with two answers can be steered, and the Accept
+/// question's Escape still decides later rather than answering.
+#[test]
+fn every_question_starts_marked_on_the_safe_answer() {
+    let (_tmp, store) = home(true, &["alice"]);
+    let mut gui = Gui::for_home(store);
+    let opened = [
+        Message::Settings(SettingsMsg::PortMapping(true)),
+        Message::Settings(SettingsMsg::ClearHistory),
+        Message::Remove("alice".into()),
+    ];
+    for open in opened {
+        let _ = gui.update(open);
+        let focus = match &gui.dialog {
+            Some(Dialog::PortMapping(a)) => a.focus(),
+            Some(Dialog::ClearHistory(a)) => a.focus(),
+            Some(Dialog::Remove(a)) => a.focus(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(focus, Choice::No);
+        assert!(shows(&gui, "Keep") || shows(&gui, "Keep it off"));
+        let _ = gui.update(key(keyboard::key::Named::Escape));
+        assert!(gui.dialog.is_none());
+    }
+}
+
+/// Pairing by keyboard: Pair cannot be pressed before the tick, so Enter
+/// on it waits instead of reading "Don't pair"; Space ticks.
+#[test]
+fn pairing_by_keyboard_waits_for_the_tick() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store);
+    gui.dialog = Some(Dialog::Pair(Pairing::Confirm {
+        ask: Ask::new(beam_model::ask::SameFingerprints {
+            name: "carol".into(),
+            peer: "ab".repeat(32),
+            own: "cd".repeat(32),
+        }),
+        compared: false,
+    }));
+    let _ = gui.update(tab());
+    let _ = gui.update(key(keyboard::key::Named::Enter));
+    let Some(Dialog::Pair(Pairing::Confirm { ask, compared })) = &gui.dialog else {
+        panic!(
+            "Enter on an unticked Pair ended the pairing: {:?}",
+            gui.dialog
+        );
+    };
+    assert_eq!(ask.focus(), Choice::Yes);
+    assert!(!compared);
+    let _ = gui.update(key(keyboard::key::Named::Space));
+    assert!(matches!(
+        &gui.dialog,
+        Some(Dialog::Pair(Pairing::Confirm { compared: true, .. }))
+    ));
+}
+
+#[test]
+fn shortcuts_switch_pages_and_walk_the_friends() {
+    let (_tmp, store) = home(true, &["alice", "bob", "carol"]);
+    let mut gui = Gui::for_home(store);
+    for (digit, page) in [
+        ("2", Page::Transfers),
+        ("3", Page::Inbox),
+        ("4", Page::History),
+        ("5", Page::Settings),
+        ("1", Page::Friends),
+    ] {
+        let _ = gui.update(ctrl(digit));
+        assert_eq!(gui.page, page, "Ctrl+{digit}");
+    }
+    assert_eq!(gui.selected.as_deref(), Some("alice"));
+    let _ = gui.update(key(keyboard::key::Named::ArrowDown));
+    let _ = gui.update(key(keyboard::key::Named::ArrowDown));
+    assert_eq!(gui.selected.as_deref(), Some("carol"));
+    let _ = gui.update(key(keyboard::key::Named::ArrowDown));
+    assert_eq!(gui.selected.as_deref(), Some("carol"), "stays at the end");
+    let _ = gui.update(key(keyboard::key::Named::ArrowUp));
+    assert_eq!(gui.selected.as_deref(), Some("bob"));
+    // Up and Down follow the search, as the list does.
+    let _ = gui.update(Message::Search("a".into()));
+    let _ = gui.update(key(keyboard::key::Named::ArrowDown));
+    assert_eq!(gui.selected.as_deref(), Some("alice"));
+    // F2 renames, Ctrl+N adds a friend.
+    let _ = gui.update(key(keyboard::key::Named::F2));
+    assert!(matches!(gui.dialog, Some(Dialog::Rename { .. })));
+    let _ = gui.update(key(keyboard::key::Named::Escape));
+    let _ = gui.update(ctrl("n"));
+    assert!(matches!(gui.dialog, Some(Dialog::Pair(_))));
+    // With a dialog open, page shortcuts do nothing.
+    let _ = gui.update(ctrl("5"));
+    assert_eq!(gui.page, Page::Friends);
+}
+
+/// Zoom scales the whole window; the layout's breakpoints follow the room
+/// left after zooming.
+#[test]
+fn zoom_steps_and_the_layout_follows() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store);
+    assert_eq!(gui.scale_factor(), 1.0);
+    let _ = gui.update(ctrl("="));
+    assert_eq!(gui.scale_factor(), 1.1);
+    let _ = gui.update(ctrl("-"));
+    let _ = gui.update(ctrl("-"));
+    assert_eq!(gui.scale_factor(), 0.9);
+    for _ in 0..20 {
+        let _ = gui.update(ctrl("="));
+    }
+    assert_eq!(gui.scale_factor(), 2.0, "stops at the largest step");
+    let _ = gui.update(ctrl("0"));
+    assert_eq!(gui.scale_factor(), 1.0);
+
+    // 1200 px at 150% leaves the layout 800: the narrower friends list.
+    let _ = gui.update(Message::Zoom(1.5));
+    assert_eq!(gui.pane_width(), 240.0);
+    // A resize arrives in zoomed units; the window's own width is kept.
+    let _ = gui.update(Message::Resized(800.0));
+    assert_eq!(gui.width, 1200.0);
+    let _ = gui.update(Message::Page(Page::Settings));
+    assert!(shows(&gui, "150%"), "Settings shows the zoom");
+}
+
+/// A tiling compositor's narrow column: the friends list keeps only
+/// faces, and selecting still works.
+#[test]
+fn a_very_narrow_window_keeps_only_faces() {
+    let (_tmp, store) = home(true, &["alice", "bob"]);
+    let mut gui = Gui::for_home(store);
+    assert!(shows(&gui, "ALL FRIENDS"));
+    let _ = gui.update(Message::Resized(700.0));
+    assert!(gui.compact());
+    assert_eq!(gui.pane_width(), 64.0);
+    assert!(!shows(&gui, "ALL FRIENDS"));
+    let _ = gui.update(key(keyboard::key::Named::ArrowDown));
+    assert_eq!(gui.selected.as_deref(), Some("bob"));
+    let fingerprint = gui.friend("bob").unwrap().fingerprint.clone();
+    assert!(shows(
+        &gui,
+        &format!("SHA256:{}", crate::view::grouped(&fingerprint))
+    ));
+}
+
+/// A damaged known_peers is said on every page; the friends list does not
+/// pretend there are none.
+#[test]
+fn an_unreadable_friends_file_is_said_not_hidden() {
+    let (_tmp, store) = home(true, &["alice"]);
+    std::fs::write(store.known_peers_path(), "alice\n").unwrap();
+    let mut gui = Gui::for_home(store);
+    assert!(shows(&gui, "Friends could not be read"));
+    assert!(!shows(&gui, "No friends yet"));
+    for page in [Page::Inbox, Page::History, Page::Settings] {
+        let _ = gui.update(Message::Page(page));
+        assert!(shows(&gui, "Try again"), "the problem is shown on {page:?}");
+    }
+}
+
+/// Many friends and a long history: everything loads and draws, "last
+/// seen" is found in one pass (`Snapshot::load`), and a history table cut
+/// to its newest rows says so.
+#[test]
+fn many_friends_and_a_long_history_load_and_draw() {
+    let names: Vec<String> = (0..400).map(|i| format!("friend{i:03}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (_tmp, store) = home(true, &refs);
+    let now = beam_core::history::unix_now();
+    for i in 0..2_000u64 {
+        let who = &names[(i as usize * 7) % names.len()];
+        record(
+            &store,
+            who,
+            now - 10_000 + i,
+            "f.bin",
+            beam_core::history::Outcome::Done,
+        );
+    }
+    let mut gui = Gui::for_home(store);
+    let _ = gui.update(Message::Refresh);
+    let _ = simulator(gui.view());
+    let _ = gui.update(Message::Page(Page::History));
+    assert!(
+        shows(
+            &gui,
+            "Showing the newest 200. Filter or search to find older ones, or run beam history in a terminal."
+        ),
+        "a cut list says so"
+    );
+    assert_eq!(gui.snapshot.as_ref().unwrap().friends.len(), 400);
+    assert!(
+        gui.snapshot
+            .as_ref()
+            .unwrap()
+            .friends
+            .iter()
+            .all(|f| f.last_seen.is_some())
+    );
+}
+
+/// Opening Settings never waits for the OS: asking whether the agent
+/// starts at sign-in runs `reg` or `systemctl`, and on the window's
+/// thread that froze the window for seconds. The switch is off and still
+/// until the answer arrives.
+#[test]
+fn opening_settings_does_not_wait_for_the_os() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store);
+    let _ = gui.update(Message::Page(Page::Settings));
+    assert_eq!(gui.page, Page::Settings);
+    assert_eq!(gui.at_sign_in, None, "not asked on the window's thread");
+    let _ = gui.update(Message::Settings(SettingsMsg::AtSignInRead(true)));
+    assert_eq!(gui.at_sign_in, Some(true));
 }

@@ -13,6 +13,7 @@ fn main() -> iced::Result {
         .title("beam")
         .theme(Gui::theme)
         .subscription(Gui::subscription)
+        .scale_factor(Gui::scale_factor)
         .default_font(beam_gui::theme::FONT)
         .window(window::Settings {
             size: Size::new(SIZE.0, SIZE.1),

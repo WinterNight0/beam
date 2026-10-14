@@ -325,9 +325,14 @@ In this order, each step with its tests (ADR-0048):
   shown, router port mapping asking first and starting on "Keep it off",
   background service run from the `beam` next to the GUI; `actions::settings`
   and `actions::service` now shared with `beam receive-dir`/`beam service`);
-  then
-  receiving (Accept starts on Decline), sending (OS picker), history and
-  settings. **No release yet**: the core grows first; later a second download
+  #8 polish (`app/keys.rs`: shortcuts by Latin letter, so any keyboard
+  layout; a question's mark starts on the safe answer, Tab/arrows move it,
+  Enter gives it, Escape is safe, Enter on an unticked Pair waits; zoom
+  80–200% on top of the screen's scaling; under 760 px the friends list
+  keeps only faces; an unreadable `known_peers` or identity is a banner on
+  every page; `Snapshot::load` finds "last seen" in one pass). Renderer:
+  iced's default (GPU, ~170 MB idle; software ~32 MB via
+  `ICED_BACKEND=tiny-skia`) until decided. **No release yet**: the core grows first; later a second download
   with `beam`, tags `gui-v*`. `spike/gui-iced` is gitignored, the testing
   ground; removed from the repo (kept locally) once the GUI is usable.
 - **Next (to be planned):** more core work before any GUI release;

@@ -6,6 +6,8 @@
 //! the first-run "Create this device's identity". Patch #3: friends: groups,
 //! recent activity, Copy, rename, and remove behind a question that starts
 //! on Keep (`beam_model::Ask`). Patch #4: Add friend (`app/pairing.rs`).
+//! Patches #5–#7: `app/receiving.rs`, `app/sending.rs`, `app/settings.rs`.
+//! Patch #8: the keyboard and zoom (`app/keys.rs`).
 //! Everything is read and changed through
 //! `beam-model` and `beam-core`; the pages still to come say so.
 
@@ -18,17 +20,19 @@ use beam_core::identity::Store;
 use beam_core::transport::endpoint::Bind;
 use beam_core::untrusted;
 use beam_model::requests::Requests;
-use beam_model::snapshot::Snapshot;
+use beam_model::snapshot::{Friend, Snapshot};
 use beam_model::{
     Ask, Choice,
     ask::{Incoming, LeaveMidTransfer, RelayMove, RemoveFriend, StopMidTransfer},
 };
 
+pub(crate) mod keys;
 pub(crate) mod pairing;
 pub(crate) mod receiving;
 pub(crate) mod sending;
 pub(crate) mod settings;
 use iced::{Element, Subscription, Task, keyboard, window};
+pub use keys::ZOOMS;
 pub use pairing::{PairMsg, Pairing};
 pub use receiving::RecvMsg;
 pub use sending::SendMsg;
@@ -70,9 +74,12 @@ pub struct Gui {
     pub(crate) selected: Option<String>,
     pub(crate) search: String,
     pub(crate) dark: bool,
-    /// The window's width. Tiling compositors (Niri, Hyprland, Sway) size
-    /// windows themselves and ignore the minimum size, so the layout adapts.
+    /// The window's width, before zoom. Tiling compositors (Niri,
+    /// Hyprland, Sway) size windows themselves and ignore the minimum size,
+    /// so the layout adapts (`layout_width`).
     pub(crate) width: f32,
+    /// Interface zoom (Ctrl+= / Ctrl+-), on top of the screen's scaling.
+    pub(crate) zoom: f32,
     pub(crate) notice: Option<(String, Tone)>,
     /// The one question or form open over the window, if any.
     pub(crate) dialog: Option<Dialog>,
@@ -91,9 +98,10 @@ pub struct Gui {
     pub(crate) outgoing: Option<sending::Running>,
     /// Where the send is, or how it ended (kept until dismissed).
     pub(crate) sending: Option<beam_model::sending::Sending>,
-    /// Whether the background agent starts at sign-in; read when the
-    /// Settings page opens and after a change (it asks the OS).
-    pub(crate) at_sign_in: bool,
+    /// Whether the background agent starts at sign-in: asked of the OS off
+    /// the window's thread when the Settings page opens and after a change
+    /// (`settings::read_at_sign_in`); `None` until the answer comes.
+    pub(crate) at_sign_in: Option<bool>,
     pub(crate) history_filter: settings::Filter,
     pub(crate) history_search: String,
     /// The `beam` program next to this window, which the background
@@ -149,6 +157,8 @@ pub enum Message {
     /// Read `~/.beam` again: a terminal may have changed it.
     Refresh,
     Resized(f32),
+    /// A new interface zoom, one of `ZOOMS`.
+    Zoom(f32),
     DismissNotice,
     /// Copy a friend's full fingerprint, to paste where they can compare it.
     CopyFingerprint(String),
@@ -165,8 +175,9 @@ pub enum Message {
     Receive(RecvMsg),
     Send(SendMsg),
     Settings(SettingsMsg),
-    /// Enter or Escape, for the open dialog.
-    Key(keyboard::Key),
+    /// A key no text box took: shortcuts, and answers on a dialog
+    /// (`app/keys.rs`). Letters arrive as their Latin letter.
+    Key(keyboard::Key, keyboard::Modifiers),
 }
 
 /// The rename form's text box, so it can be focused when the form opens.
@@ -207,6 +218,7 @@ impl Gui {
             search: String::new(),
             dark: true,
             width: SIZE.0,
+            zoom: 1.0,
             notice: None,
             dialog: None,
             worker: None,
@@ -216,7 +228,7 @@ impl Gui {
             notify: true,
             outgoing: None,
             sending: None,
-            at_sign_in: false,
+            at_sign_in: None,
             history_filter: settings::Filter::All,
             history_search: String::new(),
             beam_program: std::env::current_exe()
@@ -268,10 +280,10 @@ impl Gui {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Page(page) => {
-                if page == Page::Settings {
-                    self.at_sign_in = beam_core::actions::service::enabled();
-                }
                 self.page = page;
+                if page == Page::Settings {
+                    return settings::read_at_sign_in();
+                }
             }
             Message::Select(name) => {
                 self.selected = Some(name);
@@ -299,7 +311,9 @@ impl Gui {
                 self.reload();
                 self.connect_link();
             }
-            Message::Resized(width) => self.width = width,
+            // Sizes arrive zoomed; kept as the screen has them.
+            Message::Resized(width) => self.width = width * self.zoom,
+            Message::Zoom(zoom) => self.zoom = zoom.clamp(ZOOMS[0], ZOOMS[ZOOMS.len() - 1]),
             Message::DismissNotice => self.notice = None,
             Message::CopyFingerprint(hex) => {
                 self.notice = Some(("Fingerprint copied.".into(), Tone::Info));
@@ -338,66 +352,7 @@ impl Gui {
             Message::Receive(message) => return self.on_receive(message),
             Message::Send(message) => return self.on_send(message),
             Message::Settings(message) => return self.on_settings(message),
-            Message::Key(key) => return self.on_key(key),
-        }
-        Task::none()
-    }
-
-    /// Enter and Escape on a dialog. On the Remove question both keep the
-    /// friend: Enter answers the highlighted choice, which starts on Keep.
-    fn on_key(&mut self, key: keyboard::Key) -> Task<Message> {
-        use keyboard::key::Named;
-        let keyboard::Key::Named(named) = key else {
-            return Task::none();
-        };
-        if matches!(self.dialog, Some(Dialog::Pair(_) | Dialog::RelayMove(_))) {
-            self.pair_key(named);
-            return Task::none();
-        }
-        // Enter gives the highlighted answer, which starts on the safe one;
-        // Escape on the Accept question is "later", on the others "no".
-        let enter = named == keyboard::key::Named::Enter;
-        let escape = named == keyboard::key::Named::Escape;
-        match &self.dialog {
-            Some(Dialog::Accept(ask)) if enter => {
-                let choice = ask.focus();
-                self.answer(choice);
-                return Task::none();
-            }
-            Some(Dialog::Accept(_)) if escape => {
-                self.later();
-                return Task::none();
-            }
-            Some(Dialog::StopReceiving(ask)) if enter || escape => {
-                let choice = if enter { ask.focus() } else { Choice::No };
-                return self.on_receive(RecvMsg::AnswerStop(choice));
-            }
-            Some(Dialog::Leave(ask, _)) if enter || escape => {
-                let choice = if enter { ask.focus() } else { Choice::No };
-                return self.on_receive(RecvMsg::AnswerLeave(choice));
-            }
-            Some(Dialog::PortMapping(ask)) if enter || escape => {
-                let choice = if enter { ask.focus() } else { Choice::No };
-                return self.on_settings(SettingsMsg::AnswerPortMapping(choice));
-            }
-            Some(Dialog::ClearHistory(ask)) if enter || escape => {
-                let choice = if enter { ask.focus() } else { Choice::No };
-                return self.on_settings(SettingsMsg::AnswerClear(choice));
-            }
-            // A drop may be an accident: Enter and Escape both send nothing.
-            Some(Dialog::SendDropped { .. }) if enter || escape => {
-                return self.on_send(SendMsg::AnswerDrop(false));
-            }
-            _ => {}
-        }
-        match (&self.dialog, named) {
-            (Some(Dialog::Remove(ask)), Named::Enter) => {
-                let answer = ask.focus();
-                self.answer_remove(answer);
-            }
-            (Some(Dialog::Rename { .. }), Named::Enter) => self.rename(),
-            (Some(_), Named::Escape) => self.dialog = None,
-            _ => {}
+            Message::Key(key, mods) => return self.on_key(key, mods),
         }
         Task::none()
     }
@@ -492,7 +447,19 @@ impl Gui {
             window::close_requests().map(|id| Message::Receive(RecvMsg::CloseRequested(id))),
             window::resize_events().map(|(_, size)| Message::Resized(size.width)),
             keyboard::listen().filter_map(|event| match event {
-                keyboard::Event::KeyPressed { key, .. } => Some(Message::Key(key)),
+                keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                } => {
+                    // Shortcuts by their Latin letter, whatever the layout.
+                    let key = match key.to_latin(physical_key) {
+                        Some(c) => keyboard::Key::Character(c.to_lowercase().to_string().into()),
+                        None => key,
+                    };
+                    Some(Message::Key(key, modifiers))
+                }
                 _ => None,
             }),
             // Friends paired or removed in a terminal show up by themselves.
@@ -500,9 +467,44 @@ impl Gui {
         ])
     }
 
+    /// The width the layout has, in its own units: the window's, divided
+    /// by the zoom.
+    pub(crate) fn layout_width(&self) -> f32 {
+        self.width / self.zoom
+    }
+
+    /// Below this, the friends list shows only faces (`view::friend_strip`).
+    pub(crate) fn compact(&self) -> bool {
+        self.layout_width() < 760.0
+    }
+
     /// The friends list: narrower when the window is.
     pub(crate) fn pane_width(&self) -> f32 {
-        if self.width < 1000.0 { 240.0 } else { 300.0 }
+        match self.layout_width() {
+            _ if self.compact() => 64.0,
+            w if w < 1000.0 => 240.0,
+            _ => 300.0,
+        }
+    }
+
+    /// For iced: the interface zoom.
+    pub fn scale_factor(&self) -> f32 {
+        self.zoom
+    }
+
+    /// The friends list as it is drawn: those matching the search, the
+    /// ones who answered in the last week first.
+    pub(crate) fn listed(&self, now: u64) -> (Vec<&Friend>, Vec<&Friend>) {
+        const RECENT: u64 = 7 * 86_400;
+        let needle = self.search.to_lowercase();
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.friends)
+            .filter(|f| f.name.to_lowercase().contains(&needle))
+            .partition(|f| {
+                f.last_seen
+                    .is_some_and(|at| now.saturating_sub(at) < RECENT)
+            })
     }
 
     /// The relay, as the status bar shows it: its host, or "none".

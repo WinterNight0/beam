@@ -308,6 +308,19 @@ pub fn dialog(p: &'static Pal) -> C {
     })
 }
 
+/// The ring around the answer Enter gives on a question. Drawn (clear)
+/// round the other answer too, so moving it shifts nothing.
+pub fn focus_ring(p: &'static Pal, on: bool) -> C {
+    Box::new(move |_| container::Style {
+        border: Border {
+            color: if on { p.accent } else { Color::TRANSPARENT },
+            width: 2.0,
+            radius: (R_MD + 2.0).into(),
+        },
+        ..container::Style::default()
+    })
+}
+
 pub fn dialog_footer(p: &'static Pal) -> C {
     Box::new(move |_| container::Style {
         background: Some(p.pane.into()),

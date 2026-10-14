@@ -331,9 +331,14 @@ impl Gui {
     pub(crate) fn pair_key(&mut self, named: iced::keyboard::key::Named) {
         use iced::keyboard::key::Named;
         match (&self.dialog, named) {
-            (Some(Dialog::Pair(Pairing::Confirm { ask, .. })), Named::Enter) => {
+            // Pair, marked but not yet ticked, is a button that cannot be
+            // pressed: Enter waits for the tick (Space) rather than
+            // reading it as "Don't pair".
+            (Some(Dialog::Pair(Pairing::Confirm { ask, compared })), Named::Enter) => {
                 let choice = ask.focus();
-                self.answer_fingerprints(choice);
+                if choice == Choice::No || *compared {
+                    self.answer_fingerprints(choice);
+                }
             }
             (Some(Dialog::Pair(Pairing::Confirm { .. })), Named::Escape) => {
                 self.answer_fingerprints(Choice::No);

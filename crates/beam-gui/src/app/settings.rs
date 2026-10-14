@@ -54,6 +54,8 @@ pub enum SettingsMsg {
     StopAgent,
     /// A service action finished, off the window's thread: what to say.
     ServiceDone(Result<String, String>),
+    /// Whether the agent starts at sign-in, as the OS answered.
+    AtSignInRead(bool),
     Filter(Filter),
     Search(String),
     ClearHistory,
@@ -149,14 +151,15 @@ impl Gui {
                         .map_err(|e| e.to_string())
                 });
             }
+            SettingsMsg::AtSignInRead(on) => self.at_sign_in = Some(on),
             SettingsMsg::ServiceDone(result) => {
-                self.at_sign_in = service::enabled();
                 self.notice = Some(match result {
                     Ok(words) => (words, Tone::Success),
                     Err(why) => (untrusted::lines(&why), Tone::Problem),
                 });
                 self.reload();
                 self.connect_link();
+                return read_at_sign_in();
             }
             SettingsMsg::Filter(filter) => self.history_filter = filter,
             SettingsMsg::Search(text) => self.history_search = text,
@@ -273,6 +276,19 @@ fn started_words(started: &service::Started) -> String {
             format!("The background agent is already running, saving to {receive_dir}.")
         }
     }
+}
+
+/// Asks the OS whether the agent starts at sign-in, off the window's thread:
+/// on Windows that runs `reg`, on Linux `systemctl`, and either can take a
+/// while. Asked on the window's thread, it froze the window for seconds.
+pub(crate) fn read_at_sign_in() -> Task<Message> {
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(service::enabled());
+    });
+    Task::perform(async move { rx.await.unwrap_or(false) }, |on| {
+        Message::Settings(SettingsMsg::AtSignInRead(on))
+    })
 }
 
 /// Runs a service action on its own thread (it waits for the agent), and

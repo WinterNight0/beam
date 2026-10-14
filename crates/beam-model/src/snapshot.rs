@@ -5,6 +5,8 @@
 //! Every string is already cleaned for a screen (ADR-0034): `known_peers`
 //! and `history.jsonl` can be edited by hand.
 
+use std::collections::HashMap;
+
 use beam_core::agent::status::Running;
 use beam_core::identity::{Store, StoreError};
 use beam_core::untrusted;
@@ -91,16 +93,16 @@ impl Snapshot {
             })
             .collect();
         // Seen = they answered: a transfer that only failed to reach them
-        // says nothing about when they were there.
-        let last_seen = |fingerprint: &str| {
-            history
-                .iter()
-                .rev()
-                .find(|e| {
-                    e.fingerprint == fingerprint && e.outcome != beam_core::history::Outcome::Failed
-                })
-                .map(|e| e.at)
-        };
+        // says nothing about when they were there. One pass over the
+        // history, the newest line winning: this runs every frame, and a
+        // search per friend grew with friends times history.
+        let mut answered: HashMap<&str, u64> = HashMap::new();
+        for e in &history {
+            if e.outcome != beam_core::history::Outcome::Failed {
+                answered.insert(&e.fingerprint, e.at);
+            }
+        }
+        let last_seen = |fingerprint: &str| answered.get(fingerprint).copied();
         let friends = match store.load_known_peers() {
             Ok(known) => known
                 .peers()

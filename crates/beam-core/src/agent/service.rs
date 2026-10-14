@@ -101,13 +101,26 @@ pub fn unit_path() -> Option<PathBuf> {
     })
 }
 
+/// `reg.exe`, with no console window. Without the flag, a program that has
+/// no console of its own (the desktop window, `beam-gui`) makes Windows
+/// open one for `reg` first: seconds on Windows 11, where that can start a
+/// terminal, and a window flashing on screen.
+#[cfg(windows)]
+fn reg() -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = Command::new("reg");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// Makes the agent start at login. Does not start it now.
 pub fn enable(exe: &Path, beam_dir: &Path, dir: &Path) -> Result<(), ServiceError> {
     #[cfg(windows)]
     {
         let _ = dir;
         run(
-            Command::new("reg").args([
+            reg().args([
                 "add",
                 RUN_KEY,
                 "/v",
@@ -158,7 +171,7 @@ pub fn disable() -> Result<(), ServiceError> {
             return Ok(());
         }
         run(
-            Command::new("reg").args(["delete", RUN_KEY, "/v", SERVICE_NAME, "/f"]),
+            reg().args(["delete", RUN_KEY, "/v", SERVICE_NAME, "/f"]),
             "reg delete",
         )
     }
@@ -189,7 +202,7 @@ pub fn disable() -> Result<(), ServiceError> {
 pub fn is_enabled() -> bool {
     #[cfg(windows)]
     {
-        Command::new("reg")
+        reg()
             .args(["query", RUN_KEY, "/v", SERVICE_NAME])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
