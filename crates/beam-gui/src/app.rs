@@ -26,9 +26,11 @@ use beam_model::{
 
 pub(crate) mod pairing;
 pub(crate) mod receiving;
+pub(crate) mod sending;
 use iced::{Element, Subscription, Task, keyboard, window};
 pub use pairing::{PairMsg, Pairing};
 pub use receiving::RecvMsg;
+pub use sending::SendMsg;
 
 use crate::theme::{self, Pal};
 
@@ -83,6 +85,10 @@ pub struct Gui {
     pub(crate) receivers: receiving::Receivers,
     /// A desktop notification per request; off only in tests.
     pub(crate) notify: bool,
+    /// The send in progress; dropping it cancels the send.
+    pub(crate) outgoing: Option<sending::Running>,
+    /// Where the send is, or how it ended (kept until dismissed).
+    pub(crate) sending: Option<beam_model::sending::Sending>,
 }
 
 /// What can be open over the window. One at a time, like the view's pop-ups.
@@ -108,8 +114,14 @@ pub enum Dialog {
     Accept(Ask<Incoming>),
     /// Stop receiving while a file arrives? Starts on No.
     StopReceiving(Ask<StopMidTransfer>),
-    /// Close beam while a file arrives? Starts on No (stay).
+    /// Close beam while a file arrives or goes out? Starts on No (stay).
     Leave(Ask<LeaveMidTransfer>, window::Id),
+    /// A file was dropped on a friend's page: send it to them? Nothing
+    /// starts without a click on Send (`app/sending.rs`).
+    SendDropped {
+        friend: String,
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +149,7 @@ pub enum Message {
     AddFriend,
     Pair(PairMsg),
     Receive(RecvMsg),
+    Send(SendMsg),
     /// Enter or Escape, for the open dialog.
     Key(keyboard::Key),
 }
@@ -186,6 +199,8 @@ impl Gui {
             requests: Requests::default(),
             receivers: receiving::Receivers::default(),
             notify: true,
+            outgoing: None,
+            sending: None,
         }
     }
 
@@ -295,6 +310,7 @@ impl Gui {
             Message::AddFriend => return self.add_friend(),
             Message::Pair(message) => return self.on_pair(message),
             Message::Receive(message) => return self.on_receive(message),
+            Message::Send(message) => return self.on_send(message),
             Message::Key(key) => return self.on_key(key),
         }
         Task::none()
@@ -332,6 +348,10 @@ impl Gui {
             Some(Dialog::Leave(ask, _)) if enter || escape => {
                 let choice = if enter { ask.focus() } else { Choice::No };
                 return self.on_receive(RecvMsg::AnswerLeave(choice));
+            }
+            // A drop may be an accident: Enter and Escape both send nothing.
+            Some(Dialog::SendDropped { .. }) if enter || escape => {
+                return self.on_send(SendMsg::AnswerDrop(false));
             }
             _ => {}
         }
@@ -416,6 +436,11 @@ impl Gui {
         } else {
             Subscription::none()
         };
+        let sending = if self.outgoing.is_some() {
+            iced::time::every(Duration::from_millis(150)).map(|_| Message::Send(SendMsg::Tick))
+        } else {
+            Subscription::none()
+        };
         let pairing = if self.worker.is_some() {
             iced::time::every(Duration::from_millis(100)).map(|_| Message::Pair(PairMsg::Tick))
         } else {
@@ -424,6 +449,11 @@ impl Gui {
         Subscription::batch([
             pairing,
             receiving,
+            sending,
+            window::events().filter_map(|(_, event)| match event {
+                window::Event::FileDropped(path) => Some(Message::Send(SendMsg::Dropped(path))),
+                _ => None,
+            }),
             window::close_requests().map(|id| Message::Receive(RecvMsg::CloseRequested(id))),
             window::resize_events().map(|(_, size)| Message::Resized(size.width)),
             keyboard::listen().filter_map(|event| match event {

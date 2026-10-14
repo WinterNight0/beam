@@ -144,7 +144,7 @@ mod tests {
     fn with_the_switch_on_a_friend_sends_and_the_view_accepts() {
         use crate::tui::inbox::tests::with_an_agent::pair;
         use crate::tui::inbox::{InboxLink, InboxUpdate};
-        use crate::tui::sending::{Outgoing, SendUpdate};
+        use crate::tui::sending::SendUpdate;
 
         let (alice, bob) = (home("alice"), home("bob"));
         pair(&alice, "bob", &bob, "alice");
@@ -185,7 +185,8 @@ receive_dir = {}
         bob.store.save_known_peers(&known).unwrap();
         let path = bob.files.join("report.pdf");
         std::fs::write(&path, b"the quarterly numbers").unwrap();
-        let out = Outgoing::start_on(bob.store.clone(), "alice".into(), path, Bind::Loopback);
+        let out =
+            crate::tui::sending::start_on(bob.store.clone(), "alice".into(), path, Bind::Loopback);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let result = loop {

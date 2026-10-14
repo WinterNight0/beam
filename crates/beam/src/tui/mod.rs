@@ -250,8 +250,7 @@ fn event_loop(
                             .file_name()
                             .map(|n| untrusted::name(&n.to_string_lossy()))
                             .unwrap_or_default();
-                        outgoing =
-                            Some(sending::Outgoing::start(store.clone(), peer.clone(), path));
+                        outgoing = Some(sending::start(store.clone(), peer.clone(), path));
                         Done::SendStarted { peer, file }
                     }
                 }

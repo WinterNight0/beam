@@ -4,7 +4,7 @@
 //! safe default it offers comes from the code the CLI and the view share.
 
 #[test]
-fn the_gui_depends_only_on_the_core_the_model_and_iced() {
+fn the_gui_depends_only_on_the_core_the_model_iced_and_rfd() {
     let manifest =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
     let deps = manifest
@@ -22,7 +22,7 @@ fn the_gui_depends_only_on_the_core_the_model_and_iced() {
         .collect();
     assert_eq!(
         named,
-        ["beam-core", "beam-model", "iced"],
+        ["beam-core", "beam-model", "iced", "rfd"],
         "beam-gui depends on {named:?}"
     );
 }

@@ -696,6 +696,7 @@ without a screen (`iced_test`: find text, click by label), in
 | Pairing checks before the network | `this_devices_own_invite_is_refused`, `a_relay_move_starts_on_keep`, `the_code_box_takes_six_digits`; shared: `beam-core` `actions::pair::tests::a_pasted_invite_is_checked_before_any_network`, `actions::pair_worker::tests` (real pairing, unanswered = no, whose code is used up) |
 | Receiving (Patch #5), a real sender against the window's switch | `a_request_waits_and_enter_on_the_question_declines` (never opens by itself; a stray Enter answers nothing; starts on Decline; nothing saved), `a_click_on_accept_receives_the_file`, `escape_on_the_question_leaves_the_request_waiting`, `a_waiting_request_shows_on_the_rail_and_in_the_inbox` |
 | Stop or close while a file arrives | `stopping_or_closing_mid_file_asks_and_starts_on_no` |
+| Sending (Patch #6), two windows: bob's sends to alice's switch | `a_send_waits_for_their_yes_then_arrives` (nothing arrives before the yes), `a_declined_send_says_so`, `stop_while_waiting_withdraws_the_request`, `one_at_a_time_drops_propose_and_closing_asks` (a drop asks and Enter sends nothing; closing mid-send starts on Stay) |
 | Friend detail | `copy_puts_the_fingerprint_on_the_clipboard_and_says_so`, `a_friends_recent_activity_is_listed_with_its_result`, `recently_active_friends_are_grouped_first` |
 
 Not automated: how the window looks. Checked by hand on Windows 11 and on

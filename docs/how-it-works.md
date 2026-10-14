@@ -624,6 +624,7 @@ crates/beam-core/src/
     pair_worker.rs     pairing on a thread for screens (view and GUI); unanswered = no
     switch.rs          the Receiving switch's receiver (the agent's, in a window)
     inbox_link.rs      a window's link to the receiver: requests, answers
+    send_worker.rs     a send on a thread for windows; each front end words it
 crates/beam-core/tests/  integration and security tests of the core;
                        layers.rs (the layers), no_n0_discovery.rs (S-17)
 

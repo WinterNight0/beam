@@ -1,6 +1,6 @@
-//! Sending a file from the full-screen view (ADR-0043, step 7): what
-//! `beam send` does, on a background thread, with its progress drawn in
-//! the view instead of printed.
+//! Sending a file from the full-screen view (ADR-0043, step 7): the shared
+//! send worker (`beam_core::actions::send_worker`, also used by the GUI),
+//! with the view's own words for how a send ended.
 //!
 //! Nothing about the transfer changes: the same dial, the same engine, the
 //! same Accept on the other side before any byte moves, the same history
@@ -8,110 +8,43 @@
 //! is told who stopped it; whatever it already has is kept for a resume.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
 
-use beam_core::actions::{
-    self,
-    send::{SendError, SendRequest, Step},
-};
+use beam_core::actions::send::{SendError, Sent};
+use beam_core::actions::send_worker::{self, SendEvent};
 use beam_core::identity::{PeerError, Store};
-use beam_core::transfer::{Progress, Reporter};
 use beam_core::transport::endpoint::Bind;
 use beam_core::{text, untrusted};
 
 /// What the sending thread tells the view: the model's own message.
 pub use beam_model::sending::Update as SendUpdate;
 
-/// A send running in the background.
-pub struct Outgoing {
-    pub updates: Receiver<SendUpdate>,
-    /// Dropped to cancel.
-    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+/// A send running in the background, reporting in the view's words.
+pub type Outgoing = send_worker::Outgoing<SendUpdate>;
+
+/// Sends `path` to the friend called `peer`.
+pub fn start(store: Store, peer: String, path: PathBuf) -> Outgoing {
+    start_on(store, peer, path, Bind::Any)
 }
 
-impl Outgoing {
-    pub fn start(store: Store, peer: String, path: PathBuf) -> Self {
-        Self::start_on(store, peer, path, Bind::Any)
-    }
+/// `bind` is `Loopback` only in tests.
+pub(super) fn start_on(store: Store, peer: String, path: PathBuf, bind: Bind) -> Outgoing {
+    let name = peer.clone();
+    Outgoing::start(store, peer, path, bind, move |event| word(&name, event))
+}
 
-    /// `bind` is `Loopback` only in tests.
-    pub(super) fn start_on(store: Store, peer: String, path: PathBuf, bind: Bind) -> Self {
-        let (update_tx, updates) = mpsc::channel();
-        let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let result = run(&store, &peer, path, bind, &update_tx, cancelled);
-            let _ = update_tx.send(SendUpdate::Finished(result));
-        });
-        Self {
-            updates,
-            cancel: Some(cancel),
-        }
-    }
-
-    /// Stops the send; the receiver is told, and keeps what it has.
-    pub fn cancel(&mut self) {
-        self.cancel.take();
-    }
-
-    /// Cancels, and waits a little for the receiver to be told, so leaving
-    /// beam mid-send does not just vanish from under the other side.
-    pub fn cancel_and_wait(mut self, patience: Duration) {
-        self.cancel();
-        let deadline = std::time::Instant::now() + patience;
-        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-            match self.updates.recv_timeout(left) {
-                Ok(SendUpdate::Finished(_)) | Err(_) => return,
-                Ok(_) => {}
-            }
+/// What happened, as the view says it.
+fn word(peer_name: &str, event: SendEvent) -> SendUpdate {
+    match event {
+        SendEvent::Dialling => SendUpdate::Dialling,
+        SendEvent::Progress(progress) => SendUpdate::Progress(progress),
+        SendEvent::Finished(result) => {
+            SendUpdate::Finished(result.map(sent).map_err(|e| failed(peer_name, e)))
         }
     }
 }
 
-/// Passes the engine's progress to the view.
-struct ToView<'a>(&'a Sender<SendUpdate>);
-
-impl Reporter for ToView<'_> {
-    fn report(&mut self, progress: Progress) {
-        let _ = self.0.send(SendUpdate::Progress(progress));
-    }
-}
-
-fn run(
-    store: &Store,
-    peer_name: &str,
-    path: PathBuf,
-    bind: Bind,
-    updates: &Sender<SendUpdate>,
-    cancelled: tokio::sync::oneshot::Receiver<()>,
-) -> Result<String, String> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| untrusted::lines(&e.to_string()))?;
-    let request = SendRequest {
-        peer: peer_name,
-        file: &path,
-        chunk_size: None,
-        bind,
-    };
-    let result = runtime.block_on(actions::send::send(
-        store,
-        request,
-        &mut ToView(updates),
-        |step| {
-            if let Step::Looking { .. } = step {
-                let _ = updates.send(SendUpdate::Dialling);
-            }
-        },
-        // Dropping the sender counts too: the view went away.
-        async {
-            let _ = cancelled.await;
-        },
-    ));
-    runtime.shutdown_timeout(Duration::from_secs(1));
-
-    let sent = result.map_err(|e| failed(peer_name, e))?;
+/// A send that arrived, in the view's words.
+fn sent(sent: Sent) -> String {
     let summary = sent.summary;
     let saved = summary
         .final_name
@@ -126,11 +59,11 @@ fn run(
     } else {
         String::new()
     };
-    Ok(format!(
+    format!(
         "Sent {} to {}, saved on their side as {saved}{skipped}.",
         text::format_bytes(summary.bytes_sent),
         sent.peer
-    ))
+    )
 }
 
 /// A send that did not arrive, in the view's words.
@@ -158,6 +91,8 @@ mod tests {
     use crate::tui::inbox::InboxLink;
     use crate::tui::inbox::InboxUpdate;
     use crate::tui::inbox::tests::with_an_agent::{home, next, pair, start_agent};
+    use beam_core::transfer::Progress;
+    use std::time::Duration;
 
     /// Every update until the send ends, within a generous time.
     async fn until_finished(
@@ -216,7 +151,7 @@ mod tests {
 
         let path = bob.files.join("report.pdf");
         std::fs::write(&path, b"the quarterly numbers").unwrap();
-        let mut out = Outgoing::start_on(bob.store.clone(), "alice".into(), path, Bind::Loopback);
+        let mut out = start_on(bob.store.clone(), "alice".into(), path, Bind::Loopback);
         if cancel_while_waiting {
             next(&link, |u| matches!(u, InboxUpdate::Request { .. })).await;
             out.cancel();
@@ -333,7 +268,7 @@ mod tests {
         let two = bob_with_two_friends().await;
         let path = two.bob.files.join("for-carol.txt");
         std::fs::write(&path, b"for carol only").unwrap();
-        let out = Outgoing::start_on(two.bob.store.clone(), "carol".into(), path, Bind::Loopback);
+        let out = start_on(two.bob.store.clone(), "carol".into(), path, Bind::Loopback);
         let seen = until_finished(&out, &two.carol_link, Some(true)).await;
         assert!(
             matches!(seen.last(), Some(SendUpdate::Finished(Ok(_)))),

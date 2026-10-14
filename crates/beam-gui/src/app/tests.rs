@@ -84,6 +84,8 @@ fn the_rail_changes_the_page() {
     assert_eq!(gui.page, Page::Settings);
     assert!(shows(&gui, "Appearance"));
     click(&mut gui, "Transfers");
+    assert!(shows(&gui, "Nothing going out"));
+    click(&mut gui, "History");
     assert!(shows(&gui, "Not in this window yet"));
 }
 
@@ -830,4 +832,156 @@ fn a_waiting_request_shows_on_the_rail_and_in_the_inbox() {
     assert!(shows(&r.gui, "Waiting (1)"));
     assert!(shows(&r.gui, "Review"));
     assert!(shows(&r.gui, "Receiving is on"));
+}
+
+// ---------------------------------------------------------------- Patch #6
+
+/// bob's window, paired with alice (`r`), knowing where her switch listens.
+fn bobs_window(r: &Receiving) -> (tempfile::TempDir, Gui, std::path::PathBuf) {
+    use beam_core::agent::status::{self, Running};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::new(tmp.path().join("beam"));
+    store.ensure_dirs().unwrap();
+    store.save_identity(&r.bob, false).unwrap();
+    std::fs::write(store.config_path(), "relay = \"none\"\nport = 0\n").unwrap();
+    let alice = r.store.load_identity().unwrap();
+    let mut known = KnownPeers::with_header();
+    known
+        .add(Peer::new("alice", alice.verifying_key()))
+        .unwrap();
+    store.save_known_peers(&known).unwrap();
+    let invite = match status::read(&r.store) {
+        Running::Yes(status) => status.invite.expect("an invite"),
+        other => panic!("alice is not receiving: {other:?}"),
+    };
+    beam_core::actions::pair::save_location(&store, &invite.parse().unwrap(), true).unwrap();
+    let file = tmp.path().join("report.pdf");
+    std::fs::write(&file, b"the quarterly numbers").unwrap();
+    let mut gui = Gui::for_home(store);
+    gui.bind = Bind::Loopback;
+    (tmp, gui, file)
+}
+
+/// Runs both windows until `done` holds for bob's.
+fn both(alice: &mut Gui, bob: &mut Gui, what: &str, done: impl Fn(&Gui, &Gui) -> bool) {
+    for _ in 0..600 {
+        let _ = alice.update(Message::Receive(RecvMsg::Tick));
+        let _ = bob.update(Message::Send(SendMsg::Tick));
+        if done(alice, bob) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("never got to: {what} ({:?})", bob.sending);
+}
+
+fn result(bob: &Gui) -> Option<&Result<String, String>> {
+    bob.sending.as_ref().and_then(|s| s.result.as_ref())
+}
+
+/// A send from the window waits for the friend's yes; nothing arrives
+/// before it, and the file arrives intact after.
+#[test]
+fn a_send_waits_for_their_yes_then_arrives() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let (_t, mut bob, file) = bobs_window(&r);
+    let _ = bob.update(Message::Send(SendMsg::Picked("alice".into(), Some(file))));
+    assert_eq!(bob.page, Page::Transfers);
+    both(&mut r.gui, &mut bob, "the request", |a, _| {
+        !a.requests.waiting.is_empty()
+    });
+    both(&mut r.gui, &mut bob, "waiting for the yes", |_, b| {
+        b.sending.as_ref().map(|s| s.stage) == Some(beam_model::sending::Stage::Waiting)
+    });
+    assert!(shows(
+        &bob,
+        "Waiting for alice to accept. Nothing is sent before they do."
+    ));
+    assert!(
+        !r.downloads.join("report.pdf").exists(),
+        "nothing before the yes"
+    );
+
+    let id = waiting_id(&r.gui);
+    let _ = r.gui.update(Message::Receive(RecvMsg::Review(id)));
+    let _ = r.gui.update(Message::Receive(RecvMsg::Answer(Choice::Yes)));
+    both(&mut r.gui, &mut bob, "the end", |_, b| result(b).is_some());
+    assert!(matches!(result(&bob), Some(Ok(words)) if words.contains("Saved on their side")));
+    assert_eq!(
+        std::fs::read(r.downloads.join("report.pdf")).unwrap(),
+        b"the quarterly numbers"
+    );
+    assert!(bob.outgoing.is_none());
+}
+
+#[test]
+fn a_declined_send_says_so() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let (_t, mut bob, file) = bobs_window(&r);
+    let _ = bob.update(Message::Send(SendMsg::Picked("alice".into(), Some(file))));
+    both(&mut r.gui, &mut bob, "the request", |a, _| {
+        !a.requests.waiting.is_empty()
+    });
+    let id = waiting_id(&r.gui);
+    let _ = r.gui.update(Message::Receive(RecvMsg::Review(id)));
+    let _ = r.gui.update(key(keyboard::key::Named::Enter));
+    both(&mut r.gui, &mut bob, "the end", |_, b| result(b).is_some());
+    assert!(
+        matches!(result(&bob), Some(Err(words)) if words.contains("declined")),
+        "{:?}",
+        result(&bob)
+    );
+    assert!(!r.downloads.join("report.pdf").exists());
+}
+
+/// Stop while waiting: the friend is told, and the request goes away.
+#[test]
+fn stop_while_waiting_withdraws_the_request() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let (_t, mut bob, file) = bobs_window(&r);
+    let _ = bob.update(Message::Send(SendMsg::Picked("alice".into(), Some(file))));
+    both(&mut r.gui, &mut bob, "the request", |a, _| {
+        !a.requests.waiting.is_empty()
+    });
+    let _ = bob.update(Message::Send(SendMsg::Cancel));
+    both(&mut r.gui, &mut bob, "stopped, and withdrawn", |a, b| {
+        result(b).is_some() && a.requests.waiting.is_empty()
+    });
+    assert!(matches!(result(&bob), Some(Err(words)) if words.starts_with("Stopped")));
+    let _ = bob.update(Message::Send(SendMsg::Dismiss));
+    assert!(bob.sending.is_none());
+}
+
+/// One at a time, as in the view; a dropped file only proposes, and
+/// Enter on that question sends nothing; closing mid-send asks first.
+#[test]
+fn one_at_a_time_drops_propose_and_closing_asks() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let (_t, mut bob, file) = bobs_window(&r);
+    let _ = bob.update(Message::Page(Page::Friends));
+    let _ = bob.update(Message::Send(SendMsg::Dropped(file.clone())));
+    assert!(matches!(bob.dialog, Some(Dialog::SendDropped { .. })));
+    let _ = bob.update(key(keyboard::key::Named::Enter));
+    assert!(
+        bob.dialog.is_none() && bob.outgoing.is_none(),
+        "Enter sent nothing"
+    );
+
+    let _ = bob.update(Message::Send(SendMsg::Dropped(file.clone())));
+    let _ = bob.update(Message::Send(SendMsg::AnswerDrop(true)));
+    assert!(bob.outgoing.is_some(), "a click on Send sends");
+
+    let _ = bob.update(Message::Send(SendMsg::Picked("alice".into(), Some(file))));
+    assert!(matches!(&bob.notice, Some((w, _)) if w.starts_with("One file at a time")));
+
+    let id = iced::window::Id::unique();
+    let _ = bob.update(Message::Receive(RecvMsg::CloseRequested(id)));
+    let Some(Dialog::Leave(ask, _)) = &bob.dialog else {
+        panic!("no question: {:?}", bob.dialog);
+    };
+    assert_eq!(ask.focus(), Choice::No, "starts on Stay");
 }

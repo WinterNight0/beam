@@ -89,7 +89,7 @@ impl Gui {
             }
             RecvMsg::Tick => self.drain_receivers(Instant::now()),
             RecvMsg::CloseRequested(id) => {
-                if self.requests.arriving_here() {
+                if self.requests.arriving_here() || self.sending_now() {
                     // Starts on No: stay, and let the file finish.
                     self.dialog = Some(Dialog::Leave(Ask::new(LeaveMidTransfer), id));
                     return Task::none();
@@ -283,6 +283,7 @@ impl Gui {
             switch.stop_and_wait(STOP_PATIENCE);
         }
         self.worker = None;
+        self.stop_sending_for_close();
         window::close(id)
     }
 }

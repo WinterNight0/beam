@@ -338,7 +338,9 @@ crates/beam/src/tui/
                 (beam_core::actions::inbox_link, shared with the GUI)
   send.rs       opening the browser, and the send pop-up
   browse.rs     the file browser: places and drives, folders, filter, the disk
-  sending.rs    `beam send` on a background thread
+  sending.rs    `beam send` on a background thread (the worker is
+                beam_core::actions::send_worker, shared with the GUI;
+                the view's words for how a send ended stay here)
   clipboard.rs  Ctrl+C
 crates/beam-core/src/actions/    the flows the workers run (send, pair, receive, inbox)
 crates/beam-model/src/           what the view shows and the safe default of each question

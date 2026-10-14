@@ -32,6 +32,9 @@ hmac = "0.13.0"
 # `tokio`: the GUI's background work runs on the same runtime as the core.
 iced = { version = "=0.14.0", features = ["tokio"] }
 iced_test = "=0.14.0"
+# The OS file and folder pickers for the GUI, pinned like iced (ADR-0049).
+# Default features: the XDG desktop portal on Linux, no async runtime needed.
+rfd = "=0.17.2"
 # Pinned exactly: iroh is the transport, and a minor bump changes how beam
 # behaves on a network. Bumping it is its own reviewed commit. ADR-0025.
 iroh = "=1.2.0"

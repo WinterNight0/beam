@@ -6,6 +6,7 @@ use beam_core::text::format_bytes;
 use beam_model::Choice;
 use beam_model::ask::{Incoming, RelayMove};
 use beam_model::requests::{Switch, Taken};
+use beam_model::sending::{Sending, Stage};
 use beam_model::snapshot::{Agent, Friend, Owner, Snapshot};
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -14,7 +15,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Fill, FillPortion, Padding};
 
-use crate::app::{Dialog, Gui, Message, Page, PairMsg, Pairing, RecvMsg, Tone};
+use crate::app::{Dialog, Gui, Message, Page, PairMsg, Pairing, RecvMsg, SendMsg, Tone};
 use crate::icons;
 use crate::theme::{self, BOLD, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
 
@@ -43,13 +44,7 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
     } else {
         let page: Element<'_, Message> = match gui.page {
             Page::Friends => row![friend_pane(gui, snapshot), friend_detail(gui, snapshot)].into(),
-            Page::Transfers => later(
-                p,
-                icons::TRANSFERS,
-                "Transfers",
-                "Sending from this window comes in a later version.",
-                "Meanwhile, in a terminal: beam send <friend> <file>",
-            ),
+            Page::Transfers => transfers_page(gui, snapshot),
             Page::Inbox => inbox_page(gui, snapshot),
             Page::History => later(
                 p,
@@ -94,6 +89,7 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
             Dialog::Accept(ask) => accept_dialog(gui, ask.question()),
             Dialog::StopReceiving(_) => stop_dialog(p),
             Dialog::Leave(..) => leave_dialog(p),
+            Dialog::SendDropped { friend, path } => drop_dialog(p, friend, path),
         };
         // Clicks do not reach the window behind a dialog.
         layers = layers.push(opaque(center(card).style(theme::veil(p, 1.0))));
@@ -219,7 +215,12 @@ fn rail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
         column![
             container(logo).padding([14, 0]).center_x(Fill),
             item(icons::PEOPLE, "Friends", Page::Friends, 0),
-            item(icons::TRANSFERS, "Transfers", Page::Transfers, 0),
+            item(
+                icons::TRANSFERS,
+                "Transfers",
+                Page::Transfers,
+                usize::from(gui.sending_now())
+            ),
             item(
                 icons::INBOX,
                 "Inbox",
@@ -447,6 +448,18 @@ fn friend_detail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Messag
             .into()
     };
     let actions = row![
+        tip(
+            p,
+            button(
+                row![icon(icons::SEND, 13), text("Send a file").font(SEMIBOLD)]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+            )
+            .padding([7, 14])
+            .style(theme::primary(p))
+            .on_press(Message::Send(SendMsg::Pick(f.name.clone()))),
+            "Choose a file, or drop one on this page; they answer before anything moves",
+        ),
         tip(
             p,
             button(
@@ -1975,4 +1988,221 @@ fn waiting_from<'a>(gui: &'a Gui, f: &'a Friend) -> Element<'a, Message> {
     .width(Fill)
     .style(theme::notice(p, p.info))
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// Sending (GUI EX Patch #6)
+// ---------------------------------------------------------------------------
+
+fn transfers_page<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
+    let p = gui.pal();
+    let send_to = gui
+        .selected
+        .clone()
+        .filter(|name| snapshot.friends.iter().any(|f| &f.name == name));
+    let action = button(
+        row![icon(icons::SEND, 13), text("Send a file").font(SEMIBOLD)]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .padding([8, 16])
+    .style(theme::primary(p))
+    .on_press_maybe(send_to.clone().map(|f| Message::Send(SendMsg::Pick(f))));
+    let subtitle = match &send_to {
+        Some(friend) => format!(
+            "Files going out. Send a file goes to {friend}; choose another friend on the Friends page."
+        ),
+        None => "Files going out. Choose a friend on the Friends page first.".to_string(),
+    };
+    let now: Element<'_, Message> = match &gui.sending {
+        Some(s) => sending_card(p, s),
+        None => empty(
+            p,
+            icons::TRANSFERS,
+            "Nothing going out",
+            "Send a file from a friend's page, or drop a file on it. They answer before anything moves.",
+        ),
+    };
+    let sent: Vec<&Entry> = snapshot
+        .history
+        .iter()
+        .rev()
+        .filter(|e| e.direction == Direction::Sent)
+        .take(5)
+        .collect();
+    let recent = if sent.is_empty() {
+        empty(
+            p,
+            icons::HISTORY,
+            "Nothing sent yet",
+            "Files you send are listed here.",
+        )
+    } else {
+        activity_table(p, &sent, history::unix_now())
+    };
+    column![
+        toolbar(
+            p,
+            row![
+                column![
+                    text("Transfers").font(BOLD).size(XXL),
+                    text(subtitle).size(MD).color(p.subtext)
+                ]
+                .spacing(4)
+                .width(Fill),
+                action,
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center),
+        ),
+        scrollable(
+            column![
+                section(p, "Now", None, now),
+                section(p, "Sent recently", None, recent)
+            ]
+            .spacing(16)
+            .padding(Padding::new(24.0).top(18.0)),
+        )
+        .height(Fill),
+    ]
+    .into()
+}
+
+/// The send in progress, in the stages a person follows, or how it ended.
+fn sending_card<'a>(p: &'static Pal, s: &'a Sending) -> Element<'a, Message> {
+    let percent = |done: u64, total: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            done as f32 / total as f32 * 100.0
+        }
+    };
+    let (what, share, path): (String, Option<f32>, Option<bool>) = match s.stage {
+        Stage::Starting => ("Starting…".into(), None, None),
+        Stage::Dialling => (format!("Looking for {}…", s.peer), None, None),
+        Stage::Hashing { done, total } => (
+            format!(
+                "Reading the file: {} of {}",
+                format_bytes(done),
+                format_bytes(total)
+            ),
+            Some(percent(done, total)),
+            None,
+        ),
+        Stage::Waiting => (
+            format!(
+                "Waiting for {} to accept. Nothing is sent before they do.",
+                s.peer
+            ),
+            None,
+            None,
+        ),
+        Stage::Moving { done, total, relay } => (
+            format!("Sending: {} of {}", format_bytes(done), format_bytes(total)),
+            Some(percent(done, total)),
+            Some(relay),
+        ),
+        Stage::Checking { done, total } => (
+            format!("{} is checking the whole file", s.peer),
+            Some(percent(done, total)),
+            None,
+        ),
+    };
+    let mut head = row![
+        container(center(icon(icons::UPLOAD, 16)))
+            .width(38)
+            .height(38)
+            .style(theme::icon_tile(p, p.accent)),
+        column![
+            text(&s.file).font(SEMIBOLD).size(LG),
+            text(format!("to {}", s.peer)).size(SM).color(p.subtext),
+        ]
+        .spacing(2)
+        .width(Fill),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    if let Some(relay) = path {
+        head = head.push(if relay {
+            chip(p, p.warning, icons::GLOBE, "Relay")
+        } else {
+            chip(p, p.info, icons::LINK, "Direct P2P")
+        });
+    }
+    let mut card = column![].spacing(12);
+    match &s.result {
+        None => {
+            head = head.push(
+                button(
+                    row![icon(icons::CLOSE, 11), text("Stop").size(MD)]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                )
+                .padding([6, 12])
+                .style(theme::secondary(p))
+                .on_press(Message::Send(SendMsg::Cancel)),
+            );
+            card = card.push(head).push(text(what).size(MD).color(p.subtext));
+            if let Some(share) = share {
+                card = card.push(
+                    progress_bar(0.0..=100.0, share)
+                        .girth(6)
+                        .style(theme::progress(p, p.accent)),
+                );
+            }
+        }
+        Some(result) => {
+            head = head.push(
+                button(text("Dismiss").size(MD))
+                    .padding([6, 12])
+                    .style(theme::ghost(p))
+                    .on_press(Message::Send(SendMsg::Dismiss)),
+            );
+            let (tint, glyph, words) = match result {
+                Ok(words) => (p.success, icons::CHECK, words),
+                Err(words) => (p.danger, icons::WARNING, words),
+            };
+            card = card.push(head).push(notice(p, tint, glyph, words));
+        }
+    }
+    card.into()
+}
+
+/// A file was dropped on a friend's page. A drop may be an accident, so the
+/// highlighted answer sends nothing; Enter and Escape choose it too.
+fn drop_dialog<'a>(
+    p: &'static Pal,
+    friend: &'a str,
+    path: &'a std::path::Path,
+) -> Element<'a, Message> {
+    let file = path
+        .file_name()
+        .map(|n| beam_core::untrusted::name(&n.to_string_lossy()))
+        .unwrap_or_default();
+    dialog(
+        p,
+        icons::SEND,
+        "Send this file?",
+        column![
+            text(format!("Send {file} to {friend}?"))
+                .font(SEMIBOLD)
+                .size(LG),
+            text("They are asked first: nothing moves until they accept.")
+                .size(MD)
+                .color(p.subtext),
+        ]
+        .spacing(8),
+        row![
+            space::horizontal(),
+            button(text("Send").size(MD))
+                .padding([7, 18])
+                .style(theme::secondary(p))
+                .on_press(Message::Send(SendMsg::AnswerDrop(true))),
+            button(text("Don't send").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::Send(SendMsg::AnswerDrop(false))),
+        ]
+        .spacing(8),
+    )
 }

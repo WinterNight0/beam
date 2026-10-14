@@ -23,6 +23,7 @@ workspace = true
 beam-core.workspace = true
 beam-model.workspace = true
 iced.workspace = true
+rfd.workspace = true
 
 [dev-dependencies]
 iced_test.workspace = true
