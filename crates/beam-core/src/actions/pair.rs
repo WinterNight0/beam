@@ -181,6 +181,56 @@ pub fn already_paired(store: &Store, invite: &Invite) -> Result<Option<Location>
     }))
 }
 
+/// What to do with a pasted invite, decided before any network.
+#[derive(Debug)]
+pub enum JoinPlan {
+    /// Someone new: pair with them.
+    Pair(Box<Invite>),
+    /// A friend already paired: only where to find them may change, and
+    /// `location` says what would ([`Location::changes_relay`] needs a yes).
+    AlreadyPaired {
+        invite: Box<Invite>,
+        location: Location,
+    },
+}
+
+/// Why a pasted invite goes no further.
+#[derive(Debug, thiserror::Error)]
+pub enum JoinRefused {
+    /// Not an invite, or a damaged one. Never quotes what was pasted.
+    #[error(transparent)]
+    Invite(#[from] invite::InviteError),
+    /// This device's own invite: pairing with yourself makes no sense.
+    #[error("that is this device's own invite")]
+    OwnInvite,
+    /// The name is not usable or already taken.
+    #[error(transparent)]
+    Name(PairError),
+    #[error(transparent)]
+    Failure(#[from] PairFailure),
+}
+
+/// Checks a pasted invite and the chosen name before anything touches the
+/// network, as `beam pair` does: a damaged invite, this device's own, a
+/// friend already paired (whose key is never replaced, rule 3), a name that
+/// is unusable or taken. Shared by the full-screen view and the GUI.
+pub fn plan_join(store: &Store, text: &str, name: &str) -> Result<JoinPlan, JoinRefused> {
+    let invite: Invite = text.trim().parse()?;
+    let identity = store.load_identity().map_err(PairFailure::from)?;
+    if invite.key == identity.verifying_key() {
+        return Err(JoinRefused::OwnInvite);
+    }
+    if let Some(location) = already_paired(store, &invite)? {
+        return Ok(JoinPlan::AlreadyPaired {
+            invite: Box::new(invite),
+            location,
+        });
+    }
+    let known = store.load_known_peers().map_err(PairFailure::from)?;
+    crate::pairing::check_name(&known, name).map_err(JoinRefused::Name)?;
+    Ok(JoinPlan::Pair(Box::new(invite)))
+}
+
 /// Saves where an already-paired friend is found now. Never touches the
 /// key. Returns the friend's name as stored.
 ///
@@ -280,6 +330,39 @@ mod tests {
         let peer = known.lookup("alice").unwrap();
         assert_eq!(peer.attr(invite::ADDRS_ATTR), Some("192.0.2.7:7820"));
         assert_eq!(peer.public_key, alice.verifying_key());
+    }
+
+    /// `plan_join`, the checks every screen makes before the network.
+    #[test]
+    fn a_pasted_invite_is_checked_before_any_network() {
+        let (_tmp, store, alice) = home_with_alice();
+        let me = Identity::generate("me").unwrap();
+        store.save_identity(&me, false).unwrap();
+        let stranger = Identity::generate("stranger").unwrap();
+        let text = |key: &Identity| invite(key, None).to_string();
+
+        assert!(matches!(
+            plan_join(&store, "not an invite", "bob"),
+            Err(JoinRefused::Invite(_))
+        ));
+        assert!(matches!(
+            plan_join(&store, &text(&me), "bob"),
+            Err(JoinRefused::OwnInvite)
+        ));
+        // A friend already paired is never paired again (rule 3), whatever
+        // name was typed.
+        assert!(matches!(
+            plan_join(&store, &text(&alice), "alice-again"),
+            Ok(JoinPlan::AlreadyPaired { location, .. }) if location.name == "alice"
+        ));
+        assert!(matches!(
+            plan_join(&store, &text(&stranger), "alice"),
+            Err(JoinRefused::Name(_))
+        ));
+        assert!(matches!(
+            plan_join(&store, &format!("  {}\n", text(&stranger)), "bob"),
+            Ok(JoinPlan::Pair(_))
+        ));
     }
 
     /// Someone new is not "already paired".

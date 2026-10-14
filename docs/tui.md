@@ -329,7 +329,8 @@ crates/beam/src/tui/
   input.rs      one text box with a cursor
   palette.rs    splitting, checking, listing and placing palette commands
   add.rs        the Add friend form and the pairing pop-ups
-  pairing.rs    pairing::join / wait on a background thread
+  pairing.rs    the view's words for a failed pairing; the worker itself is
+                beam_core::actions::pair_worker, shared with the GUI
   pending.rs    the Pending tab, the Accept pop-up and the Receiving switch
   receiving.rs  the agent's receiver, run while the switch is on
   inbox.rs      the link to the background agent, as `beam inbox` has it
@@ -370,7 +371,7 @@ runtime, talking to the view through channels:
 
 | Worker | Runs | The view sends | The view gets |
 |---|---|---|---|
-| `pairing.rs` | the same `pairing::join` / `pairing::wait` as `beam pair` | the code; whether the fingerprints match | invite and code, "type the code", "do they match?", the result |
+| `pairing.rs` (worker: `beam_core::actions::pair_worker`, shared with the GUI) | the same `pairing::join` / `pairing::wait` as `beam pair` | the code; whether the fingerprints match | invite and code, "type the code", "do they match?", the result |
 | `inbox.rs` | the `beam inbox` link to the agent: loopback, token from `agent.json` | accept or decline request *n* | requests, closed, progress, finished, gone |
 | `sending.rs` | the same dial, `send_on` and history line as `beam send` | cancel | each stage and its progress, the result |
 | `receiving.rs` | the background agent's receiver (`agent::run`), while the Receiving switch is on | stop | started, stopped (and why) |

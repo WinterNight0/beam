@@ -692,6 +692,8 @@ without a screen (`iced_test`: find text, click by label), in
 | Avatar colours | `a_friends_colour_comes_from_their_fingerprint` |
 | Rename (Patch #3) | `rename_changes_the_name_and_keeps_the_friend_selected`, `a_refused_rename_says_why_and_changes_nothing`; shared with the CLI and view: `beam-core` `actions::friends::tests` |
 | Remove starts on Keep (`Ask`) | `remove_starts_on_keep_so_enter_escape_and_keep_remove_nothing`, `only_a_click_on_remove_removes` |
+| Pairing (Patch #4), two windows over loopback | `two_windows_pair_and_both_save_the_other`, `enter_on_the_fingerprint_question_does_not_pair`, `pair_without_the_tick_is_a_no`, `closing_the_dialog_cancels_the_pairing` |
+| Pairing checks before the network | `this_devices_own_invite_is_refused`, `a_relay_move_starts_on_keep`, `the_code_box_takes_six_digits`; shared: `beam-core` `actions::pair::tests::a_pasted_invite_is_checked_before_any_network`, `actions::pair_worker::tests` (real pairing, unanswered = no, whose code is used up) |
 | Friend detail | `copy_puts_the_fingerprint_on_the_clipboard_and_says_so`, `a_friends_recent_activity_is_listed_with_its_result`, `recently_active_friends_are_grouped_first` |
 
 Not automated: how the window looks. Checked by hand on Windows 11 and on

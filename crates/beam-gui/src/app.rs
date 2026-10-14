@@ -5,7 +5,8 @@
 //! friend's identity, this device, the status bar, Midnight/Daylight, and
 //! the first-run "Create this device's identity". Patch #3: friends: groups,
 //! recent activity, Copy, rename, and remove behind a question that starts
-//! on Keep (`beam_model::Ask`). Everything is read and changed through
+//! on Keep (`beam_model::Ask`). Patch #4: Add friend (`app/pairing.rs`).
+//! Everything is read and changed through
 //! `beam-model` and `beam-core`; the pages still to come say so.
 
 use std::time::Duration;
@@ -14,10 +15,17 @@ use beam_core::actions::friends;
 use beam_core::actions::identity::{Created, create};
 use beam_core::config::{Config, Relay};
 use beam_core::identity::Store;
+use beam_core::transport::endpoint::Bind;
 use beam_core::untrusted;
 use beam_model::snapshot::Snapshot;
-use beam_model::{Ask, Choice, ask::RemoveFriend};
+use beam_model::{
+    Ask, Choice,
+    ask::{RelayMove, RemoveFriend},
+};
+
+pub(crate) mod pairing;
 use iced::{Element, Subscription, Task, keyboard, window};
+pub use pairing::{PairMsg, Pairing};
 
 use crate::theme::{self, Pal};
 
@@ -61,6 +69,10 @@ pub struct Gui {
     pub(crate) notice: Option<(String, Tone)>,
     /// The one question or form open over the window, if any.
     pub(crate) dialog: Option<Dialog>,
+    /// A pairing in progress; dropping it cancels the pairing.
+    pub(crate) worker: Option<pairing::Running>,
+    /// Where a pairing listens: `Loopback` only in tests.
+    pub(crate) bind: Bind,
 }
 
 /// What can be open over the window. One at a time, like the view's pop-ups.
@@ -76,6 +88,12 @@ pub enum Dialog {
     /// Remove this friend? An `Ask`: it starts on Keep, and Enter or Escape
     /// keep them. Only a click on Remove removes.
     Remove(Ask<RemoveFriend>),
+    /// Add a friend: paste an invite or show mine, then compare
+    /// fingerprints (`app/pairing.rs`).
+    Pair(Pairing),
+    /// An invite moves a paired friend to another relay: save it? Starts on
+    /// Keep (ADR-0038).
+    RelayMove(Ask<RelayMove>),
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +117,9 @@ pub enum Message {
     /// The answer to the Remove question.
     AnswerRemove(Choice),
     CloseDialog,
+    /// Open the Add friend dialog.
+    AddFriend,
+    Pair(PairMsg),
     /// Enter or Escape, for the open dialog.
     Key(keyboard::Key),
 }
@@ -142,6 +163,8 @@ impl Gui {
             width: SIZE.0,
             notice: None,
             dialog: None,
+            worker: None,
+            bind: Bind::Any,
         }
     }
 
@@ -244,7 +267,9 @@ impl Gui {
                 self.dialog = Some(Dialog::Remove(Ask::new(RemoveFriend { name, fingerprint })));
             }
             Message::AnswerRemove(answer) => self.answer_remove(answer),
-            Message::CloseDialog => self.dialog = None,
+            Message::CloseDialog => self.close_dialog(),
+            Message::AddFriend => return self.add_friend(),
+            Message::Pair(message) => return self.on_pair(message),
             Message::Key(key) => return self.on_key(key),
         }
         Task::none()
@@ -257,6 +282,10 @@ impl Gui {
         let keyboard::Key::Named(named) = key else {
             return Task::none();
         };
+        if matches!(self.dialog, Some(Dialog::Pair(_) | Dialog::RelayMove(_))) {
+            self.pair_key(named);
+            return Task::none();
+        }
         match (&self.dialog, named) {
             (Some(Dialog::Remove(ask)), Named::Enter) => {
                 let answer = ask.focus();
@@ -333,7 +362,13 @@ impl Gui {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        let pairing = if self.worker.is_some() {
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::Pair(PairMsg::Tick))
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
+            pairing,
             window::resize_events().map(|(_, size)| Message::Resized(size.width)),
             keyboard::listen().filter_map(|event| match event {
                 keyboard::Event::KeyPressed { key, .. } => Some(Message::Key(key)),

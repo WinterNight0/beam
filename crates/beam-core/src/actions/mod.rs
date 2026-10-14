@@ -11,5 +11,6 @@ pub mod identity;
 pub mod inbox;
 pub mod messages;
 pub mod pair;
+pub mod pair_worker;
 pub mod receive;
 pub mod send;

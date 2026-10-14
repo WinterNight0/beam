@@ -4,15 +4,16 @@
 use beam_core::history::{self, Direction, Entry, Outcome};
 use beam_core::text::format_bytes;
 use beam_model::Choice;
+use beam_model::ask::RelayMove;
 use beam_model::snapshot::{Agent, Friend, Snapshot};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, center, column, container, mouse_area, opaque, row, rule, scrollable, space, stack,
-    text, text_input, tooltip,
+    button, center, checkbox, column, container, mouse_area, opaque, row, rule, scrollable, space,
+    stack, text, text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, FillPortion, Padding};
 
-use crate::app::{Dialog, Gui, Message, Page, Tone};
+use crate::app::{Dialog, Gui, Message, Page, PairMsg, Pairing, Tone};
 use crate::icons;
 use crate::theme::{self, BOLD, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
 
@@ -93,6 +94,8 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
             Dialog::Remove(ask) => {
                 remove_dialog(p, &ask.question().name, &ask.question().fingerprint)
             }
+            Dialog::Pair(state) => pairing_dialog(gui, state),
+            Dialog::RelayMove(ask) => relay_dialog(p, ask.question()),
         };
         // Clicks do not reach the window behind a dialog.
         layers = layers.push(opaque(center(card).style(theme::veil(p, 1.0))));
@@ -301,7 +304,7 @@ fn friend_pane<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message>
         list = list.push(
             column![
                 text("No friends yet").font(SEMIBOLD).size(MD),
-                text("Pair in a terminal for now: beam pair <their invite> --name <a name>")
+                text("Add one with the + button: paste their invite, or show yours.")
                     .size(SM)
                     .color(p.subtext),
             ]
@@ -358,7 +361,19 @@ fn friend_pane<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message>
     }
     container(
         column![
-            text("Friends").font(BOLD).size(XL),
+            row![
+                text("Friends").font(BOLD).size(XL),
+                space::horizontal(),
+                tip(
+                    p,
+                    button(icon(icons::ADD, 14))
+                        .padding(8)
+                        .style(theme::primary(p))
+                        .on_press(Message::AddFriend),
+                    "Add a friend",
+                ),
+            ]
+            .align_y(Alignment::Center),
             text_input("Search friends", &gui.search)
                 .on_input(Message::Search)
                 .icon(text_input::Icon {
@@ -1183,4 +1198,379 @@ fn short(hex: &str) -> String {
         return grouped(hex);
     }
     format!("{} … {}", grouped(&hex[..8]), &hex[hex.len() - 4..])
+}
+
+// ---------------------------------------------------------------------------
+// Add a friend (GUI EX Patch #4)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum StepState {
+    Done,
+    Current,
+    Todo,
+}
+
+/// Invite → Code → Verify, for the person who pasted an invite.
+fn stepper<'a>(p: &'static Pal, at: usize) -> Element<'a, Message> {
+    let state = |n: usize| match n.cmp(&at) {
+        std::cmp::Ordering::Less => StepState::Done,
+        std::cmp::Ordering::Equal => StepState::Current,
+        std::cmp::Ordering::Greater => StepState::Todo,
+    };
+    let dot = |n: usize, label: &'a str| {
+        let s = state(n);
+        let (bg, fg) = match s {
+            StepState::Done => (p.success, Color::WHITE),
+            StepState::Current => (p.accent, p.on_accent),
+            StepState::Todo => (p.raised, p.faint),
+        };
+        let mark: Element<'a, Message> = if s == StepState::Done {
+            icon(icons::CHECK, 11).color(fg).into()
+        } else {
+            text((n + 1).to_string())
+                .font(BOLD)
+                .size(SM)
+                .color(fg)
+                .line_height(1.0)
+                .into()
+        };
+        row![
+            container(center(mark))
+                .width(24)
+                .height(24)
+                .style(move |_: &iced::Theme| container::Style {
+                    background: Some(bg.into()),
+                    border: iced::Border {
+                        color: if s == StepState::Todo { p.border } else { bg },
+                        width: 1.5,
+                        radius: 999.0.into(),
+                    },
+                    ..container::Style::default()
+                }),
+            text(label).size(MD).color(if s == StepState::Todo {
+                p.faint
+            } else {
+                p.text
+            }),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+    };
+    let line = || container(divider(p)).width(Fill);
+    row![
+        dot(0, "Invite"),
+        line(),
+        dot(1, "Code"),
+        line(),
+        dot(2, "Verify")
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn divider<'a>(p: &'static Pal) -> Element<'a, Message> {
+    rule::horizontal(1)
+        .style(move |_| rule::Style {
+            color: p.divider,
+            radius: 0.0.into(),
+            fill_mode: rule::FillMode::Full,
+            snap: true,
+        })
+        .into()
+}
+
+fn cancel<'a>(p: &'static Pal, label: &'a str) -> Element<'a, Message> {
+    button(text(label).size(MD))
+        .padding([7, 18])
+        .style(theme::secondary(p))
+        .on_press(Message::CloseDialog)
+        .into()
+}
+
+fn pairing_dialog<'a>(gui: &'a Gui, state: &'a Pairing) -> Element<'a, Message> {
+    let p = gui.pal();
+    let pair = Message::Pair;
+    match state {
+        Pairing::Start {
+            invite,
+            name,
+            error,
+        } => {
+            let mut body = column![
+                stepper(p, 0),
+                text("Paste the invite your friend sent you")
+                    .font(SEMIBOLD)
+                    .size(LG),
+                text("They find it under Show my invite in beam, or with beam whoami in a terminal. It starts with beam1.")
+                    .size(MD)
+                    .color(p.subtext),
+                text_input("beam1…", invite)
+                    .id(crate::app::pairing::INVITE_INPUT)
+                    .on_input(move |t| pair(PairMsg::Invite(t)))
+                    .on_submit(pair(PairMsg::Join))
+                    .padding(10)
+                    .font(MONO)
+                    .size(MD)
+                    .style(theme::input(p)),
+                text("What to call them on this device").size(SM).color(p.subtext),
+                text_input("A name, like alice", name)
+                    .on_input(move |t| pair(PairMsg::Name(t)))
+                    .on_submit(pair(PairMsg::Join))
+                    .padding(10)
+                    .size(MD)
+                    .style(theme::input(p)),
+            ]
+            .spacing(10);
+            body = body.push(match error {
+                Some(why) => notice(p, p.danger, icons::WARNING, why),
+                None => notice(
+                    p,
+                    p.info,
+                    icons::INFO,
+                    "An invite only says where to find them. The pairing code and the fingerprint check prove who they are.",
+                ),
+            });
+            let ready = !invite.trim().is_empty() && !name.trim().is_empty();
+            dialog(
+                p,
+                icons::ADD,
+                "Add a friend",
+                body,
+                row![
+                    button(
+                        row![
+                            icon(icons::KEY, 12),
+                            text("Show my invite instead").size(MD)
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                    )
+                    .padding([7, 12])
+                    .style(theme::ghost(p))
+                    .on_press(pair(PairMsg::ShowMine)),
+                    space::horizontal(),
+                    cancel(p, "Cancel"),
+                    button(text("Next").font(SEMIBOLD).size(MD))
+                        .padding([7, 18])
+                        .style(theme::primary(p))
+                        .on_press_maybe(ready.then_some(pair(PairMsg::Join))),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+        }
+        Pairing::Showing {
+            invite,
+            code,
+            until,
+        } => {
+            let left = Gui::code_left(*until).as_secs();
+            dialog(
+                p,
+                icons::KEY,
+                "Show my invite",
+                column![
+                    text("Send this invite to your friend")
+                        .font(SEMIBOLD)
+                        .size(LG),
+                    row![
+                        container(
+                            text(invite)
+                                .font(MONO)
+                                .size(SM)
+                                .wrapping(Wrapping::WordOrGlyph)
+                        )
+                        .padding([8, 10])
+                        .width(Fill)
+                        .style(theme::code_block(p)),
+                        button(
+                            row![icon(icons::COPY, 12), text("Copy").size(SM)]
+                                .spacing(6)
+                                .align_y(Alignment::Center)
+                        )
+                        .padding([6, 10])
+                        .style(theme::secondary(p))
+                        .on_press(pair(PairMsg::CopyInvite(invite.clone()))),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    text("On their device they choose Add friend, paste it, and type this code:")
+                        .size(MD)
+                        .color(p.subtext),
+                    container(text(code).font(MONO).size(34))
+                        .padding([8, 18])
+                        .style(theme::code_block(p)),
+                    text(format!(
+                        "Works for one attempt. Expires in {} min {:02} s.",
+                        left / 60,
+                        left % 60
+                    ))
+                    .size(SM)
+                    .color(p.subtext),
+                ]
+                .spacing(12),
+                row![space::horizontal(), cancel(p, "Cancel")],
+            )
+        }
+        Pairing::Code { code, error } => {
+            let mut body = column![
+                stepper(p, 1),
+                text("Type the pairing code").font(SEMIBOLD).size(LG),
+                text("Your friend's beam shows a 6-digit code next to the invite. It works for one attempt.")
+                    .size(MD)
+                    .color(p.subtext),
+                text_input("000000", code)
+                    .id(crate::app::pairing::CODE_INPUT)
+                    .on_input(move |t| pair(PairMsg::Code(t)))
+                    .on_submit(pair(PairMsg::SendCode))
+                    .padding(12)
+                    .font(MONO)
+                    .size(26)
+                    .width(220)
+                    .style(theme::input(p)),
+            ]
+            .spacing(12);
+            if let Some(why) = error {
+                body = body.push(notice(p, p.danger, icons::WARNING, why));
+            }
+            dialog(
+                p,
+                icons::ADD,
+                "Add a friend",
+                body,
+                row![
+                    space::horizontal(),
+                    cancel(p, "Cancel"),
+                    button(text("Next").font(SEMIBOLD).size(MD))
+                        .padding([7, 18])
+                        .style(theme::primary(p))
+                        .on_press_maybe((code.len() == 6).then_some(pair(PairMsg::SendCode))),
+                ]
+                .spacing(8),
+            )
+        }
+        Pairing::Busy(what) => dialog(
+            p,
+            icons::ADD,
+            "Add a friend",
+            row![icon(icons::CLOCK, 16).color(p.accent), text(what).size(MD)]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            row![space::horizontal(), cancel(p, "Cancel")],
+        ),
+        Pairing::Confirm { ask, compared } => {
+            let q = ask.question();
+            dialog(
+                p,
+                icons::SHIELD,
+                "Add a friend",
+                column![
+                    stepper(p, 2),
+                    text(format!("Compare fingerprints with {}", q.name))
+                        .font(SEMIBOLD)
+                        .size(LG),
+                    text("Read them to each other on a call or in person. Both must match exactly, on both devices.")
+                        .size(MD)
+                        .color(p.subtext),
+                    fingerprint_card(p, &format!("{} (their device)", q.name), &q.peer),
+                    fingerprint_card(p, "This device", &q.own),
+                    checkbox(*compared)
+                        .label("We compared both fingerprints and they match")
+                        .on_toggle(move |yes| pair(PairMsg::Compared(yes)))
+                        .size(16)
+                        .text_size(MD),
+                ]
+                .spacing(12),
+                row![
+                    space::horizontal(),
+                    button(text("Pair").size(MD))
+                        .padding([7, 18])
+                        .style(theme::secondary(p))
+                        .on_press_maybe(compared.then_some(pair(PairMsg::Answer(Choice::Yes)))),
+                    // The safe answer, highlighted: Enter and Escape choose it.
+                    button(text("Don't pair").font(SEMIBOLD).size(MD))
+                        .padding([7, 18])
+                        .style(theme::primary(p))
+                        .on_press(pair(PairMsg::Answer(Choice::No))),
+                ]
+                .spacing(8),
+            )
+        }
+        Pairing::Failed(why) => dialog(
+            p,
+            icons::WARNING,
+            "Not paired",
+            notice(p, p.danger, icons::WARNING, why),
+            row![
+                space::horizontal(),
+                cancel(p, "Close"),
+                button(text("Try again").font(SEMIBOLD).size(MD))
+                    .padding([7, 18])
+                    .style(theme::primary(p))
+                    .on_press(Message::AddFriend),
+            ]
+            .spacing(8),
+        ),
+    }
+}
+
+fn fingerprint_card<'a>(p: &'static Pal, whose: &str, hex: &str) -> Element<'a, Message> {
+    column![
+        text(whose.to_string()).size(SM).color(p.subtext),
+        container(text(format!("SHA256:{}", grouped(hex))).font(MONO).size(MD))
+            .padding([10, 12])
+            .width(Fill)
+            .style(theme::code_block(p)),
+    ]
+    .spacing(4)
+    .into()
+}
+
+/// An invite would move a paired friend to another relay. Keep is the
+/// highlighted, safe answer (ADR-0038).
+fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove) -> Element<'a, Message> {
+    dialog(
+        p,
+        icons::GLOBE,
+        "Move to another relay?",
+        column![
+            text(format!("{} is already your friend.", q.name))
+                .font(SEMIBOLD)
+                .size(LG),
+            text("This invite would change only where to find them; their key stays. But it moves them to another relay:")
+                .size(MD)
+                .color(p.subtext),
+            row![
+                text("Now").size(SM).color(p.subtext).width(70),
+                text(&q.old).font(MONO).size(SM)
+            ]
+            .spacing(8),
+            row![
+                text("After").size(SM).color(p.subtext).width(70),
+                text(&q.new).font(MONO).size(SM)
+            ]
+            .spacing(8),
+            notice(
+                p,
+                p.warning,
+                icons::WARNING,
+                "Whoever runs a relay sees when you send to this friend, and from where, and can block it. Say yes only if your friend told you they changed relay.",
+            ),
+        ]
+        .spacing(10),
+        row![
+            space::horizontal(),
+            button(text("Move").size(MD))
+                .padding([7, 18])
+                .style(theme::secondary(p))
+                .on_press(Message::Pair(PairMsg::AnswerRelay(Choice::Yes))),
+            button(text("Keep the current relay").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::Pair(PairMsg::AnswerRelay(Choice::No))),
+        ]
+        .spacing(8),
+    )
 }

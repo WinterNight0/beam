@@ -227,16 +227,16 @@ impl App {
                     own,
                 })))
             }
-            Update::Finished(Ok((name, fingerprint))) => {
+            Update::Finished(Ok(super::pairing::Paired { name, fingerprint })) => {
                 self.flash = Some(format!("Paired with {name}."));
                 self.add = AddForm::default();
                 self.tab = Tab::Friends;
                 self.pending_select = Some(fingerprint);
                 None
             }
-            Update::Finished(Err(reason)) => Some(Modal::Output {
+            Update::Finished(Err(unpaired)) => Some(Modal::Output {
                 title: "Not paired".to_string(),
-                text: reason,
+                text: super::pairing::words(&unpaired),
                 scroll: 0,
                 failed: true,
             }),

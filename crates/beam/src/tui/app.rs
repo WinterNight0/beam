@@ -1625,7 +1625,10 @@ mod tests {
     fn pairing_done_selects_the_new_friend_and_a_failure_says_why() {
         let mut app = with_me(three());
         app.tab = Tab::AddFriend;
-        app.on_pair(Update::Finished(Ok(("dana".into(), "dd".into()))));
+        app.on_pair(Update::Finished(Ok(super::super::pairing::Paired {
+            name: "dana".into(),
+            fingerprint: "dd".into(),
+        })));
         assert_eq!(app.tab, Tab::Friends);
         assert_eq!(app.flash.as_deref(), Some("Paired with dana."));
         let mut friends = three().snapshot.friends;
@@ -1633,7 +1636,9 @@ mod tests {
         app.refresh(snapshot(friends));
         assert_eq!(app.selected_friend().unwrap().name, "dana");
 
-        app.on_pair(Update::Finished(Err("Not paired: declined".into())));
+        app.on_pair(Update::Finished(Err(
+            super::super::pairing::Unpaired::Failed("Not paired: declined".into()),
+        )));
         assert!(matches!(
             &app.modal,
             Some(Modal::Output { failed: true, .. })

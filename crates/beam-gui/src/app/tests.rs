@@ -3,6 +3,7 @@
 
 use super::*;
 use beam_core::identity::{Identity, KnownPeers, Peer};
+use beam_core::transport::endpoint::Bind;
 use iced_test::simulator;
 
 fn home(with_identity: bool, friends: &[&str]) -> (tempfile::TempDir, Store) {
@@ -339,4 +340,254 @@ fn recently_active_friends_are_grouped_first() {
     let gui = Gui::for_home(store);
     assert!(shows(&gui, "RECENTLY ACTIVE"));
     assert!(shows(&gui, "EVERYONE ELSE"));
+}
+
+// ---------------------------------------------------------------- Patch #4
+
+/// A window on a beam home that pairs over loopback, as the tests need.
+fn pairing_window(name: &str) -> (tempfile::TempDir, Store, Gui) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::new(tmp.path().join("beam"));
+    store.ensure_dirs().unwrap();
+    store
+        .save_identity(&Identity::generate(name).unwrap(), false)
+        .unwrap();
+    std::fs::write(store.config_path(), "relay = \"none\"\nport = 0\n").unwrap();
+    let mut gui = Gui::for_home(store.clone());
+    gui.bind = Bind::Loopback;
+    (tmp, store, gui)
+}
+
+/// Reads the worker until `done` holds, within a generous time.
+fn pump(gui: &mut Gui, what: &str, done: impl Fn(&Gui) -> bool) {
+    for _ in 0..600 {
+        let _ = gui.update(Message::Pair(PairMsg::Tick));
+        if done(gui) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("never got to: {what} ({:?})", gui.dialog);
+}
+
+fn is(gui: &Gui, f: impl Fn(&Pairing) -> bool) -> bool {
+    matches!(&gui.dialog, Some(Dialog::Pair(state)) if f(state))
+}
+
+/// Two windows up to the fingerprint question: one shows its invite, the
+/// other pastes it and types the code.
+fn up_to_the_question() -> [(tempfile::TempDir, Store, Gui); 2] {
+    let (wt, waiter_home, mut waiter) = pairing_window("lab-pc");
+    let (jt, joiner_home, mut joiner) = pairing_window("laptop");
+    let _ = waiter.update(Message::AddFriend);
+    let _ = waiter.update(Message::Pair(PairMsg::ShowMine));
+    pump(&mut waiter, "the invite", |g| {
+        is(g, |s| matches!(s, Pairing::Showing { .. }))
+    });
+    let Some(Dialog::Pair(Pairing::Showing { invite, code, .. })) = &waiter.dialog else {
+        unreachable!()
+    };
+    let (invite, code) = (invite.clone(), code.clone());
+
+    let _ = joiner.update(Message::AddFriend);
+    let _ = joiner.update(Message::Pair(PairMsg::Invite(invite)));
+    let _ = joiner.update(Message::Pair(PairMsg::Name("lab".into())));
+    let _ = joiner.update(Message::Pair(PairMsg::Join));
+    pump(&mut joiner, "the code box", |g| {
+        is(g, |s| matches!(s, Pairing::Code { .. }))
+    });
+    let _ = joiner.update(Message::Pair(PairMsg::Code(code)));
+    let _ = joiner.update(Message::Pair(PairMsg::SendCode));
+    for (gui, who) in [(&mut joiner, "joiner"), (&mut waiter, "waiter")] {
+        pump(gui, who, |g| {
+            is(g, |s| matches!(s, Pairing::Confirm { .. }))
+        });
+    }
+    [(wt, waiter_home, waiter), (jt, joiner_home, joiner)]
+}
+
+fn finished(gui: &mut Gui) {
+    pump(gui, "the end", |g| g.worker.is_none());
+}
+
+#[test]
+fn two_windows_pair_and_both_save_the_other() {
+    let [
+        (_wt, waiter_home, mut waiter),
+        (_jt, joiner_home, mut joiner),
+    ] = up_to_the_question();
+    // Both see both fingerprints, each from their side.
+    let fingerprints = |g: &Gui| match &g.dialog {
+        Some(Dialog::Pair(Pairing::Confirm { ask, .. })) => {
+            (ask.question().peer.clone(), ask.question().own.clone())
+        }
+        _ => unreachable!(),
+    };
+    let (jp, jo) = fingerprints(&joiner);
+    assert_eq!(fingerprints(&waiter), (jo, jp));
+
+    for gui in [&mut joiner, &mut waiter] {
+        let _ = gui.update(Message::Pair(PairMsg::Compared(true)));
+        let _ = gui.update(Message::Pair(PairMsg::Answer(Choice::Yes)));
+    }
+    finished(&mut joiner);
+    finished(&mut waiter);
+    assert!(joiner.dialog.is_none() && waiter.dialog.is_none());
+    assert_eq!(joiner.selected.as_deref(), Some("lab"));
+    assert!(
+        joiner_home
+            .load_known_peers()
+            .unwrap()
+            .lookup("lab")
+            .is_some()
+    );
+    assert!(
+        waiter_home
+            .load_known_peers()
+            .unwrap()
+            .lookup("laptop")
+            .is_some()
+    );
+}
+
+/// The fingerprint question starts on "Don't pair": Enter answers no, and
+/// nothing is saved on either side.
+#[test]
+fn enter_on_the_fingerprint_question_does_not_pair() {
+    let [
+        (_wt, waiter_home, mut waiter),
+        (_jt, joiner_home, mut joiner),
+    ] = up_to_the_question();
+    let Some(Dialog::Pair(Pairing::Confirm { ask, .. })) = &joiner.dialog else {
+        unreachable!()
+    };
+    assert_eq!(ask.focus(), Choice::No, "starts on Don't pair");
+    let _ = joiner.update(Message::Pair(PairMsg::Compared(true)));
+    let _ = joiner.update(key(keyboard::key::Named::Enter));
+    let _ = waiter.update(Message::Pair(PairMsg::Compared(true)));
+    let _ = waiter.update(Message::Pair(PairMsg::Answer(Choice::Yes)));
+    finished(&mut joiner);
+    finished(&mut waiter);
+    assert!(is(&joiner, |s| matches!(s, Pairing::Failed(_))));
+    assert!(joiner_home.load_known_peers().unwrap().is_empty());
+    assert!(waiter_home.load_known_peers().unwrap().is_empty());
+}
+
+/// Pair without the "we compared them" tick is a no.
+#[test]
+fn pair_without_the_tick_is_a_no() {
+    let [
+        (_wt, waiter_home, mut waiter),
+        (_jt, joiner_home, mut joiner),
+    ] = up_to_the_question();
+    let _ = joiner.update(Message::Pair(PairMsg::Answer(Choice::Yes)));
+    let _ = waiter.update(Message::Pair(PairMsg::Compared(true)));
+    let _ = waiter.update(Message::Pair(PairMsg::Answer(Choice::Yes)));
+    finished(&mut joiner);
+    finished(&mut waiter);
+    assert!(joiner_home.load_known_peers().unwrap().is_empty());
+    assert!(waiter_home.load_known_peers().unwrap().is_empty());
+}
+
+/// Closing the dialog cancels the pairing: the worker goes, and with it
+/// any question still waiting (a no).
+#[test]
+fn closing_the_dialog_cancels_the_pairing() {
+    let (_t, _store, mut gui) = pairing_window("lab-pc");
+    let _ = gui.update(Message::AddFriend);
+    let _ = gui.update(Message::Pair(PairMsg::ShowMine));
+    assert!(gui.worker.is_some());
+    let _ = gui.update(key(keyboard::key::Named::Escape));
+    assert!(gui.dialog.is_none() && gui.worker.is_none());
+}
+
+#[test]
+fn this_devices_own_invite_is_refused() {
+    let (_t, store, mut gui) = pairing_window("lab-pc");
+    let own = beam_core::invite::Invite {
+        key: store.load_identity().unwrap().verifying_key(),
+        relay: None,
+        addrs: vec!["192.0.2.7:7820".parse().unwrap()],
+    };
+    let _ = gui.update(Message::AddFriend);
+    let _ = gui.update(Message::Pair(PairMsg::Invite(own.to_string())));
+    let _ = gui.update(Message::Pair(PairMsg::Name("me".into())));
+    let _ = gui.update(Message::Pair(PairMsg::Join));
+    assert!(is(&gui, |s| matches!(
+        s,
+        Pairing::Start { error: Some(e), .. } if e.contains("own invite")
+    )));
+    assert!(gui.worker.is_none(), "nothing reached the network");
+}
+
+/// An invite for a friend already paired never pairs again; moving them to
+/// another relay is a question that starts on Keep (ADR-0038).
+#[test]
+fn a_relay_move_starts_on_keep() {
+    let (_t, store, mut gui) = pairing_window("lab-pc");
+    let alice = Identity::generate("alice").unwrap();
+    let mut known = store.load_known_peers().unwrap();
+    known
+        .add(Peer::new("alice", alice.verifying_key()))
+        .unwrap();
+    store.save_known_peers(&known).unwrap();
+    let moved = beam_core::invite::Invite {
+        key: alice.verifying_key(),
+        relay: Some("https://relay.example.org/".parse().unwrap()),
+        addrs: vec!["192.0.2.7:7820".parse().unwrap()],
+    }
+    .to_string();
+    let relay_saved = || {
+        store
+            .load_known_peers()
+            .unwrap()
+            .lookup("alice")
+            .unwrap()
+            .attr("relay")
+            .is_some()
+    };
+    let paste = |gui: &mut Gui| {
+        let _ = gui.update(Message::AddFriend);
+        let _ = gui.update(Message::Pair(PairMsg::Invite(moved.clone())));
+        let _ = gui.update(Message::Pair(PairMsg::Name("whatever".into())));
+        let _ = gui.update(Message::Pair(PairMsg::Join));
+    };
+
+    paste(&mut gui);
+    let Some(Dialog::RelayMove(ask)) = &gui.dialog else {
+        panic!("no relay question: {:?}", gui.dialog);
+    };
+    assert_eq!(ask.focus(), Choice::No, "starts on Keep");
+    let _ = gui.update(key(keyboard::key::Named::Enter));
+    assert!(gui.dialog.is_none());
+    assert!(!relay_saved(), "Enter kept the relay");
+
+    paste(&mut gui);
+    let _ = gui.update(Message::Pair(PairMsg::AnswerRelay(Choice::Yes)));
+    assert!(relay_saved(), "a yes moves them");
+    assert!(
+        gui.worker.is_none(),
+        "an existing friend is never paired again"
+    );
+}
+
+/// The code box takes digits only, and a short code never reaches the
+/// network.
+#[test]
+fn the_code_box_takes_six_digits() {
+    let (_t, _store, mut gui) = pairing_window("lab-pc");
+    gui.dialog = Some(Dialog::Pair(Pairing::Code {
+        code: String::new(),
+        error: None,
+    }));
+    let _ = gui.update(Message::Pair(PairMsg::Code("12a 34".into())));
+    assert!(is(
+        &gui,
+        |s| matches!(s, Pairing::Code { code, .. } if code == "1234")
+    ));
+    let _ = gui.update(Message::Pair(PairMsg::SendCode));
+    assert!(is(&gui, |s| matches!(
+        s,
+        Pairing::Code { error: Some(_), .. }
+    )));
 }

@@ -408,43 +408,41 @@ enum Joining {
 /// where to find them, asking first if it changes their relay (ADR-0038), as
 /// `beam pair` does.
 fn start_join(store: &Store, text: &str, name: &str) -> Result<Joining, String> {
-    let fail = |e: &dyn std::fmt::Display| untrusted::lines(&e.to_string());
-    let invite: beam_core::invite::Invite = text.parse().map_err(|e| fail(&e))?;
-    let identity = store.load_identity().map_err(|e| fail(&e))?;
-    if invite.key == identity.verifying_key() {
-        return Err("That is this device's own invite. Ask them for theirs.".to_string());
-    }
-    if let Some(location) =
-        beam_core::actions::pair::already_paired(store, &invite).map_err(|e| fail(&e))?
-    {
-        if location.changes_relay() {
-            let describe = |relay: &Option<String>| match relay {
-                Some(url) => untrusted::text(url),
-                None => format!("your own relay ({})", location.own_relay),
-            };
-            return Ok(Joining::Done(Done::AskRelay {
-                name: untrusted::name(&location.name),
-                fingerprint: location.fingerprint.hex(),
-                old: describe(&location.relay_now),
-                new: describe(&location.relay_after),
-                invite: text.to_string(),
-            }));
+    use beam_core::actions::pair::{JoinPlan, JoinRefused, plan_join};
+    let location = match plan_join(store, text, name) {
+        Ok(JoinPlan::Pair(invite)) => {
+            return Ok(Joining::Started(pairing::Worker::join(
+                store.clone(),
+                *invite,
+                name.to_string(),
+            )));
         }
-        return Ok(Joining::Done(update_location(store, text, false)));
+        Ok(JoinPlan::AlreadyPaired { location, .. }) => location,
+        Err(JoinRefused::OwnInvite) => {
+            return Err("That is this device's own invite. Ask them for theirs.".to_string());
+        }
+        Err(e) => return Err(untrusted::lines(&e.to_string())),
+    };
+    if location.changes_relay() {
+        let describe = |relay: &Option<String>| match relay {
+            Some(url) => untrusted::text(url),
+            None => format!("your own relay ({})", location.own_relay),
+        };
+        return Ok(Joining::Done(Done::AskRelay {
+            name: untrusted::name(&location.name),
+            fingerprint: location.fingerprint.hex(),
+            old: describe(&location.relay_now),
+            new: describe(&location.relay_after),
+            invite: text.to_string(),
+        }));
     }
-    let known = store.load_known_peers().map_err(|e| fail(&e))?;
-    beam_core::pairing::check_name(&known, name).map_err(|e| fail(&e))?;
-    Ok(Joining::Started(pairing::Worker::join(
-        store.clone(),
-        invite,
-        name.to_string(),
-    )))
+    Ok(Joining::Done(update_location(store, text, false)))
 }
 
 /// Saves where an already-paired friend is now. Never touches the key.
 fn update_location(store: &Store, text: &str, relay_change_agreed: bool) -> Done {
     let fail = |e: &dyn std::fmt::Display| Done::Failed(untrusted::lines(&e.to_string()));
-    let invite: beam_core::invite::Invite = match text.parse() {
+    let invite: beam_core::invite::Invite = match text.trim().parse() {
         Ok(invite) => invite,
         Err(e) => return fail(&e),
     };

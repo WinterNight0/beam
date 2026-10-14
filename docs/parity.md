@@ -21,9 +21,9 @@ terminal · — not offered · *planned* not built yet.
 | See this device: name, fingerprint, invite | `beam whoami` | ✔ header; ⌨ `whoami` | ✔ Settings and status bar (invite: *planned*) | `identity`, `listen_status`, `beam-model::snapshot` |
 | List friends, last seen | `beam peers` | ✔ Friends tab | ✔ Friends page, with search | `beam-model::snapshot` |
 | Rename / remove a friend (Remove starts on Keep) | `beam rename`, `beam remove` | ✔ `r`, `x` | ✔ Rename, Remove on a friend | `actions::friends`, `beam-model::ask` |
-| Pair by pasting an invite (fingerprint check starts on No) | `beam pair <INVITE>` | ✔ Add friend | *planned* | `actions::pair`, `beam-model::ask` |
-| Pair by showing your invite | `beam pair --wait`, `beam listen` | ✔ Show my invite | *planned* | `actions::pair` |
-| Update where a friend is (a relay move needs a yes) | `beam pair <INVITE>` | ✔ Add friend | *planned* | `actions::pair::save_location` |
+| Pair by pasting an invite (fingerprint check starts on No) | `beam pair <INVITE>` | ✔ Add friend | ✔ Add friend (+); Pair only after "we compared them" | `actions::pair::plan_join`, `actions::pair_worker`, `beam-model::ask` |
+| Pair by showing your invite | `beam pair --wait`, `beam listen` | ✔ Show my invite | ✔ Show my invite (in Add friend) | `actions::pair_worker` |
+| Update where a friend is (a relay move needs a yes) | `beam pair <INVITE>` | ✔ Add friend | ✔ Add friend; the question starts on Keep | `actions::pair::plan_join`, `save_location` |
 | Send a file | `beam send` | ✔ `s` + file browser; ⌨ `send` | *planned*, with the OS file picker | `actions::send`, `beam-model::sending` |
 | Receive with a prompt per file | `beam listen` | ⌨ `listen` (in a terminal) | *planned* | `listener` |
 | Receive while open, without a terminal | — (use `beam listen`) | ✔ Receiving switch | *planned* | `actions::receive`, `beam-model::requests` |
