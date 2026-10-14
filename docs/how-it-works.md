@@ -622,6 +622,8 @@ crates/beam-core/src/
     identity.rs        first run: make this device's identity, never replace it
     friends.rs         rename and remove a friend (CLI, view and GUI)
     pair_worker.rs     pairing on a thread for screens (view and GUI); unanswered = no
+    switch.rs          the Receiving switch's receiver (the agent's, in a window)
+    inbox_link.rs      a window's link to the receiver: requests, answers
 crates/beam-core/tests/  integration and security tests of the core;
                        layers.rs (the layers), no_n0_discovery.rs (S-17)
 

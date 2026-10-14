@@ -17,15 +17,18 @@ use beam_core::config::{Config, Relay};
 use beam_core::identity::Store;
 use beam_core::transport::endpoint::Bind;
 use beam_core::untrusted;
+use beam_model::requests::Requests;
 use beam_model::snapshot::Snapshot;
 use beam_model::{
     Ask, Choice,
-    ask::{RelayMove, RemoveFriend},
+    ask::{Incoming, LeaveMidTransfer, RelayMove, RemoveFriend, StopMidTransfer},
 };
 
 pub(crate) mod pairing;
+pub(crate) mod receiving;
 use iced::{Element, Subscription, Task, keyboard, window};
 pub use pairing::{PairMsg, Pairing};
+pub use receiving::RecvMsg;
 
 use crate::theme::{self, Pal};
 
@@ -71,8 +74,15 @@ pub struct Gui {
     pub(crate) dialog: Option<Dialog>,
     /// A pairing in progress; dropping it cancels the pairing.
     pub(crate) worker: Option<pairing::Running>,
-    /// Where a pairing listens: `Loopback` only in tests.
+    /// Where a pairing or the Receiving switch listens: `Loopback` only in
+    /// tests.
     pub(crate) bind: Bind,
+    /// Requests waiting, the file arriving, the switch (`beam-model`).
+    pub(crate) requests: Requests,
+    /// The switch's receiver and the link to the receiver, while they run.
+    pub(crate) receivers: receiving::Receivers,
+    /// A desktop notification per request; off only in tests.
+    pub(crate) notify: bool,
 }
 
 /// What can be open over the window. One at a time, like the view's pop-ups.
@@ -94,6 +104,12 @@ pub enum Dialog {
     /// An invite moves a paired friend to another relay: save it? Starts on
     /// Keep (ADR-0038).
     RelayMove(Ask<RelayMove>),
+    /// May this friend send this file? Starts on Decline (`app/receiving.rs`).
+    Accept(Ask<Incoming>),
+    /// Stop receiving while a file arrives? Starts on No.
+    StopReceiving(Ask<StopMidTransfer>),
+    /// Close beam while a file arrives? Starts on No (stay).
+    Leave(Ask<LeaveMidTransfer>, window::Id),
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +136,7 @@ pub enum Message {
     /// Open the Add friend dialog.
     AddFriend,
     Pair(PairMsg),
+    Receive(RecvMsg),
     /// Enter or Escape, for the open dialog.
     Key(keyboard::Key),
 }
@@ -147,6 +164,7 @@ impl Gui {
     pub fn for_home(store: Store) -> Self {
         let mut gui = Self::empty(Some(store));
         gui.reload();
+        gui.connect_link();
         gui
     }
 
@@ -165,6 +183,9 @@ impl Gui {
             dialog: None,
             worker: None,
             bind: Bind::Any,
+            requests: Requests::default(),
+            receivers: receiving::Receivers::default(),
+            notify: true,
         }
     }
 
@@ -233,7 +254,10 @@ impl Gui {
                     self.reload();
                 }
             }
-            Message::Refresh => self.reload(),
+            Message::Refresh => {
+                self.reload();
+                self.connect_link();
+            }
             Message::Resized(width) => self.width = width,
             Message::DismissNotice => self.notice = None,
             Message::CopyFingerprint(hex) => {
@@ -270,6 +294,7 @@ impl Gui {
             Message::CloseDialog => self.close_dialog(),
             Message::AddFriend => return self.add_friend(),
             Message::Pair(message) => return self.on_pair(message),
+            Message::Receive(message) => return self.on_receive(message),
             Message::Key(key) => return self.on_key(key),
         }
         Task::none()
@@ -285,6 +310,30 @@ impl Gui {
         if matches!(self.dialog, Some(Dialog::Pair(_) | Dialog::RelayMove(_))) {
             self.pair_key(named);
             return Task::none();
+        }
+        // Enter gives the highlighted answer, which starts on the safe one;
+        // Escape on the Accept question is "later", on the others "no".
+        let enter = named == keyboard::key::Named::Enter;
+        let escape = named == keyboard::key::Named::Escape;
+        match &self.dialog {
+            Some(Dialog::Accept(ask)) if enter => {
+                let choice = ask.focus();
+                self.answer(choice);
+                return Task::none();
+            }
+            Some(Dialog::Accept(_)) if escape => {
+                self.later();
+                return Task::none();
+            }
+            Some(Dialog::StopReceiving(ask)) if enter || escape => {
+                let choice = if enter { ask.focus() } else { Choice::No };
+                return self.on_receive(RecvMsg::AnswerStop(choice));
+            }
+            Some(Dialog::Leave(ask, _)) if enter || escape => {
+                let choice = if enter { ask.focus() } else { Choice::No };
+                return self.on_receive(RecvMsg::AnswerLeave(choice));
+            }
+            _ => {}
         }
         match (&self.dialog, named) {
             (Some(Dialog::Remove(ask)), Named::Enter) => {
@@ -362,6 +411,11 @@ impl Gui {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        let receiving = if self.receivers.switch.is_some() || self.receivers.link.is_some() {
+            iced::time::every(Duration::from_millis(250)).map(|_| Message::Receive(RecvMsg::Tick))
+        } else {
+            Subscription::none()
+        };
         let pairing = if self.worker.is_some() {
             iced::time::every(Duration::from_millis(100)).map(|_| Message::Pair(PairMsg::Tick))
         } else {
@@ -369,6 +423,8 @@ impl Gui {
         };
         Subscription::batch([
             pairing,
+            receiving,
+            window::close_requests().map(|id| Message::Receive(RecvMsg::CloseRequested(id))),
             window::resize_events().map(|(_, size)| Message::Resized(size.width)),
             keyboard::listen().filter_map(|event| match event {
                 keyboard::Event::KeyPressed { key, .. } => Some(Message::Key(key)),

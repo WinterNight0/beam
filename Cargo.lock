@@ -479,6 +479,7 @@ dependencies = [
  "iced",
  "iced_test",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

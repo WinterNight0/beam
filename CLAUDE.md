@@ -147,7 +147,9 @@ crates/beam-core/      L1 core + L2 actions. No terminal or GUI library.
   src/actions/         one copy of each flow: send, pair, receive, inbox, messages,
                        identity (first-run create, never replaces), friends
                        (rename, remove), pair_worker (pairing on a thread for
-                       the view and the GUI; plan_join checks before network)
+                       the view and the GUI; plan_join checks before network),
+                       switch (the Receiving switch's receiver), inbox_link
+                       (a window's link to the receiver)
   tests/               core integration and security tests; tests/layers.rs
 crates/beam-model/     L3 what a screen shows: snapshot, requests, sending,
                        ask (every yes/no question starts on No). Depends on
@@ -305,7 +307,12 @@ In this order, each step with its tests (ADR-0048):
   (Add friend: paste an invite or Show my invite, code, fingerprints with
   "Don't pair" highlighted and Pair only after the tick, relay move starting
   on Keep; the view's pairing worker and pre-network checks moved to
-  `actions::pair_worker` and `actions::pair::plan_join` and are shared); then
+  `actions::pair_worker` and `actions::pair::plan_join` and are shared); #5
+  receiving (Inbox: Receiving switch, requests listed and never opened by
+  themselves, Accept starting on Decline with Enter = Decline and Escape =
+  later, stop/close mid-file ask starting on No; the view's switch receiver
+  and agent link moved to `actions::switch` and `actions::inbox_link`, their
+  message types re-exported by `beam-model`); then
   receiving (Accept starts on Decline), sending (OS picker), history and
   settings. **No release yet**: the core grows first; later a second download
   with `beam`, tags `gui-v*`. `spike/gui-iced` is gitignored, the testing

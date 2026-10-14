@@ -333,7 +333,9 @@ crates/beam/src/tui/
                 beam_core::actions::pair_worker, shared with the GUI
   pending.rs    the Pending tab, the Accept pop-up and the Receiving switch
   receiving.rs  the agent's receiver, run while the switch is on
+                (beam_core::actions::switch, shared with the GUI)
   inbox.rs      the link to the background agent, as `beam inbox` has it
+                (beam_core::actions::inbox_link, shared with the GUI)
   send.rs       opening the browser, and the send pop-up
   browse.rs     the file browser: places and drives, folders, filter, the disk
   sending.rs    `beam send` on a background thread

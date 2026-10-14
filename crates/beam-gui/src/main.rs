@@ -18,6 +18,10 @@ fn main() -> iced::Result {
             size: Size::new(SIZE.0, SIZE.1),
             min_size: Some(Size::new(MIN_SIZE.0, MIN_SIZE.1)),
             position: window::Position::Centered,
+            // Closing stops the Receiving switch properly first (and asks if
+            // a file is arriving): `app/receiving.rs`. Set here, not with
+            // `.exit_on_close_request`, which these settings would replace.
+            exit_on_close_request: false,
             ..window::Settings::default()
         });
     // Bundled, so nothing depends on the fonts a system happens to have.

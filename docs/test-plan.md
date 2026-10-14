@@ -694,10 +694,16 @@ without a screen (`iced_test`: find text, click by label), in
 | Remove starts on Keep (`Ask`) | `remove_starts_on_keep_so_enter_escape_and_keep_remove_nothing`, `only_a_click_on_remove_removes` |
 | Pairing (Patch #4), two windows over loopback | `two_windows_pair_and_both_save_the_other`, `enter_on_the_fingerprint_question_does_not_pair`, `pair_without_the_tick_is_a_no`, `closing_the_dialog_cancels_the_pairing` |
 | Pairing checks before the network | `this_devices_own_invite_is_refused`, `a_relay_move_starts_on_keep`, `the_code_box_takes_six_digits`; shared: `beam-core` `actions::pair::tests::a_pasted_invite_is_checked_before_any_network`, `actions::pair_worker::tests` (real pairing, unanswered = no, whose code is used up) |
+| Receiving (Patch #5), a real sender against the window's switch | `a_request_waits_and_enter_on_the_question_declines` (never opens by itself; a stray Enter answers nothing; starts on Decline; nothing saved), `a_click_on_accept_receives_the_file`, `escape_on_the_question_leaves_the_request_waiting`, `a_waiting_request_shows_on_the_rail_and_in_the_inbox` |
+| Stop or close while a file arrives | `stopping_or_closing_mid_file_asks_and_starts_on_no` |
 | Friend detail | `copy_puts_the_fingerprint_on_the_clipboard_and_says_so`, `a_friends_recent_activity_is_listed_with_its_result`, `recently_active_friends_are_grouped_first` |
 
 Not automated: how the window looks. Checked by hand on Windows 11 and on
-Arch Linux under Niri (Wayland), at full and half width.
+Arch Linux under Niri (Wayland), at full and half width. Patch #5 was also
+checked live on Windows: the switch on in the real window, a real `beam
+send` from a second beam home through the relay, the request listed (not
+opened), the Accept question opened from Review, Decline clicked; the
+sender reported "declined" and nothing was saved.
 
 ## Manual test steps
 

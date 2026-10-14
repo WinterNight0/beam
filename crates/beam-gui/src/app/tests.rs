@@ -591,3 +591,243 @@ fn the_code_box_takes_six_digits() {
         Pairing::Code { error: Some(_), .. }
     )));
 }
+
+// ---------------------------------------------------------------- Patch #5
+
+/// A window with the Receiving switch on, a paired friend (bob) who can
+/// send to it over loopback, and the folder files are saved to.
+struct Receiving {
+    _tmp: tempfile::TempDir,
+    gui: Gui,
+    store: Store,
+    downloads: std::path::PathBuf,
+    bob: Identity,
+    files: std::path::PathBuf,
+}
+
+fn receiving_window() -> Receiving {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::new(tmp.path().join("beam"));
+    store.ensure_dirs().unwrap();
+    let me = Identity::generate("alice").unwrap();
+    store.save_identity(&me, false).unwrap();
+    let bob = Identity::generate("bob").unwrap();
+    let mut known = KnownPeers::with_header();
+    known.add(Peer::new("bob", bob.verifying_key())).unwrap();
+    store.save_known_peers(&known).unwrap();
+    let downloads = tmp.path().join("downloads");
+    let files = tmp.path().join("files");
+    std::fs::create_dir_all(&downloads).unwrap();
+    std::fs::create_dir_all(&files).unwrap();
+    std::fs::write(
+        store.config_path(),
+        format!(
+            "relay = \"none\"\nport = 0\nreceive_dir = '{}'\n",
+            downloads.display()
+        ),
+    )
+    .unwrap();
+    let mut gui = Gui::for_home(store.clone());
+    gui.bind = Bind::Loopback;
+    gui.notify = false;
+    Receiving {
+        _tmp: tmp,
+        gui,
+        store,
+        downloads,
+        bob,
+        files,
+    }
+}
+
+fn tick(gui: &mut Gui, what: &str, done: impl Fn(&Gui) -> bool) {
+    for _ in 0..600 {
+        let _ = gui.update(Message::Receive(RecvMsg::Tick));
+        if done(gui) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!(
+        "never got to: {what} ({:?}, {:?})",
+        gui.requests, gui.dialog
+    );
+}
+
+/// Turns the switch on and waits until the window's link is connected.
+fn switch_on(r: &mut Receiving) {
+    let _ = r.gui.update(Message::Receive(RecvMsg::Toggle));
+    tick(&mut r.gui, "receiving and connected", |g| {
+        g.requests.switch == beam_model::requests::Switch::On
+            && g.requests.link == beam_model::requests::Link::Connected
+    });
+}
+
+/// bob sends `report.pdf` to the window's receiver, on his own thread.
+fn bob_sends(r: &Receiving) -> std::thread::JoinHandle<bool> {
+    use beam_core::agent::status::{self, Running};
+    use beam_core::transfer::{SendOptions, SilentReporter};
+    use beam_core::transport::dial::{dial_transfer, send_on};
+    use beam_core::transport::endpoint;
+    let invite = match status::read(&r.store) {
+        Running::Yes(status) => status.invite.expect("an invite"),
+        other => panic!("not receiving: {other:?}"),
+    };
+    let at = invite
+        .parse::<beam_core::invite::Invite>()
+        .unwrap()
+        .endpoint_addr();
+    let path = r.files.join("report.pdf");
+    std::fs::write(&path, b"the quarterly numbers").unwrap();
+    let bob = r.bob.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let endpoint = endpoint::bind(
+                &bob,
+                &beam_core::config::Relay::Disabled,
+                Bind::Loopback,
+                0,
+                &[],
+            )
+            .await
+            .unwrap();
+            let connection = dial_transfer(&endpoint, at).await.expect("dial");
+            let mut options = SendOptions::new(
+                path,
+                beam_core::identity::encode_public_key(&bob.verifying_key()),
+            );
+            let sent = send_on(&connection, &mut options, &mut SilentReporter)
+                .await
+                .is_ok();
+            endpoint.close().await;
+            sent
+        })
+    })
+}
+
+fn waiting_id(gui: &Gui) -> u64 {
+    gui.requests.waiting[0].id
+}
+
+/// The whole path: a paired friend sends, the request only waits (it never
+/// opens a question by itself, and Enter with nothing open answers
+/// nothing), the question starts on Decline, and Enter declines: nothing
+/// is saved.
+#[test]
+fn a_request_waits_and_enter_on_the_question_declines() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let sending = bob_sends(&r);
+    tick(&mut r.gui, "a request", |g| !g.requests.waiting.is_empty());
+    assert!(r.gui.dialog.is_none(), "a request never opens by itself");
+    let _ = r.gui.update(key(keyboard::key::Named::Enter));
+    assert_eq!(
+        r.gui.requests.waiting.len(),
+        1,
+        "a stray Enter answers nothing"
+    );
+
+    let id = waiting_id(&r.gui);
+    let _ = r.gui.update(Message::Receive(RecvMsg::Review(id)));
+    let Some(Dialog::Accept(ask)) = &r.gui.dialog else {
+        panic!("no question: {:?}", r.gui.dialog);
+    };
+    assert_eq!(ask.focus(), Choice::No, "starts on Decline");
+    assert!(shows(&r.gui, "report.pdf"));
+    assert!(shows(&r.gui, "bob"));
+    let _ = r.gui.update(key(keyboard::key::Named::Enter));
+
+    assert!(!sending.join().unwrap(), "the sender was declined");
+    assert!(r.gui.requests.waiting.is_empty());
+    assert!(
+        !r.downloads.join("report.pdf").exists(),
+        "nothing was saved"
+    );
+
+    let _ = r.gui.update(Message::Receive(RecvMsg::Toggle));
+    tick(&mut r.gui, "off", |g| {
+        g.requests.switch == beam_model::requests::Switch::Off
+    });
+}
+
+/// Only a click on Accept accepts, and then the file arrives intact.
+#[test]
+fn a_click_on_accept_receives_the_file() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let sending = bob_sends(&r);
+    tick(&mut r.gui, "a request", |g| !g.requests.waiting.is_empty());
+    let id = waiting_id(&r.gui);
+    let _ = r.gui.update(Message::Receive(RecvMsg::Review(id)));
+    let _ = r.gui.update(Message::Receive(RecvMsg::Answer(Choice::Yes)));
+    assert!(sending.join().unwrap(), "the sender was accepted");
+    assert_eq!(
+        std::fs::read(r.downloads.join("report.pdf")).unwrap(),
+        b"the quarterly numbers"
+    );
+}
+
+/// Escape on the question is "later": it closes, and the request keeps
+/// waiting for an answer (it expires as a no).
+#[test]
+fn escape_on_the_question_leaves_the_request_waiting() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let _sending = bob_sends(&r);
+    tick(&mut r.gui, "a request", |g| !g.requests.waiting.is_empty());
+    let id = waiting_id(&r.gui);
+    let _ = r.gui.update(Message::Receive(RecvMsg::Review(id)));
+    let _ = r.gui.update(key(keyboard::key::Named::Escape));
+    assert!(r.gui.dialog.is_none());
+    assert_eq!(r.gui.requests.waiting.len(), 1, "still waiting");
+    assert!(!r.downloads.join("report.pdf").exists());
+}
+
+/// While a file arrives, the switch and the close button ask first, and
+/// both questions start on the safe answer: keep receiving, stay.
+#[test]
+fn stopping_or_closing_mid_file_asks_and_starts_on_no() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store);
+    gui.requests.switch = beam_model::requests::Switch::On;
+    gui.requests.receiving = Some(beam_model::requests::Receiving {
+        done: 1,
+        total: 10,
+        relay: false,
+    });
+
+    let _ = gui.update(Message::Receive(RecvMsg::Toggle));
+    let Some(Dialog::StopReceiving(ask)) = &gui.dialog else {
+        panic!("no question: {:?}", gui.dialog);
+    };
+    assert_eq!(ask.focus(), Choice::No);
+    let _ = gui.update(key(keyboard::key::Named::Enter));
+    assert_eq!(
+        gui.requests.switch,
+        beam_model::requests::Switch::On,
+        "kept"
+    );
+
+    let id = iced::window::Id::unique();
+    let _ = gui.update(Message::Receive(RecvMsg::CloseRequested(id)));
+    let Some(Dialog::Leave(ask, _)) = &gui.dialog else {
+        panic!("no question: {:?}", gui.dialog);
+    };
+    assert_eq!(ask.focus(), Choice::No, "starts on Stay");
+    let _ = gui.update(key(keyboard::key::Named::Escape));
+    assert!(gui.dialog.is_none(), "stayed");
+}
+
+/// The Inbox count shows on the rail, and the Inbox lists the request.
+#[test]
+fn a_waiting_request_shows_on_the_rail_and_in_the_inbox() {
+    let mut r = receiving_window();
+    switch_on(&mut r);
+    let _sending = bob_sends(&r);
+    tick(&mut r.gui, "a request", |g| !g.requests.waiting.is_empty());
+    let _ = r.gui.update(Message::Page(Page::Inbox));
+    assert!(shows(&r.gui, "Waiting (1)"));
+    assert!(shows(&r.gui, "Review"));
+    assert!(shows(&r.gui, "Receiving is on"));
+}

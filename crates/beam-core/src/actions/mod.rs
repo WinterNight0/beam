@@ -9,8 +9,10 @@
 pub mod friends;
 pub mod identity;
 pub mod inbox;
+pub mod inbox_link;
 pub mod messages;
 pub mod pair;
 pub mod pair_worker;
 pub mod receive;
 pub mod send;
+pub mod switch;

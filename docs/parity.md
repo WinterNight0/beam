@@ -26,8 +26,8 @@ terminal · — not offered · *planned* not built yet.
 | Update where a friend is (a relay move needs a yes) | `beam pair <INVITE>` | ✔ Add friend | ✔ Add friend; the question starts on Keep | `actions::pair::plan_join`, `save_location` |
 | Send a file | `beam send` | ✔ `s` + file browser; ⌨ `send` | *planned*, with the OS file picker | `actions::send`, `beam-model::sending` |
 | Receive with a prompt per file | `beam listen` | ⌨ `listen` (in a terminal) | *planned* | `listener` |
-| Receive while open, without a terminal | — (use `beam listen`) | ✔ Receiving switch | *planned* | `actions::receive`, `beam-model::requests` |
-| Answer requests (Accept starts on Decline) | `beam inbox` | ✔ Pending tab | *planned* | `actions::inbox`, `beam-model::ask` |
+| Receive while open, without a terminal | — (use `beam listen`) | ✔ Receiving switch | ✔ Receiving switch (Inbox); closing asks if a file arrives | `actions::switch`, `actions::receive`, `beam-model::requests` |
+| Answer requests (Accept starts on Decline) | `beam inbox` | ✔ Pending tab | ✔ Inbox, Review; Enter declines, Escape is later | `actions::inbox_link`, `beam-model::requests`, `beam-model::ask` |
 | Background agent: enable, start, stop, status | `beam service …` | ⌨ `service …` | *planned* | `agent` |
 | Router port mapping for the agent (asks first) | `beam service port-mapping on` | ⌨ (in a terminal) | *planned* | `agent` |
 | Where received files go | `beam receive-dir` | ⌨ `receive-dir` | *planned* | `config` |

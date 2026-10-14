@@ -12,102 +12,22 @@
 //! the way `listen` stops on Ctrl+C: a sender mid-transfer is told, and what
 //! arrived is kept for a resume (ADR-0041).
 
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+//! (The receiver itself is `beam_core::actions::switch`, shared with the
+//! GUI; this module names it as the view uses it.)
 
-use beam_core::actions::receive::{self, Place};
-use beam_core::identity::Store;
-use beam_core::transport::endpoint::Bind;
-use beam_core::untrusted;
+/// The receiver while the switch is on.
+pub use beam_core::actions::switch::InView;
 
 /// What the receiving thread tells the view: the model's own message.
 pub use beam_model::requests::SwitchUpdate as RecvUpdate;
-
-/// The receiver while the switch is on.
-pub struct InView {
-    pub updates: Receiver<RecvUpdate>,
-    /// Sent (or dropped) to stop.
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl InView {
-    pub fn start(store: Store) -> Self {
-        Self::start_on(store, Bind::Any, true)
-    }
-
-    /// `Loopback` and no notifications only in tests.
-    pub(super) fn start_on(store: Store, bind: Bind, notify: bool) -> Self {
-        let (update_tx, updates) = mpsc::channel();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        std::thread::spawn(move || {
-            let why = run(&store, bind, notify, &update_tx, stopped).err();
-            let _ = update_tx.send(RecvUpdate::Stopped(why));
-        });
-        Self {
-            updates,
-            stop: Some(stop),
-        }
-    }
-
-    /// Asks it to stop; [`RecvUpdate::Stopped`] follows.
-    pub fn stop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-    }
-
-    /// Stops it and waits, so leaving beam tells a sender before the
-    /// process ends.
-    pub fn stop_and_wait(mut self, patience: Duration) {
-        self.stop();
-        let deadline = std::time::Instant::now() + patience;
-        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-            match self.updates.recv_timeout(left) {
-                Ok(RecvUpdate::Stopped(_)) | Err(_) => return,
-                Ok(_) => {}
-            }
-        }
-    }
-}
-
-fn run(
-    store: &Store,
-    bind: Bind,
-    notify: bool,
-    updates: &Sender<RecvUpdate>,
-    stopped: tokio::sync::oneshot::Receiver<()>,
-) -> Result<(), String> {
-    let fail = |e: &dyn std::fmt::Display| untrusted::lines(&e.to_string());
-    let receiver =
-        receive::prepare(store, Place::InView, bind, notify, None).map_err(|e| fail(&e))?;
-    let shown_dir = untrusted::name(&receiver.receive_dir().display().to_string());
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| fail(&e))?;
-    let result = runtime.block_on(receive::run(
-        store,
-        receiver,
-        // A drop counts as "stop" too: the view went away.
-        async {
-            let _ = stopped.await;
-        },
-        // Say "on" once it is really receiving.
-        || {
-            let _ = updates.send(RecvUpdate::Started {
-                receive_dir: shown_dir,
-            });
-        },
-    ));
-    runtime.shutdown_timeout(Duration::from_secs(1));
-    result.map_err(|e| fail(&e))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::inbox::tests::with_an_agent::home;
     use beam_core::agent::status::{self, Running};
+    use beam_core::transport::endpoint::Bind;
+    use std::time::Duration;
 
     fn next(on: &InView) -> RecvUpdate {
         on.updates

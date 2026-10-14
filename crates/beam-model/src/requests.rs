@@ -19,47 +19,12 @@ use beam_core::actions::inbox::RequestView;
 use crate::snapshot::{Agent, Owner, Snapshot};
 
 /// What the link to the receiver reports (the background agent, or this
-/// view's Receiving switch).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Update {
-    Connected {
-        receive_dir: String,
-    },
-    Request {
-        id: u64,
-        request: RequestView,
-        expires_in: Duration,
-    },
-    /// No longer waiting: answered (here or elsewhere), expired, withdrawn.
-    Closed {
-        id: u64,
-    },
-    Progress {
-        done: u64,
-        total: u64,
-        relay: bool,
-    },
-    Finished {
-        ok: bool,
-        text: String,
-    },
-    TooLate {
-        id: u64,
-    },
-    /// The link is gone: the receiver stopped, or could not be reached.
-    Gone {
-        reason: String,
-    },
-}
+/// window's Receiving switch). Defined beside the link that sends it, in
+/// `beam-core`, so the view and the GUI share one link (ADR-0048).
+pub use beam_core::actions::inbox_link::LinkUpdate as Update;
 
-/// What the Receiving switch's receiver reports.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SwitchUpdate {
-    /// Receiving, saving to this folder.
-    Started { receive_dir: String },
-    /// Not receiving any more; why, if it was not asked to stop.
-    Stopped(Option<String>),
-}
+/// What the Receiving switch's receiver reports; defined beside it.
+pub use beam_core::actions::switch::SwitchUpdate;
 
 /// A request waiting for an answer.
 #[derive(Clone, Debug, PartialEq, Eq)]

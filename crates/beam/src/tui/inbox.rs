@@ -10,106 +10,14 @@
 //! Everything a request carries is cleaned for the terminal here, once
 //! (ADR-0034): the file name comes from the sender.
 
-use std::sync::mpsc::{self, Receiver};
-
-use beam_core::actions::inbox::{Address, ConnectError, Inbox, InboxEvent};
+//! (The link itself is `beam_core::actions::inbox_link`, shared with the
+//! GUI; this module names it as the view uses it.)
 
 pub use beam_core::actions::inbox::RequestView;
+pub use beam_core::actions::inbox_link::Link as InboxLink;
 
 /// What the agent said: the model's own message (beam-model).
 pub use beam_model::requests::Update as InboxUpdate;
-
-/// A connection to the agent, on its own thread.
-pub struct InboxLink {
-    pub updates: Receiver<InboxUpdate>,
-    answers: tokio::sync::mpsc::UnboundedSender<(u64, bool)>,
-    /// Dropped with the link, which closes it.
-    _stop: tokio::sync::oneshot::Sender<()>,
-}
-
-impl InboxLink {
-    pub fn connect(port: u16, token: String) -> Self {
-        let (update_tx, updates) = mpsc::channel();
-        let (answers, answer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let reason = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => {
-                    runtime.block_on(serve(port, &token, &update_tx, answer_rx, stopped))
-                }
-                Err(e) => e.to_string(),
-            };
-            let _ = update_tx.send(InboxUpdate::Gone { reason });
-        });
-        Self {
-            updates,
-            answers,
-            _stop: stop,
-        }
-    }
-
-    /// Passes on an answer from the Accept pop-up.
-    pub fn answer(&self, id: u64, accept: bool) {
-        let _ = self.answers.send((id, accept));
-    }
-}
-
-/// Runs the link until it ends; returns why.
-async fn serve(
-    port: u16,
-    token: &str,
-    updates: &mpsc::Sender<InboxUpdate>,
-    mut answers: tokio::sync::mpsc::UnboundedReceiver<(u64, bool)>,
-    mut stopped: tokio::sync::oneshot::Receiver<()>,
-) -> String {
-    let address = Address {
-        port,
-        token: token.to_string(),
-    };
-    let (mut inbox, receive_dir) = match Inbox::connect(&address).await {
-        Ok(connected) => connected,
-        Err(ConnectError::Unreachable(e)) => {
-            return format!("could not reach the background agent: {e}");
-        }
-        Err(ConnectError::Unexpected) => {
-            return "the background agent did not answer as expected".to_string();
-        }
-    };
-    let _ = updates.send(InboxUpdate::Connected { receive_dir });
-    loop {
-        tokio::select! {
-            event = inbox.next() => {
-                let update = match event {
-                    InboxEvent::Request { id, request, expires_in } => InboxUpdate::Request {
-                        id,
-                        request: request.into(),
-                        expires_in,
-                    },
-                    InboxEvent::Closed { id } => InboxUpdate::Closed { id },
-                    InboxEvent::Progress { done, total, relay } => {
-                        InboxUpdate::Progress { done, total, relay }
-                    }
-                    InboxEvent::Finished { ok, text } => InboxUpdate::Finished { ok, text },
-                    InboxEvent::TooLate { id } => InboxUpdate::TooLate { id },
-                    InboxEvent::Stopping => return "the background agent is stopping".to_string(),
-                    InboxEvent::Gone => return "the background agent stopped".to_string(),
-                };
-                if updates.send(update).is_err() {
-                    return String::new();
-                }
-            }
-            Some((id, accept)) = answers.recv() => {
-                if !inbox.answer(id, accept).await {
-                    return "the background agent stopped".to_string();
-                }
-            }
-            _ = &mut stopped => return String::new(),
-        }
-    }
-}
 
 #[cfg(test)]
 pub(super) mod tests {

@@ -4,16 +4,17 @@
 use beam_core::history::{self, Direction, Entry, Outcome};
 use beam_core::text::format_bytes;
 use beam_model::Choice;
-use beam_model::ask::RelayMove;
-use beam_model::snapshot::{Agent, Friend, Snapshot};
+use beam_model::ask::{Incoming, RelayMove};
+use beam_model::requests::{Switch, Taken};
+use beam_model::snapshot::{Agent, Friend, Owner, Snapshot};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, row, rule, scrollable, space,
-    stack, text, text_input, tooltip,
+    button, center, checkbox, column, container, mouse_area, opaque, progress_bar, row, rule,
+    scrollable, space, stack, text, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, FillPortion, Padding};
 
-use crate::app::{Dialog, Gui, Message, Page, PairMsg, Pairing, Tone};
+use crate::app::{Dialog, Gui, Message, Page, PairMsg, Pairing, RecvMsg, Tone};
 use crate::icons;
 use crate::theme::{self, BOLD, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
 
@@ -49,13 +50,7 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
                 "Sending from this window comes in a later version.",
                 "Meanwhile, in a terminal: beam send <friend> <file>",
             ),
-            Page::Inbox => later(
-                p,
-                icons::INBOX,
-                "Inbox",
-                "Receiving in this window comes in a later version.",
-                "Meanwhile: beam listen, or the Receiving switch in the full-screen view (beam).",
-            ),
+            Page::Inbox => inbox_page(gui, snapshot),
             Page::History => later(
                 p,
                 icons::HISTORY,
@@ -96,6 +91,9 @@ pub(crate) fn window(gui: &Gui) -> Element<'_, Message> {
             }
             Dialog::Pair(state) => pairing_dialog(gui, state),
             Dialog::RelayMove(ask) => relay_dialog(p, ask.question()),
+            Dialog::Accept(ask) => accept_dialog(gui, ask.question()),
+            Dialog::StopReceiving(_) => stop_dialog(p),
+            Dialog::Leave(..) => leave_dialog(p),
         };
         // Clicks do not reach the window behind a dialog.
         layers = layers.push(opaque(center(card).style(theme::veil(p, 1.0))));
@@ -161,16 +159,28 @@ fn rail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
     // rail minus an equal gutter on both sides, its content is centred inside
     // it (a button does not centre by itself), and the selection marker is
     // drawn on top at the left edge instead of taking up room in the row.
-    let item = |glyph: char, label: &'static str, page: Page| {
+    let item = |glyph: char, label: &'static str, page: Page, count: usize| {
         let selected = gui.page == page;
+        let mut glyph_layer = stack![center(icon(glyph, 20)).width(RAIL_GLYPH).height(30)];
+        if count > 0 {
+            glyph_layer = glyph_layer.push(
+                container(
+                    container(center(
+                        text(count.to_string()).size(XS).font(BOLD).line_height(1.0),
+                    ))
+                    .width(18)
+                    .height(18)
+                    .style(theme::badge(p)),
+                )
+                .width(RAIL_GLYPH)
+                .align_right(RAIL_GLYPH),
+            );
+        }
         let body = button(
-            column![
-                center(icon(glyph, 20)).width(RAIL_GLYPH).height(30),
-                text(label).size(XS)
-            ]
-            .spacing(2)
-            .width(Fill)
-            .align_x(Alignment::Center),
+            column![glyph_layer, text(label).size(XS)]
+                .spacing(2)
+                .width(Fill)
+                .align_x(Alignment::Center),
         )
         .width(Fill)
         .padding([6, 0])
@@ -208,12 +218,17 @@ fn rail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
     container(
         column![
             container(logo).padding([14, 0]).center_x(Fill),
-            item(icons::PEOPLE, "Friends", Page::Friends),
-            item(icons::TRANSFERS, "Transfers", Page::Transfers),
-            item(icons::INBOX, "Inbox", Page::Inbox),
-            item(icons::HISTORY, "History", Page::History),
+            item(icons::PEOPLE, "Friends", Page::Friends, 0),
+            item(icons::TRANSFERS, "Transfers", Page::Transfers, 0),
+            item(
+                icons::INBOX,
+                "Inbox",
+                Page::Inbox,
+                gui.requests.waiting.len()
+            ),
+            item(icons::HISTORY, "History", Page::History, 0),
             space::vertical(),
-            item(icons::SETTINGS, "Settings", Page::Settings),
+            item(icons::SETTINGS, "Settings", Page::Settings, 0),
             container(me).padding([12, 0]).center_x(Fill),
         ]
         .spacing(4)
@@ -228,6 +243,12 @@ fn rail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
 /// Whether anything receives for this beam home, in words and a colour.
 fn receiving(p: &'static Pal, snapshot: &Snapshot) -> (&'static str, Color) {
     match &snapshot.agent {
+        Agent::Running { .. } if snapshot.owner == Owner::ThisView => {
+            ("Receiving: on (this window)", p.success)
+        }
+        Agent::Running { .. } if snapshot.owner == Owner::OtherView => {
+            ("Receiving: on (another beam window)", p.success)
+        }
         Agent::Running { .. } => ("Receiving: on (background agent)", p.success),
         Agent::Stopped => ("Receiving: off", p.warning),
         Agent::Unreadable => ("Receiving: unknown", p.faint),
@@ -577,7 +598,7 @@ fn friend_detail<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Messag
     column![
         header,
         scrollable(
-            column![stats, identity, activity]
+            column![waiting_from(gui, f), stats, identity, activity]
                 .spacing(16)
                 .padding(Padding::new(24.0).top(18.0))
         )
@@ -758,7 +779,12 @@ fn avatar<'a>(
     }
 }
 
-fn chip<'a>(p: &'static Pal, tint: Color, glyph: char, words: &'a str) -> Element<'a, Message> {
+fn chip<'a>(
+    p: &'static Pal,
+    tint: Color,
+    glyph: char,
+    words: impl text::IntoFragment<'a>,
+) -> Element<'a, Message> {
     container(
         row![icon(glyph, 10), text(words).size(XS).font(SEMIBOLD)]
             .spacing(5)
@@ -812,7 +838,7 @@ fn group_label<'a>(p: &'static Pal, label: &'a str, count: usize) -> Element<'a,
 /// A card with a title strip: the basic block of every page.
 fn section<'a>(
     p: &'static Pal,
-    title: &'a str,
+    title: impl text::IntoFragment<'a>,
     trailing: Option<Element<'a, Message>>,
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -1573,4 +1599,380 @@ fn relay_dialog<'a>(p: &'static Pal, q: &'a RelayMove) -> Element<'a, Message> {
         ]
         .spacing(8),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Receiving (GUI EX Patch #5)
+// ---------------------------------------------------------------------------
+
+fn inbox_page<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
+    let p = gui.pal();
+    let r = &gui.requests;
+    let elsewhere = r.receiving_elsewhere(snapshot);
+    let on = matches!(r.switch, Switch::On | Switch::Starting);
+    let (title, words, tint) = match (&r.switch, elsewhere) {
+        (Switch::On, _) => (
+            "Receiving is on",
+            "Friends can send to you while this window is open. You answer every file; unanswered ones count as declined after 5 minutes.".to_string(),
+            p.success,
+        ),
+        (Switch::Starting, _) => ("Starting…", "Getting ready to receive.".to_string(), p.info),
+        (Switch::Stopping, _) => (
+            "Stopping…",
+            "A sender in the middle of a file is told; what arrived is kept for a resume.".to_string(),
+            p.warning,
+        ),
+        (Switch::Failed(why), _) => ("Receiving stopped", why.clone(), p.danger),
+        (Switch::Off, Some(Taken::Agent)) => (
+            "The background agent receives",
+            "It runs without this window. Its requests show up here, and you answer them here.".to_string(),
+            p.success,
+        ),
+        (Switch::Off, Some(Taken::OtherView)) => (
+            "Another beam window receives",
+            "Its requests show up here too.".to_string(),
+            p.info,
+        ),
+        (Switch::Off, Some(Taken::Listen)) => (
+            "beam listen receives in a terminal",
+            "Answer its requests there.".to_string(),
+            p.info,
+        ),
+        (Switch::Off, None) => (
+            "Receiving is off",
+            "Turn it on to let friends send to you while this window is open, without a terminal.".to_string(),
+            p.warning,
+        ),
+    };
+    let mut about = column![
+        text(title).font(BOLD).size(LG),
+        text(words).size(MD).color(p.subtext)
+    ]
+    .spacing(4)
+    .width(Fill);
+    if let Some(Agent::Running { receive_dir }) = Some(&snapshot.agent) {
+        about = about.push(
+            row![
+                icon(icons::FOLDER, 12).color(p.subtext),
+                text(format!("Saving to {receive_dir}"))
+                    .size(SM)
+                    .color(p.subtext)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    let banner = container(
+        row![
+            container(center(icon(icons::DOWNLOAD, 18)))
+                .width(40)
+                .height(40)
+                .style(theme::icon_tile(p, tint)),
+            about,
+            tip(
+                p,
+                toggler(on)
+                    .on_toggle(|_| Message::Receive(RecvMsg::Toggle))
+                    .size(22)
+                    .style(theme::switch(p)),
+                "The Receiving switch: receive while this window is open",
+            ),
+        ]
+        .spacing(14)
+        .align_y(Alignment::Center),
+    )
+    .padding([14, 16])
+    .width(Fill)
+    .style(theme::notice(p, tint));
+
+    let mut body = column![banner].spacing(16);
+    if let Some(arriving) = &r.receiving {
+        let share = if arriving.total == 0 {
+            0.0
+        } else {
+            arriving.done as f32 / arriving.total as f32 * 100.0
+        };
+        body = body.push(section(
+            p,
+            "Arriving now",
+            None,
+            column![
+                row![
+                    text(format!(
+                        "{} of {}",
+                        format_bytes(arriving.done),
+                        format_bytes(arriving.total)
+                    ))
+                    .size(MD)
+                    .width(Fill),
+                    if arriving.relay {
+                        chip(p, p.warning, icons::GLOBE, "Relay")
+                    } else {
+                        chip(p, p.info, icons::LINK, "Direct P2P")
+                    },
+                    text(format!("{share:.0}%")).font(BOLD).size(LG),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                progress_bar(0.0..=100.0, share)
+                    .girth(6)
+                    .style(theme::progress(p, p.success)),
+            ]
+            .spacing(10),
+        ));
+    }
+    let list: Element<'_, Message> = if r.waiting.is_empty() {
+        empty(
+            p,
+            icons::INBOX,
+            "Nothing waiting",
+            "When a friend sends you a file, it waits here for your answer. It never opens by itself.",
+        )
+    } else {
+        let rows = r.waiting.iter().map(|w| {
+            let q = &w.request;
+            let urgent = w
+                .expires
+                .saturating_duration_since(std::time::Instant::now())
+                < std::time::Duration::from_secs(60);
+            let mut file = column![
+                text(&q.file_name).size(MD),
+                text(format_bytes(q.size)).size(XS).color(p.faint)
+            ];
+            if let Some(resume) = &q.resume {
+                file = file.push(text(resume).size(XS).color(p.faint));
+            }
+            row![
+                row![
+                    avatar(p, &q.peer_name, theme::tint_for(&q.fingerprint), 28.0, None),
+                    column![
+                        text(&q.peer_name).font(SEMIBOLD).size(MD),
+                        text(format!("SHA256:{}", short(&q.fingerprint)))
+                            .font(MONO)
+                            .size(XS)
+                            .color(p.faint)
+                    ]
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .width(FillPortion(3)),
+                file.width(FillPortion(4)),
+                text(crate::app::receiving::left(w.expires))
+                    .font(MONO)
+                    .size(MD)
+                    .color(if urgent { p.danger } else { p.subtext })
+                    .width(FillPortion(1)),
+                container(
+                    button(text("Review").font(SEMIBOLD).size(MD))
+                        .padding([5, 14])
+                        .style(theme::secondary(p))
+                        .on_press(Message::Receive(RecvMsg::Review(w.id)))
+                )
+                .align_right(FillPortion(2)),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+        });
+        column![
+            row![
+                column_head(p, "FROM", 3),
+                column_head(p, "FILE", 4),
+                column_head(p, "LEFT", 1),
+                space::horizontal().width(FillPortion(2)),
+            ]
+            .spacing(12),
+            column(rows).spacing(12),
+        ]
+        .spacing(10)
+        .into()
+    };
+    body = body.push(section(
+        p,
+        format!("Waiting ({})", r.waiting.len()),
+        None,
+        list,
+    ));
+    column![
+        toolbar(
+            p,
+            page_title(
+                p,
+                "Inbox",
+                "Files your friends want to send you. Every one waits for your answer."
+            )
+        ),
+        scrollable(body.padding(Padding::new(24.0).top(18.0))).height(Fill),
+    ]
+    .into()
+}
+
+/// May this friend send this file? Decline is highlighted: Enter declines,
+/// Escape decides later, and only a click on Accept accepts (rule 1).
+fn accept_dialog<'a>(gui: &'a Gui, q: &'a Incoming) -> Element<'a, Message> {
+    let p = gui.pal();
+    let r = &q.request;
+    let saved_to = match &gui.snapshot.as_ref().map(|s| &s.agent) {
+        Some(Agent::Running { receive_dir }) => format!("  ·  saved to {receive_dir}"),
+        _ => String::new(),
+    };
+    let mut file = column![
+        text(&r.file_name).font(SEMIBOLD).size(LG),
+        text(format!("{}{saved_to}", format_bytes(r.size)))
+            .size(SM)
+            .color(p.subtext),
+    ]
+    .spacing(2);
+    if let Some(resume) = &r.resume {
+        file = file.push(text(resume).size(SM).color(p.info));
+    }
+    dialog(
+        p,
+        icons::DOWNLOAD,
+        "Incoming file",
+        column![
+            row![
+                avatar(p, &r.peer_name, theme::tint_for(&r.fingerprint), 44.0, None),
+                column![
+                    text(&r.peer_name).font(BOLD).size(XL),
+                    text("wants to send you a file").size(MD).color(p.subtext),
+                ]
+                .spacing(2)
+                .width(Fill),
+                chip(
+                    p,
+                    p.subtext,
+                    icons::CLOCK,
+                    crate::app::receiving::left(q.expires)
+                ),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+            container(
+                row![
+                    container(center(icon(icons::DOCUMENT, 18)))
+                        .width(40)
+                        .height(40)
+                        .style(theme::icon_tile(p, p.accent)),
+                    file,
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .padding(12)
+            .width(Fill)
+            .style(theme::card(p)),
+            column![
+                row![
+                    icon(icons::SHIELD, 12).color(p.success),
+                    text("The key saved when you paired; beam checked it on this connection")
+                        .size(SM)
+                        .color(p.success)
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                container(
+                    text(format!("SHA256:{}", grouped(&r.fingerprint)))
+                        .font(MONO)
+                        .size(SM)
+                )
+                .padding([8, 10])
+                .width(Fill)
+                .style(theme::code_block(p)),
+            ]
+            .spacing(6),
+            text("Only accept files you are expecting. Enter declines; Escape decides later.")
+                .size(SM)
+                .color(p.subtext),
+        ]
+        .spacing(16),
+        row![
+            space::horizontal(),
+            button(text("Accept").size(MD))
+                .padding([7, 18])
+                .style(theme::secondary(p))
+                .on_press(Message::Receive(RecvMsg::Answer(Choice::Yes))),
+            button(text("Decline").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::Receive(RecvMsg::Answer(Choice::No))),
+        ]
+        .spacing(8),
+    )
+}
+
+/// A file is arriving: stop anyway? Keep receiving is the highlighted answer.
+fn stop_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+    dialog(
+        p,
+        icons::WARNING,
+        "Stop receiving?",
+        text("A file is arriving. Stopping tells the sender; what arrived so far is kept, and they can send again to resume.")
+            .size(MD),
+        row![
+            space::horizontal(),
+            button(text("Stop").size(MD))
+                .padding([7, 18])
+                .style(theme::danger(p))
+                .on_press(Message::Receive(RecvMsg::AnswerStop(Choice::Yes))),
+            button(text("Keep receiving").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::Receive(RecvMsg::AnswerStop(Choice::No))),
+        ]
+        .spacing(8),
+    )
+}
+
+/// A file is arriving: close beam anyway? Stay is the highlighted answer.
+fn leave_dialog<'a>(p: &'static Pal) -> Element<'a, Message> {
+    dialog(
+        p,
+        icons::WARNING,
+        "Close beam?",
+        text("A file is still arriving. Closing stops it; the sender is told, what arrived is kept, and they can send again to resume.")
+            .size(MD),
+        row![
+            space::horizontal(),
+            button(text("Close anyway").size(MD))
+                .padding([7, 18])
+                .style(theme::danger(p))
+                .on_press(Message::Receive(RecvMsg::AnswerLeave(Choice::Yes))),
+            button(text("Stay").font(SEMIBOLD).size(MD))
+                .padding([7, 18])
+                .style(theme::primary(p))
+                .on_press(Message::Receive(RecvMsg::AnswerLeave(Choice::No))),
+        ]
+        .spacing(8),
+    )
+}
+
+/// On a friend's page: their files waiting for an answer, with the way to
+/// answer. Nothing opens by itself.
+fn waiting_from<'a>(gui: &'a Gui, f: &'a Friend) -> Element<'a, Message> {
+    let p = gui.pal();
+    let theirs = gui.requests.from(&f.fingerprint);
+    let Some(first) = theirs.first() else {
+        return space::vertical().height(0).into();
+    };
+    let words = match theirs.len() {
+        1 => format!("{} wants to send you {}.", f.name, first.request.file_name),
+        n => format!("{} wants to send you {n} files.", f.name),
+    };
+    container(
+        row![
+            icon(icons::INBOX, 14).color(p.info),
+            text(words).size(MD).width(Fill),
+            button(text("Review").font(SEMIBOLD).size(MD))
+                .padding([5, 14])
+                .style(theme::primary(p))
+                .on_press(Message::Receive(RecvMsg::Review(first.id))),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([10, 14])
+    .width(Fill)
+    .style(theme::notice(p, p.info))
+    .into()
 }

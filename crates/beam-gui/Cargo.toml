@@ -27,3 +27,5 @@ iced.workspace = true
 [dev-dependencies]
 iced_test.workspace = true
 tempfile.workspace = true
+# Only for tests that run a real sender against the window's receiver.
+tokio.workspace = true
