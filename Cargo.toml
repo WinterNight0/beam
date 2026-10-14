@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
 # The layers, from the bottom up (ADR-0048): beam-core (core + actions),
-# beam-model (what a screen shows), then the front ends in beam (CLI +
-# full-screen view). A crate may only depend on the ones before it.
-members = ["crates/beam-core", "crates/beam-model", "crates/beam"]
+# beam-model (what a screen shows), then the front ends: beam (CLI +
+# full-screen view) and beam-gui (the desktop window, ADR-0049). A crate may
+# only depend on the ones before it; the two front ends never use each other.
+members = ["crates/beam-core", "crates/beam-model", "crates/beam", "crates/beam-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +27,11 @@ fs4 = "1.1.0"
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.4.3"
 hmac = "0.13.0"
+# Pinned exactly, as iroh is: iced is not 1.0 and every minor release breaks
+# its API. Upgrading is its own reviewed commit and short ADR. ADR-0049.
+# `tokio`: the GUI's background work runs on the same runtime as the core.
+iced = { version = "=0.14.0", features = ["tokio"] }
+iced_test = "=0.14.0"
 # Pinned exactly: iroh is the transport, and a minor bump changes how beam
 # behaves on a network. Bumping it is its own reviewed commit. ADR-0025.
 iroh = "=1.2.0"

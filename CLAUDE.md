@@ -1,5 +1,9 @@
 # Beam — Identity-Based P2P File Transfer (CLI)
 
+> **A desktop GUI is being built (ADR-0049)** on `GUI-Experimental`, in
+> `crates/beam-gui`. It is not released; `beam` (CLI + full-screen view) stays
+> the reference and ships on its own.
+
 University Software Engineering project. Beam is a terminal-only tool that sends files
 directly between two computers (peer-to-peer). File data must not be stored on or normally
 routed through any server.
@@ -67,6 +71,9 @@ beam history                   # what came and went (ADR-0043)
 - CLI: `clap` (derive).
 - Full-screen view: `ratatui` 0.30 with its `crossterm` backend (through ratatui's
   re-export), approved for ADR-0043. Plain `beam` on a terminal opens it.
+- GUI (being built, not released): `iced` `=0.14.0`, tested with `iced_test`;
+  `rfd` `=0.17.2` for OS pickers. ADR-0049, `crates/beam-gui`. Only there:
+  no other crate may list a GUI library.
 - Identity keys: Ed25519 (`ed25519-dalek`), PKCS#8 PEM via the `pkcs8` feature.
 - Pairing: `spake2` (PAKE). Check that it is maintained before adopting; propose
   alternatives if not.
@@ -123,7 +130,7 @@ needs a new Accept" a property of the design rather than a rule to remember. Res
 triggered only by running `beam send` again — no automatic reconnection, no
 `beam resume`. See ADR-0020.
 
-## Layout (ADR-0048: four layers, three crates)
+## Layout (ADR-0048: four layers; ADR-0049: the GUI is a fourth crate)
 
 ```
 crates/beam-core/      L1 core + L2 actions. No terminal or GUI library.
@@ -145,12 +152,16 @@ crates/beam/           L4 front ends: the `beam` binary
   src/tui/             the full-screen view
   src/ui.rs            terminal tables and y/N prompts
   tests/               command, two-process and terminal-injection tests
+crates/beam-gui/       L4 front end: the `beam-gui` desktop window (iced
+                       =0.14.0, ADR-0049). Being built; not released.
+  src/app.rs           state, messages, view (iced_test tests inside)
+  tests/layers.rs      depends on beam-core, beam-model, iced only
 docs/                  requirements, diagrams, test plan, design decisions
 ```
 
-A crate may only use the ones above it in this list; Cargo enforces it, and
+A crate may only use the ones above it in this list, except that the two
+front ends (`beam`, `beam-gui`) never use each other; Cargo enforces it, and
 `crates/beam-core/tests/layers.rs` keeps the core from using `actions`.
-The GUI will be another front-end crate (`beam-gui`, ADR-0049 to come).
 
 ## Adding a feature
 
@@ -273,7 +284,16 @@ In this order, each step with its tests (ADR-0048):
   job; `cargo audit` in `security.yml`, weekly too (scheduled runs start once
   it is on `main`). Later: `release.yml` with checksums, required checks.
   Branch flow: work merges into `GUI-Experimental`; `main` waits for the GUI.
-- **Next (to be planned):** the GUI (`beam-gui`, iced per SPIKE-002, ADR-0049);
+- **Post-M6 (ADR-0049, in progress)** The GUI: iced `=0.14.0` (+ `iced_test`;
+  `rfd =0.17.2` when the pickers come) in `crates/beam-gui`, on beam-core and
+  beam-model only. Built in steps on `GUI-Experimental`, "GUI EX Patch #N":
+  #1 skeleton (device + friends via `Snapshot`, Refresh); then look and shell
+  (Aero structure, rice style, from `spike/gui-iced`), friends, pairing,
+  receiving (Accept starts on Decline), sending (OS picker), history and
+  settings. **No release yet**: the core grows first; later a second download
+  with `beam`, tags `gui-v*`. `spike/gui-iced` is gitignored, the testing
+  ground; removed from the repo (kept locally) once the GUI is usable.
+- **Next (to be planned):** more core work before any GUI release;
   the path itself — why cross-network transfers stay on the relay
   (performance plan step 0). n0's public relay stays rate-limited.
 - Stretch (only if time allows): bandwidth limit, folder transfer. (The TUI and

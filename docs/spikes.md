@@ -68,9 +68,9 @@ tie-break rather than presented as a finding.
 
 ## SPIKE-002 — GUI library
 
-**Status: complete (2026-10-08), awaiting a decision. Recommendation: iced
-`=0.14.0` with `rfd` for the OS file picker. Findings in
-[`spikes/gui.md`](spikes/gui.md). Branch `GUI-Experimental`.**
+**Status: complete (2026-10-08); decided by ADR-0049 (2026-10-14): iced
+`=0.14.0` with `rfd` for the OS file picker, in `crates/beam-gui`. Findings
+in [`spikes/gui.md`](spikes/gui.md). Branch `GUI-Experimental`.**
 
 **Question:** which library should beam's GUI (a second download, after the
 CLI/TUI) be built with?

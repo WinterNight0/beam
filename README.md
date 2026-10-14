@@ -451,11 +451,12 @@ crates/beam-core/      the core and the shared actions: identity, pairing,
                        transfers, transport, the agent; send, pair, receive
 crates/beam-model/     what a screen shows; every yes/no question starts on No
 crates/beam/           the `beam` program: the CLI and the full-screen view
+crates/beam-gui/       a desktop window, being built (ADR-0049); not released
 docs/                  requirements, design decisions, test plan
 ```
 
-Each crate may only use the ones above it, and the build enforces it
-(ADR-0048). [docs/how-it-works.md §11](docs/how-it-works.md) lists every
+Each crate may only use the ones above it, the two front ends never use
+each other, and the build enforces it (ADR-0048). [docs/how-it-works.md §11](docs/how-it-works.md) lists every
 file; [docs/parity.md](docs/parity.md) says which front end offers what.
 
 Transfer speed, what has been measured and the plan to improve it:

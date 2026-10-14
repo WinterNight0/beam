@@ -1,6 +1,6 @@
 # SPIKE-002 — GUI library
 
-**Run:** 2026-10-08 · **Status:** complete, awaiting a decision · **Branch:** `GUI-Experimental`
+**Run:** 2026-10-08 · **Status:** complete; **accepted as ADR-0049** (2026-10-14) · **Branch:** `GUI-Experimental`
 
 Candidates considered: iced, Slint, egui, Tauri, JavaFX. Prototype built: **iced**.
 
@@ -80,12 +80,14 @@ modern without effort; Slint is the runner-up.
 * An iced upgrade we need costs more than a few days.
 * Then: Slint (closest to JavaFX's FXML), after checking its licence.
 
-## Next steps, if accepted
+## Next steps (accepted)
 
-1. ADR-0049 records the choice.
+1. ~~ADR-0049 records the choice~~: done, with `crates/beam-gui` started
+   (GUI EX Patch #1).
 2. ~~Split the workspace~~ and ~~move the shared flows and model out of
    `tui/`~~: done by the restructure, ADR-0048 (`beam-core` with
    `actions/`, `beam-model`, `beam`). The GUI uses the same code, and the
    same safe defaults (`beam_model::Ask`).
-3. Build the GUI first version as `crates/beam-gui`; release it separately
-   (tag `gui-v*`), bundled with the `beam` it was built with.
+3. Build the GUI in steps as `crates/beam-gui` (ADR-0049); release it
+   separately later (tag `gui-v*`), bundled with the `beam` it was built
+   with. Not before the core has grown further.

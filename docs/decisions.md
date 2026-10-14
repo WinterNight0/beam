@@ -2615,6 +2615,63 @@ reviewed patch with every test passing.
   one error for about a second on Windows only; see the test plan's "flaky
   tests".
 
+## ADR-0049 — The GUI: iced, as a fourth crate beside the CLI and the view
+
+**Status:** accepted (2026-10-14). Branch `GUI-Experimental`, GUI EX Patch #1.
+Evidence: SPIKE-002 (`docs/spikes/gui.md`), the mockups in `spike/gui-iced`.
+
+**Context.** Even the full-screen view (ADR-0043) assumes someone at ease in
+a terminal. A desktop window is for everyone else. SPIKE-002 compared iced,
+Slint, egui, Tauri and JavaFX and prototyped iced: it builds with beam's
+MSRV and lints, its `Message` → `update` → `view` is the shape the view
+already has, it opens the OS file picker through `rfd`, it is tested
+without a screen (`iced_test`), and it falls back to a software renderer.
+JavaFX (the team's experience) was ruled out because it cannot call beam's
+Rust code: every flow and safe default would be written again in Java.
+ADR-0048 then split beam so a GUI reuses the flows (`beam-core` actions)
+and the model (`beam-model`, where every yes/no question starts on No).
+
+### Decision
+
+* **iced, pinned `=0.14.0`** (with `iced_test` for tests), and **`rfd`
+  `=0.17.2`** for the OS file and folder pickers, added in the patch that
+  first uses it. Pinned exactly like iroh: iced is not 1.0, and every minor
+  release breaks its API; an upgrade is its own reviewed commit.
+* **A fourth crate, `crates/beam-gui`** (binary `beam-gui`), a front end on
+  `beam-core` and `beam-model` only. It never uses the `beam` crate or a
+  terminal library (`crates/beam-gui/tests/layers.rs`), so every flow and
+  safe default it offers is the one the CLI and the view share.
+* **Look:** Aero's structure (sidebar, panes, framed dialogs) with the rice
+  style direction (modern, dark-friendly), from the spike's mockups.
+* **Built in steps on `GUI-Experimental`** (GUI EX Patch #1, #2, …), each
+  reviewed, with `iced_test` tests: skeleton, look and shell, friends,
+  pairing, receiving, sending, history and settings. **No release yet**:
+  the core is to grow further first. When it ships, it is a second download
+  that also contains `beam`, tagged `gui-v*`; `main` gets the GUI only then.
+* The CLI stays the reference front end (ADR-0048, `docs/parity.md`); the
+  GUI may lag a feature, never weaken a rule.
+
+### Consequences
+
+* Requirement N-1 ("terminal only, no GUI") and N-2 ("a single binary") are
+  revised: the terminal front ends still need nothing else; the GUI is an
+  optional second front end.
+* About 215 more crates in `Cargo.lock` (iced's renderers and windowing).
+  None of the existing ones changed version, so the `beam` binary's tree is
+  unchanged; `security.yml` audits the new ones with the rest.
+* `cargo build`/`cargo test` over the workspace now build the GUI too, so CI
+  takes longer. Opening a real window on Arch (Wayland or X11) needs a
+  desktop, so it is a manual check; CI builds and runs the screen-free tests.
+* Memory: the spike measured 219 MB with the GPU renderer and 33 MB with
+  the software one (the skeleton: 224 MB, debug, GPU). The default is
+  decided once the real theme exists.
+* Would reopen this: iced failing on Arch in a way that cannot be
+  configured away, or an upgrade we need costing more than a few days.
+  Then Slint, after checking its licence.
+* `spike/gui-iced` stays as the testing ground until the GUI is usable; it
+  is in `.gitignore` already, and will then be removed from the repository
+  but kept locally.
+
 ## ADR-0050 — CI: when it runs, tests as an ordinary user, the minimum Rust, a weekly audit
 
 **Status:** accepted (2026-10-12). Branch `RE-Arrange-Structure`, "CI/CD

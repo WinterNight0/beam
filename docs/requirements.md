@@ -131,8 +131,8 @@ convenience loses.
 
 | ID | Requirement |
 |----|-------------|
-| N-1 | Terminal only. No GUI, no daemon the user did not start. |
-| N-2 | Runs on Windows, macOS and Linux from a single Rust binary with no runtime dependencies. |
+| N-1 | The CLI and the full-screen view need only a terminal. A desktop GUI (`beam-gui`, ADR-0049) is an optional, separate front end on the same core and model: it may lag a feature, never weaken a rule. No daemon the user did not start. *(Was "Terminal only. No GUI"; revised by ADR-0049.)* |
+| N-2 | `beam` runs on Windows, macOS and Linux as a single Rust binary with no runtime dependencies. `beam-gui` is a second binary; on Linux it also needs a Wayland or X11 desktop. |
 | N-3 | Default chunk size 4 MiB. |
 | N-4 | `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` pass before any milestone is called done. |
 | N-5 | Exit codes: 0 success, 1 error, 2 not implemented yet. |

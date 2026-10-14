@@ -568,13 +568,15 @@ What has been measured, with the benchmark that measures it, is in
 
 ## 11. Where everything lives in the code
 
-beam is built in four layers, in three crates (ADR-0048). Each layer may use
-only the ones below it, and the build enforces that: the core's crate does
-not even list a terminal or GUI library, so it cannot print or draw.
+beam is built in four layers (ADR-0048), in four crates now that the GUI
+has started (ADR-0049). Each layer may use only the ones below it, and the
+build enforces that: the core's crate does not even list a terminal or GUI
+library, so it cannot print or draw. The two front ends never use each
+other.
 
 ```
   front ends   crates/beam         the `beam` program: CLI and full-screen view
-                                   (a GUI will be another crate here)
+               crates/beam-gui     the desktop window (iced; being built)
        │ uses
   model        crates/beam-model   what a screen shows; every yes/no question
                                    starts on No
@@ -642,6 +644,11 @@ crates/beam/src/
   tui/                 the full-screen view: keys, drawing, palette, workers
   ui.rs                terminal tables and y/N prompts
 crates/beam/tests/     command, two-process and terminal-injection tests
+
+crates/beam-gui/src/   the desktop window (ADR-0049), being built
+  main.rs              entry point: opens the window
+  app.rs               state, messages and view; iced_test tests inside
+crates/beam-gui/tests/layers.rs  uses only beam-core, beam-model and iced
 docs/                  requirements, decisions (ADRs), test plan, threat model
 ```
 
