@@ -17,9 +17,9 @@ terminal · — not offered · *planned* not built yet.
 
 | Feature | CLI | View | GUI | Shared code |
 |---|---|---|---|---|
-| Create this device's identity | `beam init` | ✔ first-run welcome | *planned* | `identity` |
-| See this device: name, fingerprint, invite | `beam whoami` | ✔ header; ⌨ `whoami` | *planned* | `identity`, `listen_status` |
-| List friends, last seen | `beam peers` | ✔ Friends tab | *planned* | `beam-model::snapshot` |
+| Create this device's identity (never replaces one) | `beam init` | ✔ first-run welcome | ✔ first-run welcome | `actions::identity` |
+| See this device: name, fingerprint, invite | `beam whoami` | ✔ header; ⌨ `whoami` | ✔ Settings and status bar (invite: *planned*) | `identity`, `listen_status`, `beam-model::snapshot` |
+| List friends, last seen | `beam peers` | ✔ Friends tab | ✔ Friends page, with search | `beam-model::snapshot` |
 | Rename / remove a friend (Remove starts on Keep) | `beam rename`, `beam remove` | ✔ `r`, `x` | *planned* | `beam-model::ask` |
 | Pair by pasting an invite (fingerprint check starts on No) | `beam pair <INVITE>` | ✔ Add friend | *planned* | `actions::pair`, `beam-model::ask` |
 | Pair by showing your invite | `beam pair --wait`, `beam listen` | ✔ Show my invite | *planned* | `actions::pair` |

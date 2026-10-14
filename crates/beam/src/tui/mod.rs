@@ -391,23 +391,14 @@ fn carry_out(store: &Store, effect: Effect) -> Done {
 /// First run: makes this device's identity exactly as `beam init` does,
 /// named after the computer. Never replaces one that exists.
 fn create_identity(store: &Store) -> Done {
-    if store.has_identity() {
-        return Done::Message("This device already has its identity.".to_string());
-    }
-    let made = beam_core::identity::Identity::generate(&beam_core::identity::hostname())
-        .map_err(|e| e.to_string())
-        .and_then(|identity| {
-            store
-                .save_identity(&identity, false)
-                .map(|()| identity.short_id().grouped())
-                .map_err(|e| e.to_string())
-        });
-    match made {
-        Ok(short_id) => Done::IdentityCreated { short_id },
-        Err(e) => Done::Failed(format!(
-            "Could not create the identity: {}",
-            untrusted::text(&e)
-        )),
+    use beam_core::actions::identity::{Created, create};
+    match create(store) {
+        Ok(Created::New { short_id }) => Done::IdentityCreated { short_id },
+        Ok(Created::AlreadyThere) => {
+            Done::Message("This device already has its identity.".to_string())
+        }
+        // Already cleaned by the action.
+        Err(e) => Done::Failed(format!("Could not create the identity: {e}")),
     }
 }
 

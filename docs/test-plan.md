@@ -675,6 +675,25 @@ connected, and the time for the same file with and without the relay.
 | Kill and resume with chunks in flight | the existing `tests/end_to_end.rs` kill tests, now pipelined |
 | Throughput | `tests/throughput.rs` with `BEAM_BENCH_RTT_MS=50/100/200` |
 
+## Implemented (GUI EX): the desktop window (ADR-0049, ADR-0051)
+
+Being built on `GUI-Experimental`, not released. Tests drive the window
+without a screen (`iced_test`: find text, click by label), in
+`crates/beam-gui/src/app/tests.rs` unless noted.
+
+| Area | Tests |
+|---|---|
+| Layers | `tests/layers.rs::the_gui_depends_only_on_the_core_the_model_and_iced` |
+| Bundled icons | `icons::tests::every_icon_is_in_the_bundled_font` (parses the font's `cmap`) |
+| First run | `a_first_run_creates_the_identity_once`, `a_device_with_an_identity_is_not_offered_a_new_one`; the rule itself: `beam-core` `actions::identity::tests::an_existing_identity_is_never_replaced` |
+| Friends | `the_friends_are_listed_and_the_first_is_shown`, `clicking_a_friend_shows_them`, `search_narrows_the_list`, `a_refresh_picks_up_changes_made_in_a_terminal` |
+| Shell | `the_rail_changes_the_page`, `the_theme_switches_between_midnight_and_daylight`, `the_status_bar_says_whether_anything_receives`, `the_relay_is_shown_by_its_host` |
+| Narrow windows (tiling compositors ignore the minimum size) | `a_narrow_window_keeps_the_status_bar_to_one_line` |
+| Avatar colours | `a_friends_colour_comes_from_their_fingerprint` |
+
+Not automated: how the window looks. Checked by hand on Windows 11 and on
+Arch Linux under Niri (Wayland), at full and half width.
+
 ## Manual test steps
 
 Some things cannot honestly be covered by an automated test on one machine.

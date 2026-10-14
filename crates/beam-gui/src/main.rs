@@ -1,21 +1,28 @@
-//! beam's desktop window (ADR-0049).
-//!
-//! A front end like the CLI and the full-screen view: it draws what
-//! `beam-model` holds and runs the flows in `beam-core`'s `actions`, and
-//! keeps only its own layout, clicks and words. Every rule that keeps beam
-//! safe is enforced below it, so this crate cannot weaken one.
-//!
-//! Being built in steps on `GUI-Experimental`; not released yet.
+//! Opens beam's desktop window (ADR-0049). Everything else is in the
+//! library: `beam_gui::app` (state), `view` (drawing), `theme`, `icons`.
 
 // No console window behind the GUI on Windows (release builds only, so a
 // debug build still shows panics).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
+use beam_gui::app::{Gui, MIN_SIZE, SIZE};
+use iced::{Size, window};
 
 fn main() -> iced::Result {
-    iced::application(app::Gui::boot, app::Gui::update, app::Gui::view)
+    let mut app = iced::application(Gui::boot, Gui::update, Gui::view)
         .title("beam")
-        .window_size((900.0, 560.0))
-        .run()
+        .theme(Gui::theme)
+        .subscription(Gui::subscription)
+        .default_font(beam_gui::theme::FONT)
+        .window(window::Settings {
+            size: Size::new(SIZE.0, SIZE.1),
+            min_size: Some(Size::new(MIN_SIZE.0, MIN_SIZE.1)),
+            position: window::Position::Centered,
+            ..window::Settings::default()
+        });
+    // Bundled, so nothing depends on the fonts a system happens to have.
+    for font in beam_gui::fonts::ALL {
+        app = app.font(font);
+    }
+    app.run()
 }

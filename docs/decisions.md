@@ -2735,3 +2735,48 @@ a repository setting once CI is green; no new security tools.
   keeps the total about the same.
 * Supersedes the "every push and pull request" trigger of ADR-0014 and the
   root rule of ADR-0046; both are otherwise unchanged.
+
+## ADR-0051 — The GUI's fonts and icons are bundled: Inter, JetBrains Mono, Fluent UI System Icons
+
+**Status:** accepted (2026-10-14). GUI EX Patch #2. Assets:
+`crates/beam-gui/assets/` (sources, versions and how to rebuild in its
+`README.md`; licence texts in `LICENSES/`).
+
+**Context.** The enterprise mock-up (SPIKE-002) drew with fonts and icons
+borrowed from Windows: Segoe UI, Cascadia Mono, Segoe MDL2 Assets. Arch has
+none of them, so the same window would show a fallback font and empty boxes
+for icons. beam must look the same on both platforms (ADR-0046), and
+nothing it draws should depend on what a system has installed.
+
+### Decision
+
+* **Bundle three open asset sets** into `beam-gui` with `include_bytes!`,
+  registered with iced at start-up; nothing is fetched at run time:
+
+  | Use | Asset | Licence |
+  |---|---|---|
+  | Interface text | **Inter 4.1** (Regular, SemiBold, Bold) | SIL OFL 1.1 |
+  | Fingerprints, invites, paths | **JetBrains Mono 2.304** (Regular): `0`/`O` and `1`/`l` clearly differ, which matters when people read fingerprints aloud to compare them | SIL OFL 1.1 |
+  | Icons | **Fluent UI System Icons** (Regular, Microsoft), as a font so iced draws icons as text with no extra feature | MIT |
+
+* **The icon font is cut down** to the glyphs `src/icons.rs` names (32;
+  2.8 MB → under 7 KB), with fontTools as a one-off development tool, not a
+  dependency. `icons::tests::every_icon_is_in_the_bundled_font` parses the
+  bundled font and fails if an icon is missing from it.
+* Assets are treated like dependencies: an MIT-compatible licence, the
+  licence text committed beside them, and approval before one is added.
+* Chosen in the spike and checked on Windows 11 and on Arch Linux under
+  Niri (Wayland), where the window also showed that a tiling compositor
+  ignores the minimum window size: the layout adapts to the width instead.
+
+### Consequences
+
+* About 1.5 MB of fonts in the `beam-gui` binary; `beam` is unchanged.
+* The fonts are unmodified OFL files; OFL allows bundling them in software
+  of any licence, and forbids only selling the fonts on their own.
+* A new icon means a rebuilt subset (`assets/README.md`); the test says so
+  if it is forgotten.
+* The fonts are parsed by iced's text stack from bytes compiled into the
+  binary, never from a file a peer or a download could supply.
+* Still to come, each needing its own decision: beam's logo and the app
+  icons (window, `.exe`, Linux), part of the release work.

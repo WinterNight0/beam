@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "beam_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "beam-gui"
 path = "src/main.rs"

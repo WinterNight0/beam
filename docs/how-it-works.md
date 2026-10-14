@@ -619,6 +619,7 @@ crates/beam-core/src/
     receive.rs         the agent's settings, for beam agent and the switch
     inbox.rs           the link to a running agent; cleaned requests
     messages.rs        what beam says when a send cannot go ahead
+    identity.rs        first run: make this device's identity, never replace it
 crates/beam-core/tests/  integration and security tests of the core;
                        layers.rs (the layers), no_n0_discovery.rs (S-17)
 
@@ -647,7 +648,12 @@ crates/beam/tests/     command, two-process and terminal-injection tests
 
 crates/beam-gui/src/   the desktop window (ADR-0049), being built
   main.rs              entry point: opens the window
-  app.rs               state, messages and view; iced_test tests inside
+  lib.rs               the bundled fonts; the modules below
+  app.rs               state and messages (tests in app/tests.rs, iced_test)
+  view.rs              what is drawn: rail, friends, settings, status bar
+  theme.rs             the design system: Midnight and Daylight palettes
+  icons.rs             the icons, by codepoint in the bundled icon font
+crates/beam-gui/assets/  Inter, JetBrains Mono, Fluent icons (subset); LICENSES/
 crates/beam-gui/tests/layers.rs  uses only beam-core, beam-model and iced
 docs/                  requirements, decisions (ADRs), test plan, threat model
 ```

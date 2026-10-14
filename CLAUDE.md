@@ -73,7 +73,10 @@ beam history                   # what came and went (ADR-0043)
   re-export), approved for ADR-0043. Plain `beam` on a terminal opens it.
 - GUI (being built, not released): `iced` `=0.14.0`, tested with `iced_test`;
   `rfd` `=0.17.2` for OS pickers. ADR-0049, `crates/beam-gui`. Only there:
-  no other crate may list a GUI library.
+  no other crate may list a GUI library. Fonts and icons are bundled
+  (ADR-0051): Inter, JetBrains Mono (OFL), Fluent UI System Icons (MIT,
+  subset to the glyphs in `icons.rs`); a new asset is approved like a
+  dependency.
 - Identity keys: Ed25519 (`ed25519-dalek`), PKCS#8 PEM via the `pkcs8` feature.
 - Pairing: `spake2` (PAKE). Check that it is maintained before adopting; propose
   alternatives if not.
@@ -141,7 +144,8 @@ crates/beam-core/      L1 core + L2 actions. No terminal or GUI library.
   src/transfer/        protocol messages, state machine, chunking, resume, integrity
   src/listener.rs      `listen` as a service; src/agent/ the background agent
   src/history.rs, config.rs, untrusted.rs, text.rs
-  src/actions/         one copy of each flow: send, pair, receive, inbox, messages
+  src/actions/         one copy of each flow: send, pair, receive, inbox, messages,
+                       identity (first-run create, never replaces)
   tests/               core integration and security tests; tests/layers.rs
 crates/beam-model/     L3 what a screen shows: snapshot, requests, sending,
                        ask (every yes/no question starts on No). Depends on
@@ -154,7 +158,10 @@ crates/beam/           L4 front ends: the `beam` binary
   tests/               command, two-process and terminal-injection tests
 crates/beam-gui/       L4 front end: the `beam-gui` desktop window (iced
                        =0.14.0, ADR-0049). Being built; not released.
-  src/app.rs           state, messages, view (iced_test tests inside)
+  src/app.rs           state and messages; app/tests.rs (iced_test)
+  src/view.rs          drawing: rail, panes, status bar, pages
+  src/theme.rs         design system (Midnight/Daylight); icons.rs
+  assets/              bundled fonts + LICENSES (ADR-0051)
   tests/layers.rs      depends on beam-core, beam-model, iced only
 docs/                  requirements, diagrams, test plan, design decisions
 ```
@@ -287,8 +294,10 @@ In this order, each step with its tests (ADR-0048):
 - **Post-M6 (ADR-0049, in progress)** The GUI: iced `=0.14.0` (+ `iced_test`;
   `rfd =0.17.2` when the pickers come) in `crates/beam-gui`, on beam-core and
   beam-model only. Built in steps on `GUI-Experimental`, "GUI EX Patch #N":
-  #1 skeleton (device + friends via `Snapshot`, Refresh); then look and shell
-  (Aero structure, rice style, from `spike/gui-iced`), friends, pairing,
+  #1 skeleton (device + friends via `Snapshot`, Refresh); #2 assets and shell
+  (ADR-0051; theme from the enterprise mock-up; rail, friends list + identity,
+  status bar, Midnight/Daylight, first-run create via `actions::identity`,
+  width-aware layout for tiling compositors); then friends, pairing,
   receiving (Accept starts on Decline), sending (OS picker), history and
   settings. **No release yet**: the core grows first; later a second download
   with `beam`, tags `gui-v*`. `spike/gui-iced` is gitignored, the testing
