@@ -20,6 +20,16 @@ user rather than root, so permission checks mean something) and with
 on every pull request into `main` or `GUI-Experimental`, every push to
 `main`, and by hand, so the gate is enforced rather than remembered.
 
+```
+gh workflow run ci.yml --ref <branch>       # CI by hand (works once ci.yml is on main)
+gh run list --workflow ci.yml --limit 5     # recent runs
+gh run view <id> --log-failed               # what failed, every failing test
+```
+
+The dependency audit is a separate workflow, `security.yml`, which also runs
+weekly. The checklist for a merge into `main` or a release is under "Manual
+test steps" below.
+
 ## Test levels
 
 | Level | Where | What it covers |
@@ -718,6 +728,54 @@ echo y | beam listen --addr 127.0.0.1:7777
 
 Expected: the piped `y` is discarded and the prompt still waits. Answering a
 question you have not seen is exactly what S-1 forbids.
+
+### Before a merge into `main` or a release
+
+The restructure (ADR-0048) was checked this way before its merge; the GUI's
+merge into `main` and every release go through the same list.
+
+**Automatic (CI, ADR-0050)**, on the pull request:
+
+- [ ] `check (Windows)`, `check (Arch Linux)` (tests as user `builder`) and
+      `check (Rust 1.91, the minimum)` green; read the test counts, not only
+      the colour (`gh run view <id> --log` and look for `test result:`).
+- [ ] `Security` (`cargo audit`) green.
+- [ ] A failed run: `gh run view <id> --log-failed`. Tests run with
+      `--no-fail-fast`, so the log lists every failing test at once.
+- [ ] For a change meant to keep behaviour (a refactor): the same commands
+      run on a build of `main` and of the branch, with identical copies of one
+      beam home, and the outputs diffed (as for ADR-0048: 94 CLI scenarios plus
+      live pair and send flows, identical apart from masked ports, codes and
+      timings).
+
+**By hand, CLI** (two beam homes or two machines):
+
+- [ ] `beam init`; `beam whoami` while `listen` runs shows the invite and code.
+- [ ] `beam listen` + `beam pair <INVITE> --name …`; both see both fingerprints.
+- [ ] `beam send <friend> <file>`: the prompt shows name, fingerprint, file and
+      size; the file arrives intact.
+- [ ] Declining, and letting a request expire: nothing saved on either side.
+- [ ] Killing a send midway, sending again: it resumes and asks Accept again.
+- [ ] `beam peers`, `beam rename`, `beam remove`; `beam history`;
+      `beam receive-dir`.
+- [ ] `beam service enable`, a send to the agent, `beam inbox`,
+      `beam service disable`.
+- [ ] Pairing from an invite with a different relay asks before saving it.
+
+**By hand, full-screen view** (`beam`):
+
+- [ ] Welcome card on a fresh home; Create it makes the identity once.
+- [ ] Friends: rename; remove (the pop-up starts on No).
+- [ ] Add friend: code pop-up; the fingerprint check starts on No.
+- [ ] Pending: the Receiving switch on and off; the Accept pop-up starts on
+      Decline.
+- [ ] Send with the file browser; hide; cancel; quitting mid-send asks.
+- [ ] History tab; the command palette (`:` or Ctrl+P).
+- [ ] Classic console (`conhost`): paste, and `m` toggles the mouse.
+
+**By hand, GUI** (`beam-gui`, once it ships; ADR-0049): the same flows as the
+view, plus opening the window on Arch under Wayland and under X11, which CI
+cannot do.
 
 ## Known gaps
 
