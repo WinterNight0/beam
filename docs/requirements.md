@@ -131,14 +131,15 @@ convenience loses.
 
 | ID | Requirement |
 |----|-------------|
-| N-1 | Terminal only. No GUI, no daemon the user did not start. |
-| N-2 | Runs on Windows, macOS and Linux from a single Rust binary with no runtime dependencies. |
+| N-1 | The CLI and the full-screen view need only a terminal. A desktop GUI (`beam-gui`, ADR-0049) is an optional, separate front end on the same core and model: it may lag a feature, never weaken a rule. No daemon the user did not start. *(Was "Terminal only. No GUI"; revised by ADR-0049.)* |
+| N-2 | `beam` runs on Windows, macOS and Linux as a single Rust binary with no runtime dependencies. `beam-gui` is a second binary; on Linux it also needs a Wayland or X11 desktop. |
 | N-3 | Default chunk size 4 MiB. |
 | N-4 | `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` pass before any milestone is called done. |
 | N-5 | Exit codes: 0 success, 1 error, 2 not implemented yet. |
 | N-6 | Nicknames are local labels. There is no global username registry, and a peer is not notified when it is renamed. |
 | N-8 | Throughput is measured with `tests/throughput.rs` (release build) before and after any change meant to affect it, and the numbers are recorded in `docs/performance-plan.md` (ADR-0039). |
 | N-7 | Free space is checked before the Accept prompt, on the volume holding partials and — when it differs — the destination volume, counting only the bytes still missing plus a small margin. Too little space is refused clearly rather than discovered part-way through. |
+| N-9 | The code is layered (ADR-0048): the core keeps every security rule and uses no terminal or GUI library; each flow a person runs is written once (`beam-core/src/actions`) for every front end; every yes/no question that could accept, pair, remove, move a relay or stop a transfer starts on No by construction (`beam_model::Ask`). The build and `tests/layers.rs` enforce it. |
 
 ## 5. Implementation language
 

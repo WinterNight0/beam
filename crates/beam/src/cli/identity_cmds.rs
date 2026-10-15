@@ -3,10 +3,10 @@
 use serde::Serialize;
 
 use super::{App, CommandError, Io};
-use crate::identity::{Identity, KEY_TYPE, Peer, PeerError, StoreError, encode_public_key};
-use crate::listen_status::{self, ListenStatus, Listening, PairingStatus};
-use crate::pairing::PairingCode;
 use crate::ui;
+use beam_core::identity::{Identity, KEY_TYPE, Peer, PeerError, StoreError, encode_public_key};
+use beam_core::listen_status::{self, ListenStatus, Listening, PairingStatus};
+use beam_core::pairing::PairingCode;
 
 /// The `--json` shape of `beam whoami` and `beam init`.
 #[derive(Serialize)]
@@ -80,7 +80,7 @@ impl App {
             )));
         }
 
-        let hostname = hostname();
+        let hostname = beam_core::identity::hostname();
         let identity = Identity::generate(&hostname).map_err(|e| StoreError::Key {
             path: self.store.private_key_path(),
             source: e,
@@ -107,7 +107,7 @@ impl App {
     pub(super) fn whoami(&self, io: &mut Io<'_>) -> Result<(), CommandError> {
         let identity = self.store.load_identity()?;
         let listening = listen_status::read(&self.store);
-        let agent = crate::agent::status::read(&self.store);
+        let agent = beam_core::agent::status::read(&self.store);
 
         if self.json {
             let mut json = self.self_json(&identity);
@@ -117,15 +117,15 @@ impl App {
                 Listening::No => ListeningJson::No(()),
             });
             json.agent = Some(match agent {
-                crate::agent::status::Running::Yes(status) => AgentJson {
+                beam_core::agent::status::Running::Yes(status) => AgentJson {
                     running: true,
                     receive_dir: Some(status.receive_dir),
                 },
-                crate::agent::status::Running::Unreadable => AgentJson {
+                beam_core::agent::status::Running::Unreadable => AgentJson {
                     running: true,
                     receive_dir: None,
                 },
-                crate::agent::status::Running::No => AgentJson {
+                beam_core::agent::status::Running::No => AgentJson {
                     running: false,
                     receive_dir: None,
                 },
@@ -145,7 +145,7 @@ impl App {
         ui::field(io.out, "Directory", &self.store.dir().display().to_string())?;
         writeln!(io.out)?;
         show_listening(io, &listening)?;
-        if let crate::agent::status::Running::Yes(status) = agent {
+        if let beam_core::agent::status::Running::Yes(status) = agent {
             let who = if status.in_view {
                 "beam's full-screen view is receiving (until it closes)"
             } else {
@@ -155,7 +155,7 @@ impl App {
                 io.out,
                 "{who}: paired devices can send files, which you answer in the view's Pending \
                  tab or with `beam inbox`.\nIt saves them to {}.",
-                crate::untrusted::name(&status.receive_dir)
+                beam_core::untrusted::name(&status.receive_dir)
             )?;
         }
         self.warn_permissions(io);
@@ -201,9 +201,8 @@ impl App {
         new_name: &str,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let mut known = self.store.load_known_peers()?;
-        known.rename(old_name, new_name)?;
-        self.store.save_known_peers(&known)?;
+        beam_core::actions::friends::rename(&self.store, old_name, new_name)
+            .map_err(friend_error)?;
         writeln!(io.out, "Renamed {old_name} to {new_name}.")?;
         Ok(())
     }
@@ -214,7 +213,7 @@ impl App {
         assume_yes: bool,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let mut known = self.store.load_known_peers()?;
+        let known = self.store.load_known_peers()?;
         let peer = known
             .lookup(name)
             .ok_or_else(|| PeerError::NotFound(name.to_string()))?;
@@ -231,10 +230,17 @@ impl App {
             }
         }
 
-        known.remove(&peer_name)?;
-        self.store.save_known_peers(&known)?;
+        beam_core::actions::friends::remove(&self.store, &peer_name).map_err(friend_error)?;
         writeln!(io.out, "Removed {peer_name}.")?;
         Ok(())
+    }
+}
+
+/// The shared action's error, as the command has always reported it.
+fn friend_error(e: beam_core::actions::friends::FriendError) -> CommandError {
+    match e {
+        beam_core::actions::friends::FriendError::Store(e) => e.into(),
+        beam_core::actions::friends::FriendError::Peer(e) => e.into(),
     }
 }
 
@@ -253,19 +259,6 @@ pub(super) fn write_json<T: Serialize>(io: &mut Io<'_>, value: &T) -> Result<(),
     let text = serde_json::to_string_pretty(value)?;
     writeln!(io.out, "{text}")?;
     Ok(())
-}
-
-/// A best-effort machine name for the public key comment. It is cosmetic, so a
-/// missing value is not an error.
-pub(crate) fn hostname() -> String {
-    for key in ["COMPUTERNAME", "HOSTNAME"] {
-        if let Ok(name) = std::env::var(key)
-            && !name.trim().is_empty()
-        {
-            return name;
-        }
-    }
-    String::new()
 }
 
 /// The part of `whoami` about a running `listen`: its invite and the pairing

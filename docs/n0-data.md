@@ -51,7 +51,7 @@ project controlled. ADR-0036 then removed the need for any lookup: the first
 meeting uses an invite the person pastes, and after that a peer is dialled by
 its key through its relay. Nothing is published anywhere.
 
-`tests/no_n0_discovery.rs` enforces this: it fails if any beam source file
+`crates/beam-core/tests/no_n0_discovery.rs` enforces this: it fails if any beam source file
 uses `presets::N0`, a pkarr or DNS address lookup, or n0's default relay map.
 
 In code, the difference is which preset the endpoint is built with:

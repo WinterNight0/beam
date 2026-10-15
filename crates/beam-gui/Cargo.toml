@@ -1,0 +1,32 @@
+[package]
+name = "beam-gui"
+description = "beam's desktop window: a front end on beam-core and beam-model, beside the CLI and the full-screen view"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "beam_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beam-gui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+# The core, the model and the GUI library: never the `beam` crate (the other
+# front end) or a terminal library (ADR-0048, ADR-0049).
+[dependencies]
+beam-core.workspace = true
+beam-model.workspace = true
+iced.workspace = true
+rfd.workspace = true
+
+[dev-dependencies]
+iced_test.workspace = true
+tempfile.workspace = true
+# Only for tests that run a real sender against the window's receiver.
+tokio.workspace = true

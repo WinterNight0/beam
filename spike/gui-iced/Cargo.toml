@@ -1,0 +1,29 @@
+# Detached from the main workspace on purpose: a spike must not be able to
+# change what the product builds. SPIKE-002.
+[workspace]
+
+[package]
+name = "gui-iced-spike"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[dependencies]
+# The real core: the window lists the real friends from ~/.beam.
+beam-core = { path = "../../crates/beam-core" }
+# Pinned exactly, as iroh is: iced is not 1.0 and every minor release breaks.
+iced = { version = "=0.14.0", features = ["tokio", "canvas"] }
+rfd = "=0.17.2"
+
+[dev-dependencies]
+iced_test = "=0.14.0"
+
+[profile.release]
+strip = true

@@ -12,21 +12,23 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beam::config::Relay;
-use beam::identity::{Identity, Peer, Store};
-use beam::listener::{ListenEvent, ListenOptions, run};
-use beam::pairing::{
+use beam_core::config::Relay;
+use beam_core::identity::{Identity, Peer, Store};
+use beam_core::listener::{ListenEvent, ListenOptions, run};
+use beam_core::pairing::{
     Confirm, ConfirmRequest, Network, PairError, Pairing, PairingCode, PairingError, Policy,
     Timeouts, join,
 };
-use beam::transfer::frame::{read_message, write_message};
-use beam::transfer::message::{ChunkStart, Message, RejectReason, TransferId, TransferRequest};
-use beam::transfer::{
+use beam_core::transfer::frame::{read_message, write_message};
+use beam_core::transfer::message::{
+    ChunkStart, Message, RejectReason, TransferId, TransferRequest,
+};
+use beam_core::transfer::{
     Progress, Prompt, PromptRequest, Reporter, SendOptions, SilentReporter, TransferError,
 };
-use beam::transport::PathKind;
-use beam::transport::dial::{DialError, dial, send_on};
-use beam::transport::endpoint::{self, Bind, XFER_ALPN};
+use beam_core::transport::PathKind;
+use beam_core::transport::dial::{DialError, dial, send_on};
+use beam_core::transport::endpoint::{self, Bind, XFER_ALPN};
 use iroh::EndpointAddr;
 use tokio::sync::mpsc;
 
@@ -245,7 +247,7 @@ async fn send(
     bytes: &[u8],
     tweak: impl FnOnce(&mut SendOptions),
     reporter: &mut impl Reporter,
-) -> Result<beam::transfer::SendSummary, TransferError> {
+) -> Result<beam_core::transfer::SendSummary, TransferError> {
     let path = from.files.join(name);
     std::fs::write(&path, bytes).unwrap();
     let endpoint = endpoint::bind(&from.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
@@ -254,7 +256,7 @@ async fn send(
     let connection = dial(&endpoint, to.at(), XFER_ALPN).await.expect("dial");
     let mut options = SendOptions::new(
         path,
-        beam::identity::encode_public_key(&from.identity.verifying_key()),
+        beam_core::identity::encode_public_key(&from.identity.verifying_key()),
     );
     tweak(&mut options);
     let result = send_on(&connection, &mut options, reporter).await;
@@ -304,8 +306,8 @@ async fn a_paired_peer_sends_a_file_over_iroh() {
 /// `XFER_ALPN`.)
 #[tokio::test]
 async fn the_transfer_protocol_version_is_agreed_and_sets_the_window() {
-    use beam::transport::dial::{dial_transfer, window_for};
-    use beam::transport::endpoint::XFER_ALPN_V2;
+    use beam_core::transport::dial::{dial_transfer, window_for};
+    use beam_core::transport::endpoint::XFER_ALPN_V2;
 
     let (alice, bob) = (home("alice"), home("bob"));
     pair_by_hand(&alice, "bob", &bob, "alice");
@@ -316,7 +318,10 @@ async fn the_transfer_protocol_version_is_agreed_and_sets_the_window() {
 
     let current = dial_transfer(&endpoint, bob.at()).await.expect("dial");
     assert_eq!(current.alpn(), XFER_ALPN_V2);
-    assert_eq!(window_for(current.alpn()), beam::transfer::PIPELINE_WINDOW);
+    assert_eq!(
+        window_for(current.alpn()),
+        beam_core::transfer::PIPELINE_WINDOW
+    );
 
     // An old receiver: knows only version 1.
     let old = home("old");
@@ -457,7 +462,8 @@ async fn a_paired_device_claiming_another_ones_key_is_refused() {
         "forged.bin",
         &payload(10),
         |o| {
-            o.sender_public_key = beam::identity::encode_public_key(&alice.identity.verifying_key())
+            o.sender_public_key =
+                beam_core::identity::encode_public_key(&alice.identity.verifying_key())
         },
         &mut SilentReporter,
     )
@@ -487,12 +493,12 @@ async fn data_before_accept_is_discarded() {
     let data = payload(1000);
     let request = TransferRequest {
         transfer_id: TransferId::generate().unwrap(),
-        sender_public_key: beam::identity::encode_public_key(&alice.identity.verifying_key()),
+        sender_public_key: beam_core::identity::encode_public_key(&alice.identity.verifying_key()),
         file_name: "pushy.bin".into(),
         size: data.len() as u64,
         chunk_size: 1000,
         chunk_count: 1,
-        file_sha256: beam::transfer::sha256_hex(&data),
+        file_sha256: beam_core::transfer::sha256_hex(&data),
     };
     write_message(&mut send, &Message::TransferRequest(request))
         .await
@@ -503,7 +509,7 @@ async fn data_before_accept_is_discarded() {
         &Message::ChunkStart(ChunkStart {
             index: 0,
             len: data.len() as u32,
-            sha256: beam::transfer::sha256_hex(&data),
+            sha256: beam_core::transfer::sha256_hex(&data),
         }),
     )
     .await
@@ -556,7 +562,7 @@ async fn an_interrupted_transfer_resumes_with_a_new_accept() {
             let connection = dial(&endpoint, bob_at, XFER_ALPN).await.unwrap();
             let mut options = SendOptions::new(
                 &path,
-                beam::identity::encode_public_key(&identity.verifying_key()),
+                beam_core::identity::encode_public_key(&identity.verifying_key()),
             );
             options.chunk_size = 10_000;
             let mut signal = SignalAfter(5, Some(progressed));
@@ -686,10 +692,10 @@ async fn join_listener(
     listener: &Home,
     code: PairingCode,
     answer: bool,
-) -> Result<beam::pairing::Paired, PairError> {
+) -> Result<beam_core::pairing::Paired, PairError> {
     let known = joiner.store.load_known_peers().unwrap();
     let network = network();
-    let invite = beam::invite::Invite::new(&listener.at());
+    let invite = beam_core::invite::Invite::new(&listener.at());
     let pairing = Pairing {
         identity: &joiner.identity,
         known: &known,
@@ -997,12 +1003,14 @@ async fn a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send() {
     let data = payload(1000);
     let request = TransferRequest {
         transfer_id: TransferId::generate().unwrap(),
-        sender_public_key: beam::identity::encode_public_key(&mallory.identity.verifying_key()),
+        sender_public_key: beam_core::identity::encode_public_key(
+            &mallory.identity.verifying_key(),
+        ),
         file_name: "held.bin".into(),
         size: data.len() as u64,
         chunk_size: 1000,
         chunk_count: 1,
-        file_sha256: beam::transfer::sha256_hex(&data),
+        file_sha256: beam_core::transfer::sha256_hex(&data),
     };
     write_message(&mut send, &Message::TransferRequest(request))
         .await
@@ -1041,7 +1049,7 @@ async fn a_paired_peer_holding_the_slot_is_dropped_and_the_next_can_send() {
 async fn send_file_as(
     from: &Home,
     to: &Home,
-) -> Result<beam::transfer::SendSummary, TransferError> {
+) -> Result<beam_core::transfer::SendSummary, TransferError> {
     send(
         from,
         to,
@@ -1110,7 +1118,7 @@ mod impersonation {
         let prompt = Script::default().transfers(&[true]);
         let mut listening = listen(&bob, prompt.clone(), options(&bob, Policy::default())).await;
 
-        let alices_key = beam::identity::encode_public_key(&alice.identity.verifying_key());
+        let alices_key = beam_core::identity::encode_public_key(&alice.identity.verifying_key());
         let sent = send(
             &attacker,
             &bob,
@@ -1210,7 +1218,7 @@ impl Reporter for FirstChunk {
 
 /// How many chunks bob's partials hold, read from disk.
 fn chunks_kept(home: &Home) -> u32 {
-    beam::transfer::PartialStore::new(home.store.tmp_path())
+    beam_core::transfer::PartialStore::new(home.store.tmp_path())
         .list(Duration::from_secs(3600))
         .unwrap()
         .iter()
@@ -1232,7 +1240,7 @@ async fn stopping_listen_mid_transfer_tells_the_sender_and_keeps_what_arrived() 
     let (identity, store) = (bob.identity.clone(), bob.store.clone());
     let opts = options(&bob, Policy::default());
     let task = tokio::spawn(async move {
-        let _ = beam::listener::run_until(
+        let _ = beam_core::listener::run_until(
             identity,
             store,
             network(),
@@ -1267,12 +1275,12 @@ async fn stopping_listen_mid_transfer_tells_the_sender_and_keeps_what_arrived() 
             let endpoint = endpoint::bind(&identity, &Relay::Disabled, Bind::Loopback, 0, &[])
                 .await
                 .unwrap();
-            let connection = beam::transport::dial::dial_transfer(&endpoint, at)
+            let connection = beam_core::transport::dial::dial_transfer(&endpoint, at)
                 .await
                 .unwrap();
             let mut options = SendOptions::new(
                 path,
-                beam::identity::encode_public_key(&identity.verifying_key()),
+                beam_core::identity::encode_public_key(&identity.verifying_key()),
             );
             options.chunk_size = 1024 * 1024;
             let result = send_on(&connection, &mut options, &mut SilentReporter).await;
@@ -1330,13 +1338,13 @@ async fn a_sender_stopped_mid_transfer_is_reported_as_such_by_listen() {
     let endpoint = endpoint::bind(&alice.identity, &Relay::Disabled, Bind::Loopback, 0, &[])
         .await
         .unwrap();
-    let connection = beam::transport::dial::dial_transfer(&endpoint, bob.at())
+    let connection = beam_core::transport::dial::dial_transfer(&endpoint, bob.at())
         .await
         .unwrap();
     let (moving_tx, mut moving) = mpsc::unbounded_channel();
     let sending = {
         let connection = connection.clone();
-        let key = beam::identity::encode_public_key(&alice.identity.verifying_key());
+        let key = beam_core::identity::encode_public_key(&alice.identity.verifying_key());
         tokio::spawn(async move {
             let mut options = SendOptions::new(path, key);
             options.chunk_size = 1024 * 1024;
@@ -1347,7 +1355,7 @@ async fn a_sender_stopped_mid_transfer_is_reported_as_such_by_listen() {
     tokio::time::timeout(PATIENCE, moving.recv())
         .await
         .expect("no chunk was ever acknowledged");
-    beam::transport::dial::interrupt(&connection); // Ctrl+C on alice's side
+    beam_core::transport::dial::interrupt(&connection); // Ctrl+C on alice's side
     let _ = sending.await;
 
     let started = std::time::Instant::now();
@@ -1390,7 +1398,7 @@ async fn stopping_listen_while_the_sender_is_still_hashing_tells_it_at_once() {
     let (identity, store) = (bob.identity.clone(), bob.store.clone());
     let opts = options(&bob, Policy::default());
     let _task = tokio::spawn(async move {
-        let _ = beam::listener::run_until(
+        let _ = beam_core::listener::run_until(
             identity,
             store,
             network(),
@@ -1422,12 +1430,12 @@ async fn stopping_listen_while_the_sender_is_still_hashing_tells_it_at_once() {
         let endpoint = endpoint::bind(&identity, &Relay::Disabled, Bind::Loopback, 0, &[])
             .await
             .unwrap();
-        let connection = beam::transport::dial::dial_transfer(&endpoint, at)
+        let connection = beam_core::transport::dial::dial_transfer(&endpoint, at)
             .await
             .unwrap();
         let mut options = SendOptions::new(
             path,
-            beam::identity::encode_public_key(&identity.verifying_key()),
+            beam_core::identity::encode_public_key(&identity.verifying_key()),
         );
         let result = send_on(&connection, &mut options, &mut SilentReporter).await;
         endpoint.close().await;

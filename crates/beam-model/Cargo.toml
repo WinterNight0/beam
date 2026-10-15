@@ -1,0 +1,22 @@
+[package]
+name = "beam-model"
+description = "beam's view model: what the full-screen view and a GUI both show, and the safe default of every question"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "beam_model"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Only the core: no terminal and no GUI library. A front end draws this
+# model; the model never draws (ADR-0048).
+[dependencies]
+beam-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

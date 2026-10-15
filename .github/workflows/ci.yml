@@ -1,9 +1,16 @@
 name: CI
 
+# When CI runs (ADR-0050): a pull request into main or GUI-Experimental, a
+# push to main, or by hand (Actions -> CI -> Run workflow, or
+# `gh workflow run ci.yml --ref <branch>`). A push to any other branch does
+# not run it: open a pull request, or run it by hand, when a branch is ready.
+# The button and `gh workflow run` work only once this file is on main.
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
+    branches: [main, GUI-Experimental]
+  workflow_dispatch:
 
 # A run is superseded as soon as a newer commit lands on the same branch.
 concurrency:
@@ -28,48 +35,71 @@ env:
 # distributions are added once beam is stable. Each platform is its own job,
 # and one failing does not cancel the other: several of beam's rules (file
 # permissions, path handling) differ by platform.
+#
+# Every cargo command uses Cargo.lock as committed (`--locked`: a run that
+# would change it fails instead) and covers the whole workspace. Tests run
+# with `--no-fail-fast`, so one run reports every failing test, not only the
+# first failing test program.
+#
+# The dependency audit is in security.yml, which also runs weekly.
 jobs:
   # GitHub has no Arch runner, so this runs in the official Arch image on a
   # GitHub Linux machine. The image is rolling on purpose: it tests what an
   # up-to-date Arch has. `base-devel` brings the C compiler `ring` needs.
-  # Jobs in a container run as root, so no test may rely on file permissions
-  # being enforced.
+  #
+  # A container job runs as root, and root ignores file permissions, so a
+  # test that a private file is really private would pass whatever beam did.
+  # The build and tests therefore run as an ordinary user, `builder`, as beam
+  # runs for real. Only installing packages and creating that user need root.
   arch:
     name: check (Arch Linux)
     runs-on: ubuntu-latest
     container:
       image: archlinux:base-devel
+    env:
+      # The toolchain and the cargo cache belong to builder, where the cache
+      # step (running as root) also finds them.
+      CARGO_HOME: /home/builder/.cargo
+      RUSTUP_HOME: /home/builder/.rustup
     steps:
-      - name: Install packages
-        run: pacman -Syu --noconfirm --needed git rustup
+      - name: Install packages and create the build user
+        run: |
+          pacman -Syu --noconfirm --needed git rustup
+          useradd --create-home builder
+          test "$(runuser -u builder -- id -u)" != 0
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
-      - name: Install Rust
+      - name: Install Rust (as builder)
         run: |
-          rustup default stable
-          rustup component add rustfmt clippy
-          rustc --version
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- rustup default stable
+          runuser -u builder -- rustup component add rustfmt clippy
+          runuser -u builder -- rustc --version
 
       - name: Cache cargo registry and target directory
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # The cache step restores files as root; give them back to builder.
+      - name: Hand the restored cache to builder
+        run: chown -R builder:builder "$GITHUB_WORKSPACE" /home/builder
+
       - name: cargo fmt --check
-        run: cargo fmt --all --check
+        run: runuser -u builder -- cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: runuser -u builder -- cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: cargo test
-        run: cargo test
+      - name: cargo test (as builder, not root)
+        run: runuser -u builder -- cargo test --workspace --locked --no-fail-fast
 
   windows:
     name: check (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -86,31 +116,32 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --workspace --locked --no-fail-fast
 
-  # Every dependency in Cargo.lock against the RustSec advisory database, on
-  # every push, so a newly published vulnerability shows up without anyone
-  # remembering to look. Unmaintained-crate notices are reported as warnings;
-  # a vulnerability fails the job. See SECURITY.md. It reads only Cargo.lock,
-  # so it is not a platform test and runs on GitHub's standard Linux image.
-  audit:
-    name: dependency audit
+  # The oldest Rust beam promises to build with: `rust-version` in Cargo.toml
+  # (MSRV). Stable moves every six weeks, so the jobs above alone would never
+  # notice beam starting to need a newer compiler. If this fails because a
+  # dependency needs a newer Rust, raise `rust-version` on purpose and say so
+  # in the docs; do not drop the job. Keep the toolchain below equal to
+  # `rust-version`. Runs on GitHub's Ubuntu image, as an ordinary user.
+  msrv:
+    name: check (Rust 1.91, the minimum)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
-      - name: Install Rust
+      - name: Install Rust 1.91
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10
         with:
-          toolchain: stable
+          toolchain: "1.91"
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: cargo audit
-        run: cargo audit
+      - name: cargo test
+        run: cargo test --workspace --locked --no-fail-fast

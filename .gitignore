@@ -16,6 +16,12 @@ Thumbs.db
 /spike/*/target/
 /spike/*/*/target/
 
+# The GUI spike and mockups (SPIKE-002) are the GUI's local testing ground.
+# Files already committed stay tracked until the GUI is usable; then they
+# are removed from the repository (`git rm -r --cached spike/gui-iced`) and
+# kept on disk. New files there are never picked up (ADR-0049).
+/spike/gui-iced/
+
 # beam homes created inside the repo while testing (e.g. --beam-dir ./alice).
 # These hold private keys and peer lists; they must never be committed.
 id_ed25519
