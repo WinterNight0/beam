@@ -143,7 +143,21 @@ These are accepted on purpose, with their reasons, in
 
 ## 7. Vulnerability status
 
-### Latest check: 2026-10-02
+### Latest check: 2026-10-15 (`cargo audit`, 690 crates with the GUI)
+
+The first audit of the GUI branch (`GUI-Experimental`) in CI failed on four
+advisories published the day before against `rustls`, which iroh uses for
+TLS. None comes from the GUI.
+
+| Checked | Result |
+|---|---|
+| RUSTSEC-2026-0346 (medium: `Debug` output of client session values shows TLS secrets), -0347, -0348, -0349 (low: ECH data after rejection, Brotli certificate decompression up to 1 GiB, a ServerHello downgrade of later connections) in `rustls` 0.23.45 | **Fixed**: `Cargo.lock` moves to `rustls` 0.23.46, a patch release (no new crate, iroh's pin unchanged). beam never prints TLS session values, but the update is the fix. `main` had the same version. |
+| RUSTSEC-2026-0253, `lru` 0.16.4 unsound (`LruCache::pop` after a panic in a key's `Hash`/`Eq`) | Warning. Only in the GUI's GPU renderer (`iced_wgpu` → `cryoglyph`'s glyph cache), which calls `pop_lru`, with plain-data keys that cannot panic. Gone if the software renderer is chosen (Patch #8, decision open). |
+| RUSTSEC-2026-0192, `ttf-parser` 0.25.1 unmaintained | Warning. iced's text stack (`fontdb`), reading the fonts beam bundles (ADR-0051), not files from the network. |
+| RUSTSEC-2024-0436, `paste` unmaintained | Warning, as before; now also through `wgpu` (GPU renderer). Compile time only. |
+| `yoke-derive` 0.8.3 yanked | Warning. A compile-time macro under `url`; the lockfile keeps it until its dependents move. |
+
+### Previous check: 2026-10-02
 
 | Checked | Result |
 |---|---|
@@ -185,6 +199,7 @@ These are accepted on purpose, with their reasons, in
 | 2026-10-12 | F-5: in the full-screen view, the message for a failed send was drawn without cleaning. It can quote network error text, including the reason a peer gives for closing a connection, so a hostile paired device could put control characters on the screen. `beam send` was not affected (it cleans when it prints) | Low | **Fixed**: the messages now come back cleaned from the one place every front end takes them (`actions::messages`); `actions::messages::tests::messages_come_back_cleaned` |
 | 2026-10-12 | Hardening (ADR-0048): a relay move for a paired friend relied on each front end asking first (ADR-0038). Now the one save every front end uses refuses a relay change without the person's yes, and every yes/no question is built to start on No | — | **Done**: `actions::pair::tests::a_relay_change_is_not_saved_without_a_yes`, `beam_model::ask::tests::every_question_starts_on_no` |
 | 2026-10-12 | Hardening (ADR-0050): the audit ran only when code was pushed; Linux tests ran as root, where permission checks prove nothing | — | **Done**: weekly `security.yml`; Arch tests as user `builder` |
+| 2026-10-15 | Four `rustls` advisories (RUSTSEC-2026-0346..0349, one medium) published 2026-10-14 failed the audit | Medium | **Fixed**: `rustls` 0.23.46 in `Cargo.lock` |
 | M6 | Impersonation, terminal injection, hostile-peer limits | — | Fixed and tested in M6; `threat-model.md` |
 
 ## 8. Reporting a vulnerability
