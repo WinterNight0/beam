@@ -2780,3 +2780,56 @@ nothing it draws should depend on what a system has installed.
   binary, never from a file a peer or a download could supply.
 * Still to come, each needing its own decision: beam's logo and the app
   icons (window, `.exe`, Linux), part of the release work.
+
+## ADR-0052 — The GUI's renderer and its saved preferences
+
+**Status:** accepted (2026-10-16). GUI EX Patch #9. Code:
+`crates/beam-core/src/gui_prefs.rs`, `crates/beam-gui/src/renderer.rs`,
+`crates/beam-gui/src/app/prefs.rs`.
+
+**Context.** iced draws with the GPU (wgpu) by default and falls back to
+software (tiny-skia, a Rust port of Skia's CPU renderer) only when the GPU
+cannot start. Measured on beam's idle window (release build, Windows 11):
+GPU 167 MB, software 32 MB. Software only would also drop 52 crates and two
+audit warnings (SECURITY.md, `lru` and `paste`), but leaves no GPU for large
+or high-DPI screens. An old but working GPU never triggers the fallback, so
+an older computer stays on the GPU unless someone sets `ICED_BACKEND`, which
+few people will. Separately, Theme, Zoom and Highlighted answer (Patch #8)
+reset at every start.
+
+### Decision
+
+* **Keep both renderers; the GPU first** with iced's automatic fallback. No
+  dependency change.
+* **Settings → Appearance → Software rendering** ("for older computers"),
+  off by default. iced reads the renderer only from `ICED_BACKEND` before
+  the window opens, and setting a process's own environment is `unsafe` in
+  Rust 2024 (forbidden here). So `main`, before any window, starts beam
+  again with `ICED_BACKEND=tiny-skia` set for the new process only, and the
+  first process exits. The new process carries a marker
+  (`BEAM_GUI_RENDERER`), so it never restarts itself again.
+* **`ICED_BACKEND` set by the person wins**; the setting says so instead.
+* **Restart now** appears while the setting and the running window differ.
+  It closes the window the way its close button does: if a file is moving,
+  "Close beam?" asks first, starting on Stay, and Stay (or closing the
+  question) calls the restart off. If the new beam cannot start, the window
+  stays open and says so.
+* **Preferences are saved in `gui.toml`**, in the beam folder beside
+  `config.toml` (`~/.beam`, or `$BEAM_DIR`): theme, zoom, highlighted
+  answer, software rendering. Not in `config.toml`, which the command line
+  shares; `beam` never reads `gui.toml`. Read and written by
+  `beam_core::gui_prefs` (the GUI keeps to its layers: core, model, iced,
+  rfd), written whole through a temporary file. A missing file is the
+  defaults; a damaged one is reported and the defaults are used.
+* Nothing in `gui.toml` touches a rule: the highlighted answer changes only
+  colours and order, and every question's mark still starts on No (`Ask`).
+
+### Consequences
+
+* The GPU's memory is the default cost; the setting removes it on machines
+  that need it. Checked on Windows: on, the first process exits and the new
+  one draws in software (31 MB); off, beam stays on the GPU (166 MB).
+* Starting in software costs one extra, windowless process start.
+* The `lru` and `paste` audit warnings stay (GPU path), as SECURITY.md says.
+* `toml` is built without its writer in this workspace, so the four keys are
+  written by hand rather than adding that crate.

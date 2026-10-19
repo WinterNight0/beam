@@ -1387,3 +1387,92 @@ fn opening_settings_does_not_wait_for_the_os() {
     let _ = gui.update(Message::Settings(SettingsMsg::AtSignInRead(true)));
     assert_eq!(gui.at_sign_in, Some(true));
 }
+
+// ---------------------------------------------------------------- Patch #9
+
+/// Theme, zoom, the highlighted answer and software rendering are saved
+/// in gui.toml beside config.toml, and a new window opens with them.
+#[test]
+fn preferences_are_saved_beside_the_config_and_read_back() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store.clone());
+    assert!(gui.dark && gui.zoom == 1.0 && gui.emphasis == Emphasis::Safe && !gui.software);
+    let _ = gui.update(Message::Dark(false));
+    let _ = gui.update(Message::Zoom(1.25));
+    let _ = gui.update(Message::Emphasis(Emphasis::Action));
+    let _ = gui.update(Message::Software(true));
+    assert_eq!(
+        store.gui_prefs_path().parent(),
+        store.config_path().parent(),
+        "in the beam folder, beside config.toml"
+    );
+    assert!(store.gui_prefs_path().is_file());
+
+    let again = Gui::for_home(store.clone());
+    assert!(!again.dark);
+    assert_eq!(again.zoom, 1.25);
+    assert_eq!(again.emphasis, Emphasis::Action);
+    assert!(again.software);
+    // The command line's settings are not touched.
+    assert!(
+        !store.config_path().exists() || {
+            let text = std::fs::read_to_string(store.config_path()).unwrap();
+            !text.contains("zoom") && !text.contains("software")
+        }
+    );
+}
+
+/// A damaged gui.toml: the defaults, and a notice saying why.
+#[test]
+fn a_damaged_preferences_file_uses_the_defaults_and_says_so() {
+    let (_tmp, store) = home(true, &[]);
+    std::fs::write(store.gui_prefs_path(), "theme = \"purple\"\n").unwrap();
+    let gui = Gui::for_home(store);
+    assert!(gui.dark && gui.zoom == 1.0 && !gui.software);
+    assert!(matches!(gui.notice, Some((_, Tone::Problem))));
+}
+
+/// Restart now closes like the close button. If that asks "Close beam?"
+/// (a file is moving), answering Stay, or closing the question, calls the
+/// restart off, so a later close does not start beam again.
+#[test]
+fn staying_calls_a_restart_off() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store);
+    for dismiss in [
+        key(keyboard::key::Named::Escape),
+        Message::Receive(RecvMsg::AnswerLeave(Choice::No)),
+        Message::CloseDialog,
+    ] {
+        gui.restarting = true;
+        gui.dialog = Some(Dialog::Leave(
+            Ask::new(beam_model::ask::LeaveMidTransfer),
+            window::Id::unique(),
+        ));
+        let _ = gui.update(dismiss);
+        assert!(gui.dialog.is_none());
+        assert!(!gui.restarting);
+    }
+}
+
+/// Restart now appears only while the switch and the running window
+/// differ; a renderer the person chose with ICED_BACKEND is said instead.
+#[test]
+fn restart_now_appears_only_when_the_renderer_would_change() {
+    let (_tmp, store) = home(true, &[]);
+    let mut gui = Gui::for_home(store);
+    gui.renderer = crate::renderer::Chosen::Default;
+    let _ = gui.update(Message::Page(Page::Settings));
+    assert!(!shows(&gui, "Restart now"));
+    let _ = gui.update(Message::Software(true));
+    assert!(shows(&gui, "Restart now"));
+    // Started in software by beam: nothing to change.
+    gui.renderer = crate::renderer::Chosen::Beam;
+    assert!(!shows(&gui, "Restart now"));
+    gui.renderer = crate::renderer::Chosen::Person("wgpu".into());
+    assert!(!shows(&gui, "Restart now"));
+    assert!(shows(
+        &gui,
+        "Set for this window by ICED_BACKEND=wgpu; this switch applies when that is not set."
+    ));
+}

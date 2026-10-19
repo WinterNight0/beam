@@ -143,7 +143,7 @@ crates/beam-core/      L1 core + L2 actions. No terminal or GUI library.
   src/invite.rs        invites, and where a paired peer is found
   src/transfer/        protocol messages, state machine, chunking, resume, integrity
   src/listener.rs      `listen` as a service; src/agent/ the background agent
-  src/history.rs, config.rs, untrusted.rs, text.rs
+  src/history.rs, config.rs, untrusted.rs, text.rs; gui_prefs.rs (gui.toml)
   src/actions/         one copy of each flow: send, pair, receive, inbox, messages,
                        identity (first-run create, never replaces), friends
                        (rename, remove), pair_worker (pairing on a thread for
@@ -333,9 +333,13 @@ In this order, each step with its tests (ADR-0048):
   stops), only the look: the mark starts on no either way; zoom
   80–200% on top of the screen's scaling; under 760 px the friends list
   keeps only faces; an unreadable `known_peers` or identity is a banner on
-  every page; `Snapshot::load` finds "last seen" in one pass). Renderer:
-  iced's default (GPU, ~170 MB idle; software ~32 MB via
-  `ICED_BACKEND=tiny-skia`) until decided. **No release yet**: the core grows first; later a second download
+  every page; `Snapshot::load` finds "last seen" in one pass). #9 saved preferences and renderer (ADR-0052): `gui.toml` beside
+  `config.toml` (theme, zoom, highlighted answer, software rendering;
+  `beam_core::gui_prefs`, never read by the CLI); both renderers, GPU first
+  with iced's fallback, Settings → Software rendering restarts beam with
+  `ICED_BACKEND=tiny-skia` for the new process only (marker
+  `BEAM_GUI_RENDERER`, no loop; the person's `ICED_BACKEND` wins), Restart
+  now closes like the close button. **No release yet**: the core grows first; later a second download
   with `beam`, tags `gui-v*`. `spike/gui-iced` is gitignored, the testing
   ground; removed from the repo (kept locally) once the GUI is usable.
 - **Next (to be planned):** more core work before any GUI release;

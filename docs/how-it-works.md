@@ -659,7 +659,11 @@ crates/beam-gui/src/   the desktop window (ADR-0049), being built
   app.rs               state and messages (tests in app/tests.rs, iced_test)
   app/                 one file per page's messages: pairing, receiving,
                        sending, settings; keys.rs (shortcuts, a question's
-                       mark: Tab moves it, Enter gives it, Escape is safe)
+                       mark: Tab moves it, Enter gives it, Escape is safe);
+                       prefs.rs (gui.toml: theme, zoom, highlighted answer,
+                       software rendering; Restart now)
+  renderer.rs          GPU first; software when chosen, by starting again
+                       with ICED_BACKEND set for the new process (ADR-0052)
   view.rs              what is drawn: rail, friends, settings, status bar
   theme.rs             the design system: Midnight and Daylight palettes
   icons.rs             the icons, by codepoint in the bundled icon font

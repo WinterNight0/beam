@@ -36,6 +36,8 @@ terminal · — not offered · *planned* not built yet.
 | Choose what plain `beam` opens | `beam ui cli\|tui` | ⌨ `ui` | — | `config` |
 | Everything by keyboard (every question starts marked on its safe answer) | ✔ | ✔ keys on each tab | ✔ shortcuts (Ctrl+1…5, Ctrl+F, Ctrl+N, Ctrl+O, F2, Delete, Up/Down), listed in Settings → Keyboard; Tab or the arrows move a question's mark; which answer is purple is a setting (the safe one by default), Enter starts on the safe one either way | `beam-model::ask` |
 | Zoom | — (the terminal's own) | — (the terminal's own) | ✔ Ctrl+= / Ctrl+- / Ctrl+0, Settings → Appearance | — |
+| Window preferences kept between launches (theme, zoom, highlighted answer) | — | — | ✔ `gui.toml` beside `config.toml` (ADR-0052) | `gui_prefs` |
+| Software rendering for older computers | — | — | ✔ Settings → Appearance; applies at start, Restart now (ADR-0052) | `gui_prefs` |
 | Copy, paste, mouse in old consoles | — | ✔ Ctrl+C / Ctrl+V, `m` (ADR-0047) | — | — |
 
 ## Keeping it current

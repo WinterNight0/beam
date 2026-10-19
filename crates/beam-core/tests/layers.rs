@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 const CORE: &[&str] = &[
     "agent",
     "config.rs",
+    "gui_prefs.rs",
     "hex.rs",
     "history.rs",
     "identity",

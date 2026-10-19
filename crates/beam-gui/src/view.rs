@@ -21,6 +21,7 @@ use crate::app::{
     SettingsMsg, Tone,
 };
 use crate::icons;
+use crate::renderer::Chosen;
 use crate::theme::{self, BOLD, FONT, LG, MD, MONO, Pal, SEMIBOLD, SM, XL, XS, XXL};
 
 /// The navigation rail: its width, the equal gutter left and right of each
@@ -721,6 +722,7 @@ fn settings<'a>(gui: &'a Gui, snapshot: &'a Snapshot) -> Element<'a, Message> {
                 .style(theme::segments(p))
                 .into(),
             ),
+            rendering_setting(gui),
         ],
     );
     let mut device = Vec::new();
@@ -2825,4 +2827,59 @@ fn keyboard_settings<'a>(p: &'static Pal) -> Element<'a, Message> {
             ),
         ],
     )
+}
+
+// ---------------------------------------------------------------------------
+// Saved preferences (GUI EX Patch #9)
+// ---------------------------------------------------------------------------
+
+/// Software rendering: saved now, applied when beam starts (`renderer.rs`),
+/// so Restart now appears while the setting and the window differ.
+fn rendering_setting(gui: &Gui) -> Element<'_, Message> {
+    let p = gui.pal();
+    let (help, pending) = match &gui.renderer {
+        Chosen::Person(backend) => (
+            format!(
+                "Set for this window by ICED_BACKEND={}; this switch applies when that is not set.",
+                beam_core::untrusted::text(backend)
+            ),
+            false,
+        ),
+        chosen => (
+            "Draws on the processor instead of the graphics card: about 30 MB of memory instead of 170 MB, for older computers or graphics drivers that misbehave. Applies when beam starts."
+                .to_string(),
+            gui.software != (*chosen == Chosen::Beam),
+        ),
+    };
+    let mut control = row![
+        toggler(gui.software)
+            .on_toggle(Message::Software)
+            .size(20)
+            .style(theme::switch(p))
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    if pending {
+        control = control.push(
+            button(text("Restart now").size(MD))
+                .padding([5, 12])
+                .style(theme::secondary(p))
+                .on_press(Message::Restart),
+        );
+    }
+    container(
+        row![
+            column![
+                text("Software rendering").font(SEMIBOLD).size(MD),
+                text(help).size(SM).color(p.subtext)
+            ]
+            .spacing(3)
+            .width(Fill),
+            control,
+        ]
+        .spacing(24)
+        .align_y(Alignment::Center),
+    )
+    .padding([14, 16])
+    .into()
 }

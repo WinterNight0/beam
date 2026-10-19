@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod icons;
+pub mod renderer;
 pub mod theme;
 mod view;
 

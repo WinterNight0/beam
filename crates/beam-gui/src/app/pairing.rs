@@ -359,6 +359,8 @@ impl Gui {
     /// dropped, a question still waiting reads as no, nothing is saved.
     pub(crate) fn close_dialog(&mut self) {
         self.dialog = None;
+        // Closing the "Close beam?" question is staying.
+        self.restarting = false;
         self.worker = None;
     }
 

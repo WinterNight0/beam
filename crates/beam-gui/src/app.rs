@@ -7,7 +7,8 @@
 //! recent activity, Copy, rename, and remove behind a question that starts
 //! on Keep (`beam_model::Ask`). Patch #4: Add friend (`app/pairing.rs`).
 //! Patches #5–#7: `app/receiving.rs`, `app/sending.rs`, `app/settings.rs`.
-//! Patch #8: the keyboard and zoom (`app/keys.rs`).
+//! Patch #8: the keyboard and zoom (`app/keys.rs`). Patch #9: saved
+//! preferences and software rendering (`app/prefs.rs`, ADR-0052).
 //! Everything is read and changed through
 //! `beam-model` and `beam-core`; the pages still to come say so.
 
@@ -28,6 +29,7 @@ use beam_model::{
 
 pub(crate) mod keys;
 pub(crate) mod pairing;
+pub(crate) mod prefs;
 pub(crate) mod receiving;
 pub(crate) mod sending;
 pub(crate) mod settings;
@@ -139,6 +141,12 @@ pub struct Gui {
     /// The `beam` program next to this window, which the background
     /// service runs; `None` if it is not there.
     pub(crate) beam_program: Option<std::path::PathBuf>,
+    /// "Software rendering" (saved in `gui.toml`; applies at start).
+    pub(crate) software: bool,
+    /// Who chose this process's renderer (`renderer.rs`).
+    pub(crate) renderer: crate::renderer::Chosen,
+    /// The window is closing to start again (Restart now).
+    pub(crate) restarting: bool,
 }
 
 /// What can be open over the window. One at a time, like the view's pop-ups.
@@ -193,6 +201,11 @@ pub enum Message {
     Zoom(f32),
     /// Which answer of a question is purple and on the right.
     Emphasis(Emphasis),
+    /// "Software rendering" was switched.
+    Software(bool),
+    /// Restart now, so the renderer setting applies.
+    Restart,
+    RestartIn(Option<window::Id>),
     DismissNotice,
     /// Copy a friend's full fingerprint, to paste where they can compare it.
     CopyFingerprint(String),
@@ -236,6 +249,7 @@ impl Gui {
 
     pub fn for_home(store: Store) -> Self {
         let mut gui = Self::empty(Some(store));
+        gui.load_prefs();
         gui.reload();
         gui.connect_link();
         gui
@@ -269,6 +283,9 @@ impl Gui {
             beam_program: std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().and_then(settings::beam_in)),
+            software: false,
+            renderer: crate::renderer::Chosen::now(),
+            restarting: false,
         }
     }
 
@@ -325,7 +342,10 @@ impl Gui {
                 self.page = Page::Friends;
             }
             Message::Search(text) => self.search = text,
-            Message::Dark(dark) => self.dark = dark,
+            Message::Dark(dark) => {
+                self.dark = dark;
+                self.save_prefs();
+            }
             Message::CreateIdentity => {
                 if let Some(store) = &self.store {
                     self.notice = Some(match create(store) {
@@ -348,8 +368,20 @@ impl Gui {
             }
             // Sizes arrive zoomed; kept as the screen has them.
             Message::Resized(width) => self.width = width * self.zoom,
-            Message::Emphasis(emphasis) => self.emphasis = emphasis,
-            Message::Zoom(zoom) => self.zoom = zoom.clamp(ZOOMS[0], ZOOMS[ZOOMS.len() - 1]),
+            Message::Emphasis(emphasis) => {
+                self.emphasis = emphasis;
+                self.save_prefs();
+            }
+            Message::Zoom(zoom) => {
+                self.zoom = zoom.clamp(ZOOMS[0], ZOOMS[ZOOMS.len() - 1]);
+                self.save_prefs();
+            }
+            Message::Software(on) => {
+                self.software = on;
+                self.save_prefs();
+            }
+            Message::Restart => return self.restart(),
+            Message::RestartIn(id) => return self.restart_in(id),
             Message::DismissNotice => self.notice = None,
             Message::CopyFingerprint(hex) => {
                 self.notice = Some(("Fingerprint copied.".into(), Tone::Info));

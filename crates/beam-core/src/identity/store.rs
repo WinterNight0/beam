@@ -145,6 +145,12 @@ impl Store {
         self.dir.join(CONFIG_NAME)
     }
 
+    /// Path of `gui.toml`, the desktop window's preferences, beside
+    /// `config.toml`; it may not exist (ADR-0052).
+    pub fn gui_prefs_path(&self) -> PathBuf {
+        self.dir.join(crate::gui_prefs::FILE_NAME)
+    }
+
     /// The path of the `known_peers` database.
     pub fn known_peers_path(&self) -> PathBuf {
         self.dir.join(KNOWN_PEERS_NAME)

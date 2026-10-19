@@ -81,10 +81,12 @@ impl Gui {
                 }
             }
             RecvMsg::AnswerLeave(choice) => {
-                if let Some(Dialog::Leave(_, id)) = self.dialog.take()
-                    && choice == Choice::Yes
-                {
-                    return self.leave(id);
+                if let Some(Dialog::Leave(_, id)) = self.dialog.take() {
+                    if choice == Choice::Yes {
+                        return self.leave(id);
+                    }
+                    // Stay: a restart that asked is called off too.
+                    self.restarting = false;
                 }
             }
             RecvMsg::Tick => self.drain_receivers(Instant::now()),
@@ -278,6 +280,11 @@ impl Gui {
     /// Closes the window. The receiver stops first, the way `listen` stops on
     /// Ctrl+C: a sender mid-transfer is told, and what arrived is kept.
     fn leave(&mut self, id: window::Id) -> Task<Message> {
+        // Restart now: the new beam starts first; if it cannot, this one
+        // stays open and says so.
+        if !self.start_again_if_restarting() {
+            return Task::none();
+        }
         self.receivers.link = None;
         if let Some(switch) = self.receivers.switch.take() {
             switch.stop_and_wait(STOP_PATIENCE);

@@ -5,10 +5,25 @@
 // debug build still shows panics).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use beam_core::gui_prefs::GuiPrefs;
+use beam_core::identity::Store;
 use beam_gui::app::{Gui, MIN_SIZE, SIZE};
+use beam_gui::renderer::{self, Chosen};
 use iced::{Size, window};
 
 fn main() -> iced::Result {
+    // "Software rendering" (Settings): iced reads the renderer only from
+    // the environment, so start again with it set, before any window.
+    // Should that fail, this process carries on with iced's default.
+    let software = Store::default_dir()
+        .ok()
+        .and_then(|dir| GuiPrefs::load(&Store::new(dir).gui_prefs_path()).ok())
+        .is_some_and(|prefs| prefs.software_rendering);
+    if renderer::restart_in_software(software, &Chosen::now())
+        && renderer::start_again(true).is_ok()
+    {
+        return Ok(());
+    }
     let mut app = iced::application(Gui::boot, Gui::update, Gui::view)
         .title("beam")
         .theme(Gui::theme)
