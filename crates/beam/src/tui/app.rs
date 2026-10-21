@@ -11,14 +11,17 @@ use ratatui::layout::{Position, Rect};
 
 use super::add::{self, AddForm, Field};
 use super::browse::{Browser, Fs};
-use super::inbox::RequestView;
 use super::input::{Edit, Input};
 use super::palette::{self, Palette, Place, Suggestion};
-use super::pending::{Link, Owner, Pending, Receiving, Switch};
 use super::send::Sending;
-use crate::agent::status::Running;
-use crate::identity::{MAX_NAME_LEN, Store, StoreError};
-use crate::untrusted;
+use beam_core::identity::MAX_NAME_LEN;
+use beam_core::untrusted;
+pub use beam_model::ask::{
+    Incoming, LeaveMidTransfer, RelayMove, RemoveFriend, SameFingerprints, StopMidTransfer,
+};
+use beam_model::requests::Requests;
+pub use beam_model::snapshot::{Agent, Friend, Me, Owner, Snapshot};
+pub use beam_model::{Ask, Choice};
 
 /// The tabs along the top, as in Discord's Friends page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,159 +200,6 @@ pub enum Done {
     },
 }
 
-/// This device, for the header.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Me {
-    pub name: String,
-    pub short_id: String,
-    pub fingerprint: String,
-}
-
-/// One paired peer, ready to draw. Every string is already safe for the
-/// terminal (ADR-0034): `known_peers` can be edited by hand.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Friend {
-    /// Also the key for rename and remove: `known_peers` only holds names
-    /// that pass `validate_name`, which cleaning leaves unchanged.
-    pub name: String,
-    pub short_id: String,
-    /// The fingerprint's hex, without the `SHA256:` prefix.
-    pub fingerprint: String,
-    pub added: String,
-    /// When a transfer with them last got an answer (unix seconds): what
-    /// "last seen" means without a server (ADR-0043).
-    pub last_seen: Option<u64>,
-}
-
-/// Whether the background agent is running (ADR-0042).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Agent {
-    Running { receive_dir: String },
-    Unreadable,
-    Stopped,
-}
-
-/// Everything read from `~/.beam` for one frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Snapshot {
-    /// `None` until `beam init` has been run.
-    pub me: Option<Me>,
-    /// No identity file at all: the first run, which offers to make one.
-    pub needs_setup: bool,
-    pub friends: Vec<Friend>,
-    pub agent: Agent,
-    /// What came and went, oldest first, its strings cleaned for drawing.
-    pub history: Vec<crate::history::Entry>,
-    /// Who runs the agent's receiver, when one runs.
-    pub owner: Owner,
-    /// Whether `beam listen` runs in this beam home.
-    pub listen_elsewhere: bool,
-    /// Why something could not be read, shown in the status line.
-    pub problem: Option<String>,
-}
-
-impl Snapshot {
-    /// Reads the identity, the paired peers and the agent's status.
-    pub fn load(store: &Store) -> Self {
-        let mut problem = None;
-        let mut needs_setup = false;
-        let me = match store.load_identity() {
-            Ok(identity) => Some(Me {
-                name: untrusted::name(identity.comment()),
-                short_id: identity.short_id().grouped(),
-                fingerprint: identity.fingerprint().hex(),
-            }),
-            Err(StoreError::NoIdentity) => {
-                needs_setup = true;
-                None
-            }
-            Err(e) => {
-                problem = Some(untrusted::text(&e.to_string()));
-                None
-            }
-        };
-        let history: Vec<crate::history::Entry> = crate::history::read(store)
-            .into_iter()
-            .map(|mut e| {
-                e.peer = untrusted::name(&e.peer);
-                e.file = untrusted::name(&e.file);
-                e.fingerprint = untrusted::text(&e.fingerprint);
-                e.note = e.note.as_deref().map(untrusted::text);
-                e
-            })
-            .collect();
-        // Seen = they answered: a transfer that only failed to reach them
-        // says nothing about when they were there.
-        let last_seen = |fingerprint: &str| {
-            history
-                .iter()
-                .rev()
-                .find(|e| {
-                    e.fingerprint == fingerprint && e.outcome != crate::history::Outcome::Failed
-                })
-                .map(|e| e.at)
-        };
-        let friends = match store.load_known_peers() {
-            Ok(known) => known
-                .peers()
-                .iter()
-                .map(|p| {
-                    let fingerprint = p.fingerprint().hex();
-                    Friend {
-                        name: untrusted::name(&p.name),
-                        short_id: p.short_id().grouped(),
-                        last_seen: last_seen(&fingerprint),
-                        fingerprint,
-                        added: p.added_date(),
-                    }
-                })
-                .collect(),
-            Err(e) => {
-                problem.get_or_insert_with(|| untrusted::text(&e.to_string()));
-                Vec::new()
-            }
-        };
-        let mut owner = Owner::Background;
-        let agent = match crate::agent::status::read(store) {
-            Running::Yes(status) => {
-                if status.in_view {
-                    owner = if status.pid == std::process::id() {
-                        Owner::ThisView
-                    } else {
-                        Owner::OtherView
-                    };
-                }
-                Agent::Running {
-                    receive_dir: untrusted::name(&status.receive_dir),
-                }
-            }
-            Running::Unreadable => Agent::Unreadable,
-            Running::No => Agent::Stopped,
-        };
-        let listen_elsewhere = !matches!(
-            crate::listen_status::read(store),
-            crate::listen_status::Listening::No
-        );
-        Self {
-            me,
-            needs_setup,
-            friends,
-            agent,
-            history,
-            owner,
-            listen_elsewhere,
-            problem,
-        }
-    }
-}
-
-/// The two answers of a yes/no pop-up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Choice {
-    Yes,
-    No,
-}
-
 /// A pop-up over the page. While one is open, keys go to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
@@ -360,11 +210,7 @@ pub enum Modal {
         error: Option<String>,
     },
     /// Starts on `No`: Enter alone keeps the friend.
-    Remove {
-        name: String,
-        fingerprint: String,
-        focus: Choice,
-    },
+    Remove(Ask<RemoveFriend>),
     /// What a command run from the palette printed.
     Output {
         title: String,
@@ -391,40 +237,19 @@ pub enum Modal {
         attempt: Option<String>,
     },
     /// Do the fingerprints match? Starts on `No`. Fingerprints are hex.
-    ConfirmPair {
-        name: String,
-        peer: String,
-        own: String,
-        focus: Choice,
-    },
+    ConfirmPair(Ask<SameFingerprints>),
     /// Which file to send: the browser (ADR-0045).
     Browse(Box<Browser>),
     /// How the send in [`App::sending`] is going.
     SendStatus,
     /// A file is still going out or coming in: leave anyway? Starts on `No`.
-    ConfirmQuit {
-        focus: Choice,
-    },
+    ConfirmQuit(Ask<LeaveMidTransfer>),
     /// A file is arriving: turn Receiving off anyway? Starts on `No`.
-    ConfirmStop {
-        focus: Choice,
-    },
+    ConfirmStop(Ask<StopMidTransfer>),
     /// May this friend send this file? Starts on `No` (Decline).
-    Accept {
-        id: u64,
-        request: RequestView,
-        expires: Instant,
-        focus: Choice,
-    },
+    Accept(Ask<Incoming>),
     /// An invite moves a paired friend to another relay. Starts on `No`.
-    RelayChange {
-        name: String,
-        fingerprint: String,
-        old: String,
-        new: String,
-        invite: String,
-        focus: Choice,
-    },
+    RelayChange(Ask<RelayMove>),
 }
 
 /// A clickable thing the view drew, and where.
@@ -501,18 +326,11 @@ pub struct App {
     pub add: AddForm,
     /// A friend to select once they appear (just paired), by fingerprint.
     pub pending_select: Option<String>,
-    /// Requests from the background agent, waiting for an answer.
-    pub pending: Vec<Pending>,
-    /// Index into `pending`.
-    pub pending_selected: usize,
-    /// What the agent is receiving now.
-    pub receiving: Option<Receiving>,
-    /// How the view stands with the agent.
-    pub link: Link,
+    /// Requests waiting for an answer, the file arriving, the link to
+    /// the receiver and the Receiving switch (beam-model).
+    pub requests: Requests,
     /// The file going out now, or the one that just ended.
     pub sending: Option<Sending>,
-    /// The Receiving switch (ADR-0044).
-    pub switch: Switch,
     /// The first-run card's highlighted button: starts on "Create it".
     pub setup_focus: Choice,
     /// Whether beam has the mouse (clicks) or the terminal does (selecting
@@ -541,12 +359,8 @@ impl App {
             last_dir: None,
             add: AddForm::default(),
             pending_select: None,
-            pending: Vec::new(),
-            pending_selected: 0,
-            receiving: None,
-            link: Link::Off,
+            requests: Requests::default(),
             sending: None,
-            switch: Switch::Off,
             setup_focus: Choice::Yes,
             mouse: true,
             quit: false,
@@ -667,12 +481,7 @@ impl App {
                 self.add.focus = Some(Field::Invite);
             }
             Done::SendStarted { peer, file } => {
-                self.sending = Some(Sending {
-                    peer,
-                    file,
-                    stage: super::send::Stage::Starting,
-                    result: None,
-                });
+                self.sending = Some(Sending::new(peer, file));
                 self.modal = Some(Modal::SendStatus);
             }
             Done::PairingStarted => {
@@ -687,14 +496,13 @@ impl App {
                 new,
                 invite,
             } => {
-                self.modal = Some(Modal::RelayChange {
+                self.modal = Some(Modal::RelayChange(Ask::new(RelayMove {
                     name,
                     fingerprint,
                     old,
                     new,
                     invite,
-                    focus: Choice::No,
-                });
+                })));
             }
         }
     }
@@ -734,11 +542,11 @@ impl App {
             Some(modal @ Modal::Accept { .. }) => self.on_accept_key(modal, key),
             Some(Modal::Browse(b)) => self.on_browse_key(b, key),
             Some(Modal::SendStatus) => self.on_send_status_key(key),
-            Some(Modal::ConfirmQuit { focus }) => {
-                self.on_confirm_quit_key(focus, key);
+            Some(Modal::ConfirmQuit(ask)) => {
+                self.on_confirm_quit_key(ask, key);
                 None
             }
-            Some(Modal::ConfirmStop { focus }) => self.on_confirm_stop_key(focus, key),
+            Some(Modal::ConfirmStop(ask)) => self.on_confirm_stop_key(ask, key),
             Some(modal) if add::is_pairing(&modal) => self.on_pair_modal_key(modal, key),
             Some(modal) => self.on_modal_key(modal, key),
             None if self.snapshot.needs_setup => self.on_setup_key(key),
@@ -929,11 +737,11 @@ impl App {
                 self.set_tab(Tab::AddFriend)
             }
             Key::Up | Key::Char('k') if self.tab == Tab::Pending => {
-                self.pending_selected = self.pending_selected.saturating_sub(1);
+                self.requests.selected = self.requests.selected.saturating_sub(1);
             }
             Key::Down | Key::Char('j') if self.tab == Tab::Pending => {
-                self.pending_selected =
-                    (self.pending_selected + 1).min(self.pending.len().saturating_sub(1));
+                self.requests.selected =
+                    (self.requests.selected + 1).min(self.requests.waiting.len().saturating_sub(1));
             }
             Key::Enter => self.open_accept_here(),
             Key::Up | Key::Char('k') => self.selected = self.selected.saturating_sub(1),
@@ -965,11 +773,10 @@ impl App {
             return;
         }
         if let Some(friend) = self.selected_friend() {
-            self.modal = Some(Modal::Remove {
+            self.modal = Some(Modal::Remove(Ask::new(RemoveFriend {
                 name: friend.name.clone(),
                 fingerprint: friend.fingerprint.clone(),
-                focus: Choice::No,
-            });
+            })));
         }
     }
 
@@ -1072,47 +879,31 @@ impl App {
                 self.modal = Some(Modal::Rename { from, input, error });
                 None
             }
-            Modal::Remove {
-                name,
-                fingerprint,
-                focus,
-            } => {
-                let focus = match key {
+            Modal::Remove(mut ask) => {
+                match key {
                     Key::Esc => return None,
                     Key::Enter => {
-                        return self.answer_remove(name, fingerprint, focus);
+                        let answer = ask.focus();
+                        return self.answer_remove(ask, answer);
                     }
-                    Key::Left | Key::Right | Key::Tab | Key::BackTab => match focus {
-                        Choice::Yes => Choice::No,
-                        Choice::No => Choice::Yes,
-                    },
-                    _ => focus,
-                };
-                self.modal = Some(Modal::Remove {
-                    name,
-                    fingerprint,
-                    focus,
-                });
+                    Key::Left | Key::Right | Key::Tab | Key::BackTab => ask.flip(),
+                    _ => {}
+                }
+                self.modal = Some(Modal::Remove(ask));
                 None
             }
             pairing => self.on_pair_modal_key(pairing, key),
         }
     }
 
-    fn answer_remove(
-        &mut self,
-        name: String,
-        fingerprint: String,
-        answer: Choice,
-    ) -> Option<Effect> {
+    fn answer_remove(&mut self, mut ask: Ask<RemoveFriend>, answer: Choice) -> Option<Effect> {
         match answer {
             Choice::No => None,
             Choice::Yes => {
-                self.modal = Some(Modal::Remove {
-                    name: name.clone(),
-                    fingerprint,
-                    focus: Choice::Yes,
-                });
+                // Stays up, on Yes, while the removal is carried out.
+                let name = ask.question().name.clone();
+                ask.point_at(Choice::Yes);
+                self.modal = Some(Modal::Remove(ask));
                 Some(Effect::Remove { name })
             }
         }
@@ -1182,7 +973,7 @@ impl App {
                         }
                     }
                     (None, Some((_, Target::Request(index)))) => {
-                        self.pending_selected = index;
+                        self.requests.selected = index;
                         self.open_accept(index);
                     }
                     (Some(Modal::Browse(b)), hit) => {
@@ -1204,12 +995,9 @@ impl App {
                         self.selected = index.min(last);
                     }
                     (Some(Modal::Help), _) => {}
-                    (
-                        Some(Modal::Remove {
-                            name, fingerprint, ..
-                        }),
-                        Some((_, Target::Button(answer))),
-                    ) => return self.answer_remove(name, fingerprint, answer),
+                    (Some(Modal::Remove(ask)), Some((_, Target::Button(answer)))) => {
+                        return self.answer_remove(ask, answer);
+                    }
                     (
                         Some(Modal::Rename { from, input, error }),
                         Some((_, Target::Button(answer))),
@@ -1460,11 +1248,8 @@ mod tests {
         let mut app = three();
         app.on_key(Key::Char('x'));
         assert!(matches!(
-            app.modal,
-            Some(Modal::Remove {
-                focus: Choice::No,
-                ..
-            })
+            &app.modal,
+            Some(Modal::Remove(ask)) if ask.focus() == Choice::No
         ));
         assert_eq!(app.on_key(Key::Enter), None);
         assert!(app.modal.is_none());
@@ -1652,11 +1437,8 @@ mod tests {
             "-y does not skip the question"
         );
         assert!(matches!(
-            app.modal,
-            Some(Modal::Remove {
-                focus: Choice::No,
-                ..
-            })
+            &app.modal,
+            Some(Modal::Remove(ask)) if ask.focus() == Choice::No
         ));
         assert_eq!(app.selected_friend().unwrap().name, "carol");
 
@@ -1843,7 +1625,10 @@ mod tests {
     fn pairing_done_selects_the_new_friend_and_a_failure_says_why() {
         let mut app = with_me(three());
         app.tab = Tab::AddFriend;
-        app.on_pair(Update::Finished(Ok(("dana".into(), "dd".into()))));
+        app.on_pair(Update::Finished(Ok(super::super::pairing::Paired {
+            name: "dana".into(),
+            fingerprint: "dd".into(),
+        })));
         assert_eq!(app.tab, Tab::Friends);
         assert_eq!(app.flash.as_deref(), Some("Paired with dana."));
         let mut friends = three().snapshot.friends;
@@ -1851,7 +1636,9 @@ mod tests {
         app.refresh(snapshot(friends));
         assert_eq!(app.selected_friend().unwrap().name, "dana");
 
-        app.on_pair(Update::Finished(Err("Not paired: declined".into())));
+        app.on_pair(Update::Finished(Err(
+            super::super::pairing::Unpaired::Failed("Not paired: declined".into()),
+        )));
         assert!(matches!(
             &app.modal,
             Some(Modal::Output { failed: true, .. })

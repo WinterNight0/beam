@@ -13,21 +13,35 @@ cargo test --test end_to_end                # two real processes
 ```
 
 `make check` is the gate: a milestone is not done until it passes. CI runs the
-same three commands on Windows (`windows-latest`) and on **Arch Linux** (the
-official `archlinux:base-devel` image) for every push and pull request
-(ADR-0014, ADR-0046), so the gate is enforced rather than remembered.
+same three commands, with `--locked`, on Windows (`windows-latest`), on
+**Arch Linux** (the official `archlinux:base-devel` image, as an ordinary
+user rather than root, so permission checks mean something) and with
+**Rust 1.91**, the declared minimum (ADR-0014, ADR-0046, ADR-0050). It runs
+on every pull request into `main` or `GUI-Experimental`, every push to
+`main`, and by hand, so the gate is enforced rather than remembered.
+
+```
+gh workflow run ci.yml --ref <branch>       # CI by hand (works once ci.yml is on main)
+gh run list --workflow ci.yml --limit 5     # recent runs
+gh run view <id> --log-failed               # what failed, every failing test
+```
+
+The dependency audit is a separate workflow, `security.yml`, which also runs
+weekly. The checklist for a merge into `main` or a release is under "Manual
+test steps" below.
 
 ## Test levels
 
 | Level | Where | What it covers |
 |-------|-------|----------------|
-| Unit | `#[cfg(test)]` modules inside `crates/beam/src/` | derivations, parsing, framing, chunk arithmetic, state machine transitions, path safety |
+| Unit | `#[cfg(test)]` modules inside each crate's `src/` (`beam-core`, `beam-model`, `beam`) | derivations, parsing, framing, chunk arithmetic, state machine transitions, path safety |
 | Command | `crates/beam/tests/cli.rs` | whole commands driven through `cli::execute` with in-memory streams and a temporary `--beam-dir` |
-| Integration | `crates/beam/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
-| Failure | `crates/beam/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
-| Security | `tests/transfer.rs::accept_rules`, `tests/cli.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
-| Resume | `crates/beam/tests/resume.rs` | partial transfers: what carries over, what is re-fetched, and what survives a failure |
+| Integration | `crates/beam-core/tests/transfer.rs` | both halves of the engine over an in-memory pipe, plus one pass over a real socket |
+| Failure | `crates/beam-core/tests/transfer.rs` | corruption, refusal, expiry, malformed requests; interruption and crash-and-resume arrive with M3 |
+| Security | `crates/beam-core/tests/transfer.rs::accept_rules`, `hostile_peer.rs`, `crates/beam/tests/cli.rs`, `injection.rs` | the S-* requirements in `requirements.md`, each with a test that tries to break it |
+| Resume | `crates/beam-core/tests/resume.rs` | partial transfers: what carries over, what is re-fetched, and what survives a failure |
 | End to end | `crates/beam/tests/end_to_end.rs` | two real `beam` processes, talking over a real socket, with the prompt answered only once it has actually appeared — including killing one of them mid-transfer |
+| Layers | `crates/beam-core/tests/layers.rs`, `crates/beam-model/tests/layers.rs` | which layer may use which (ADR-0048) |
 | Manual | `docs/test-plan.md` | the few things one machine cannot honestly automate: a real second volume, a real full disk |
 
 Command-level tests never spawn a process and never touch the real `~/.beam`:
@@ -197,6 +211,48 @@ than once, and both would have failed in CI eventually.
   about data arriving *while the prompt is open* depend on the data winning. A
   prompt returning in nanoseconds sometimes beat it. Those tests now use a
   prompt that takes 300 ms, as a person does.
+- **The kill-and-resume tests failed under load, and the cause was in beam
+  (2026-10-12).** `end_to_end.rs`'s three kill-and-resume tests passed alone
+  but failed about one run in five when many ran at once, after a 30 s wait
+  for "two chunks on disk". Assumed at first to be the file finishing before
+  the cut; a stress run (8 to 12 copies at a time) and the receiver's own
+  output showed otherwise: `replace …\state.json: Access is denied`. On
+  Windows, replacing a file fails while another program has it open, and
+  the test reads `state.json` to count chunks, so under load a read and a
+  replace met and the **transfer failed**. Antivirus scanners, indexers and
+  backup tools open new files the same way, so real transfers could fail
+  too. Fixed in beam, not in the test: `beam-core/src/replace.rs` retries a
+  refused replace for about a second, on Windows only, for `state.json`, the
+  `~/.beam` files and the final move into place
+  (`replace::tests::a_replace_waits_out_a_program_that_holds_the_file_for_a_moment`,
+  `a_file_that_stays_held_still_fails_after_about_a_second`). The same stress
+  run then passed 180 of 180, against 58 of 72 before. The wait in the test
+  now prints the receiver's output if it ever fails again.
+
+### Linux-only failures that CI hid (2026-10-12)
+
+The Linux CI job had failed on every run, each time on a different test,
+because `cargo test` stops at the first failing test program and the rest
+never ran. Reading each run's log (`gh run view --log-failed`) found:
+
+- **A real bug: "no space" for a folder not made yet.** Before the prompt,
+  the receiver checks the free space of the destination folder. Linux
+  cannot measure a folder that does not exist (Windows can), and the error
+  was reported as "not enough space", so every request was refused. It
+  showed in `hostile_peer.rs`, whose `out` folder is made only after
+  Accept; for a person, it happens if the receive folder is deleted while
+  `listen` or the agent runs. The check now measures the nearest folder
+  that exists, which is on the same disk
+  (`storage::tests::a_destination_not_made_yet_is_measured_by_the_folder_it_will_be_in`).
+- **A test race: the inbox history line.** The agent answers the sender
+  first and writes its history line just after, so on Linux the test could
+  read the history before the line existed. `tui::inbox`'s two tests now
+  wait for it.
+- Earlier, fixed then: the file browser read `D:` as a drive letter on
+  every platform (ADR-0046).
+
+CI now runs tests with `--no-fail-fast`, so one run reports every failure
+(ADR-0050).
 
 ## Implemented (M4)
 
@@ -253,7 +309,7 @@ fingerprints. The successful case then runs `listen` and `send` between the two
 freshly paired homes, so pairing is shown to produce a `known_peers` entry the
 transfer engine accepts.
 
-### S-17 — `tests/no_n0_discovery.rs`
+### S-17 — `crates/beam-core/tests/no_n0_discovery.rs`
 
 iroh cannot report which address lookup services a bound endpoint has, so the
 test checks the source: no `presets::N0`, pkarr or DNS lookup, `address_lookup`
@@ -517,7 +573,7 @@ invite by chat and the code by another channel; the other runs `beam pair
 | **S-33 only `https://` public relays from invites** (F-3) | `invite::an_http_or_local_relay_in_an_invite_is_dropped_not_used` (http, private IPv4, loopback v4/v6, `localhost`, `*.local`; the rest of the invite still counts); a public https relay is kept |
 | What counts as a public address | `transport::endpoint::only_internet_reachable_addresses_count_as_public` (private, CGNAT, link-local, unique-local, documentation ranges are not) |
 | F-23 `advertise` | `config::advertised_addresses_are_read_and_checked`, `invite::advertised_addresses_come_first_without_duplicates`, `tests/pairing.rs::advertised_addresses_lead_the_invite`, `tests/cli.rs::a_no_relay_config_with_an_advertised_address_is_accepted` |
-| S-35 dependency audit | the `audit` job in `.github/workflows/ci.yml`; manual results in `SECURITY.md` §7 |
+| S-35 dependency audit | the `audit` job in `.github/workflows/security.yml` (also weekly, ADR-0050); manual results in `SECURITY.md` §7 |
 
 ## Implemented (post-M6): the full-screen view and history (ADR-0043)
 
@@ -538,6 +594,10 @@ file is given.
 | F-37 first-run welcome (ADR-0045) | `app::tests::the_first_run_offers_to_create_the_identity_and_enter_does_it`, `not_now_leaves_and_keys_do_nothing_else_meanwhile`, `tests::the_first_run_makes_an_identity_once_and_never_replaces_it`, `view::tests::the_first_run_shows_a_welcome_with_create_it_highlighted` |
 | F-38 file browser (ADR-0045) | `browse::tests::*`, `send::tests::s_opens_the_browser_and_enter_goes_in_then_sends`, `typing_filters_backspace_goes_up_and_a_dragged_path_is_sent`, `esc_closes_and_the_browser_reopens_where_it_was_left`, `tab_goes_to_the_places_and_enter_jumps`, `view::tests::sending_shows_the_browser_then_a_progress_pop_up_and_a_header_pill` |
 | F-39 classic Windows console (ADR-0047) | `tests::the_classic_console_keys_paste_and_copy`, `the_classic_console_is_told_apart_from_modern_terminals`, `app::tests::ctrl_v_reads_the_clipboard_only_where_something_is_typed`, `m_gives_the_mouse_to_the_terminal_and_back_but_is_a_letter_when_typing`; manual: run `beam` from `conhost.exe` and paste an invite with Ctrl+V |
+| Restructure safety net (before ADR-0048): a send reaches only the chosen friend; the Receiving switch never pairs; the view's failure messages are cleaned (SECURITY.md F-5) | `sending::tests::a_send_from_the_view_reaches_the_chosen_friend_and_no_other`, `beam_send_reaches_the_chosen_friend_and_no_other` (the CLI path), `actions::messages::tests::messages_come_back_cleaned`, `both_key_change_messages_warn_of_impersonation`, `receiving::tests::the_switch_never_offers_pairing` |
+| Actions (ADR-0048): one send, pairing, receiver and inbox flow for every front end | `actions::receive::tests::both_places_receive_by_the_same_rules`, `port_mapping_is_off_unless_asked_for`; `actions::pair::tests::a_relay_change_is_not_saved_without_a_yes`, `new_addresses_are_saved_and_the_key_is_kept`, `a_stranger_is_not_already_paired`; `actions::inbox::tests::a_request_is_cleaned_and_its_resume_described`; the send path is covered by the safety-net row above and every existing send, pairing, agent and end-to-end test, which now run through the actions |
+| Model (ADR-0048): every question starts on No, by construction; requests, the Receiving switch, the send in progress and "last seen" follow one set of rules for the view and a GUI | `crates/beam-model`: `ask::tests::every_question_starts_on_no`, `the_highlight_moves_only_when_asked`; `requests::tests::a_request_waits_until_answered_and_cannot_be_answered_twice`, `expired_requests_go_even_without_word_from_the_receiver`, `a_lost_link_takes_every_request_with_it`, `the_switch_asks_before_cutting_off_a_file_and_never_fights`; `sending::tests::the_stages_follow_the_engine_and_the_end_is_handed_back`; `snapshot::tests::last_seen_counts_answers_not_attempts_that_never_arrived`, `no_identity_is_the_first_run`; `tests/layers.rs::the_model_depends_only_on_the_core`; the view's own tests (Accept starts on Decline, Remove on Keep, …) still pass on top of it |
+| Layers (ADR-0048): the core never uses the actions or a front end | `crates/beam-core/tests/layers.rs::the_core_never_uses_the_layers_above_it`, `every_module_is_placed_in_a_layer`, `the_core_crate_depends_on_no_front_end_library` (the crate split makes Cargo enforce the front-end half) |
 | Keys, mouse, terminal | `tests::ctrl_c_copies_ctrl_q_quits_and_other_ctrl_keys_are_ignored`, `left_clicks_and_the_wheel_count_and_mouse_moves_do_not`, `view::tests::clicking_where_a_friend_was_drawn_selects_them`, `a_tiny_terminal_does_not_panic`, `input::tests::*` |
 
 ## Implemented (post-M6): background agent (ADR-0042)
@@ -615,6 +675,40 @@ connected, and the time for the same file with and without the relay.
 | Kill and resume with chunks in flight | the existing `tests/end_to_end.rs` kill tests, now pipelined |
 | Throughput | `tests/throughput.rs` with `BEAM_BENCH_RTT_MS=50/100/200` |
 
+## Implemented (GUI EX): the desktop window (ADR-0049, ADR-0051)
+
+Being built on `GUI-Experimental`, not released. Tests drive the window
+without a screen (`iced_test`: find text, click by label), in
+`crates/beam-gui/src/app/tests.rs` unless noted.
+
+| Area | Tests |
+|---|---|
+| Layers | `tests/layers.rs::the_gui_depends_only_on_the_core_the_model_and_iced` |
+| Bundled icons | `icons::tests::every_icon_is_in_the_bundled_font` (parses the font's `cmap`) |
+| First run | `a_first_run_creates_the_identity_once`, `a_device_with_an_identity_is_not_offered_a_new_one`; the rule itself: `beam-core` `actions::identity::tests::an_existing_identity_is_never_replaced` |
+| Friends | `the_friends_are_listed_and_the_first_is_shown`, `clicking_a_friend_shows_them`, `search_narrows_the_list`, `a_refresh_picks_up_changes_made_in_a_terminal` |
+| Shell | `the_rail_changes_the_page`, `the_theme_switches_between_midnight_and_daylight`, `the_status_bar_says_whether_anything_receives`, `the_relay_is_shown_by_its_host` |
+| Narrow windows (tiling compositors ignore the minimum size) | `a_narrow_window_keeps_the_status_bar_to_one_line` |
+| Avatar colours | `a_friends_colour_comes_from_their_fingerprint` |
+| Rename (Patch #3) | `rename_changes_the_name_and_keeps_the_friend_selected`, `a_refused_rename_says_why_and_changes_nothing`; shared with the CLI and view: `beam-core` `actions::friends::tests` |
+| Remove starts on Keep (`Ask`) | `remove_starts_on_keep_so_enter_escape_and_keep_remove_nothing`, `only_a_click_on_remove_removes` |
+| Pairing (Patch #4), two windows over loopback | `two_windows_pair_and_both_save_the_other`, `enter_on_the_fingerprint_question_does_not_pair`, `pair_without_the_tick_is_a_no`, `closing_the_dialog_cancels_the_pairing` |
+| Pairing checks before the network | `this_devices_own_invite_is_refused`, `a_relay_move_starts_on_keep`, `the_code_box_takes_six_digits`; shared: `beam-core` `actions::pair::tests::a_pasted_invite_is_checked_before_any_network`, `actions::pair_worker::tests` (real pairing, unanswered = no, whose code is used up) |
+| Receiving (Patch #5), a real sender against the window's switch | `a_request_waits_and_enter_on_the_question_declines` (never opens by itself; a stray Enter answers nothing; starts on Decline; nothing saved), `a_click_on_accept_receives_the_file`, `escape_on_the_question_leaves_the_request_waiting`, `a_waiting_request_shows_on_the_rail_and_in_the_inbox` |
+| Stop or close while a file arrives | `stopping_or_closing_mid_file_asks_and_starts_on_no` |
+| Sending (Patch #6), two windows: bob's sends to alice's switch | `a_send_waits_for_their_yes_then_arrives` (nothing arrives before the yes), `a_declined_send_says_so`, `stop_while_waiting_withdraws_the_request`, `one_at_a_time_drops_propose_and_closing_asks` (a drop asks and Enter sends nothing; closing mid-send starts on Stay) |
+| History and settings (Patch #7) | `port_mapping_on_asks_and_starts_on_keep_it_off`, `the_receive_folder_is_saved_and_reset`, `clearing_the_history_asks_and_starts_on_keep`, `history_filters_and_search_narrow_the_list`, `the_service_controls_need_beam_beside_the_window`; shared with the CLI: `beam-core` `actions::settings::tests` (enabling the service is not tested: it writes to the registry) |
+| Polish (Patch #8): keyboard, zoom, narrow windows, error states, many friends | `removing_by_keyboard_starts_on_keep_and_tab_moves_the_mark`, `every_question_starts_marked_on_the_safe_answer`, `pairing_by_keyboard_waits_for_the_tick` (Enter on an unticked Pair does nothing; Space ticks), `shortcuts_switch_pages_and_walk_the_friends`, `zoom_steps_and_the_layout_follows`, `a_very_narrow_window_keeps_only_faces`, `an_unreadable_friends_file_is_said_not_hidden`, `many_friends_and_a_long_history_load_and_draw` (400 friends, a full history: about 4 ms to read in a release build), `opening_settings_does_not_wait_for_the_os` (the sign-in check ran `reg` on the window's thread: 5 s in the release window, which has no console, so Windows made one first; now off the thread and with no console window) |
+| Saved preferences and renderer (Patch #9) | `preferences_are_saved_beside_the_config_and_read_back`, `a_damaged_preferences_file_uses_the_defaults_and_says_so`, `staying_calls_a_restart_off`, `restart_now_appears_only_when_the_renderer_would_change`, `renderer::tests::only_an_unchosen_renderer_is_switched_to_software` (no restart loop; the person's `ICED_BACKEND` wins); core: `gui_prefs::tests` (defaults, round trip with zoom kept in range, damaged file). By hand on Windows (release): on, the first process exits and a new one draws in software (31 MB); off, it stays on the GPU (166 MB) |
+| Friend detail | `copy_puts_the_fingerprint_on_the_clipboard_and_says_so`, `a_friends_recent_activity_is_listed_with_its_result`, `recently_active_friends_are_grouped_first` |
+
+Not automated: how the window looks. Checked by hand on Windows 11 and on
+Arch Linux under Niri (Wayland), at full and half width. Patch #5 was also
+checked live on Windows: the switch on in the real window, a real `beam
+send` from a second beam home through the relay, the request listed (not
+opened), the Accept question opened from Review, Decline clicked; the
+sender reported "declined" and nothing was saved.
+
 ## Manual test steps
 
 Some things cannot honestly be covered by an automated test on one machine.
@@ -668,6 +762,54 @@ echo y | beam listen --addr 127.0.0.1:7777
 
 Expected: the piped `y` is discarded and the prompt still waits. Answering a
 question you have not seen is exactly what S-1 forbids.
+
+### Before a merge into `main` or a release
+
+The restructure (ADR-0048) was checked this way before its merge; the GUI's
+merge into `main` and every release go through the same list.
+
+**Automatic (CI, ADR-0050)**, on the pull request:
+
+- [ ] `check (Windows)`, `check (Arch Linux)` (tests as user `builder`) and
+      `check (Rust 1.91, the minimum)` green; read the test counts, not only
+      the colour (`gh run view <id> --log` and look for `test result:`).
+- [ ] `Security` (`cargo audit`) green.
+- [ ] A failed run: `gh run view <id> --log-failed`. Tests run with
+      `--no-fail-fast`, so the log lists every failing test at once.
+- [ ] For a change meant to keep behaviour (a refactor): the same commands
+      run on a build of `main` and of the branch, with identical copies of one
+      beam home, and the outputs diffed (as for ADR-0048: 94 CLI scenarios plus
+      live pair and send flows, identical apart from masked ports, codes and
+      timings).
+
+**By hand, CLI** (two beam homes or two machines):
+
+- [ ] `beam init`; `beam whoami` while `listen` runs shows the invite and code.
+- [ ] `beam listen` + `beam pair <INVITE> --name …`; both see both fingerprints.
+- [ ] `beam send <friend> <file>`: the prompt shows name, fingerprint, file and
+      size; the file arrives intact.
+- [ ] Declining, and letting a request expire: nothing saved on either side.
+- [ ] Killing a send midway, sending again: it resumes and asks Accept again.
+- [ ] `beam peers`, `beam rename`, `beam remove`; `beam history`;
+      `beam receive-dir`.
+- [ ] `beam service enable`, a send to the agent, `beam inbox`,
+      `beam service disable`.
+- [ ] Pairing from an invite with a different relay asks before saving it.
+
+**By hand, full-screen view** (`beam`):
+
+- [ ] Welcome card on a fresh home; Create it makes the identity once.
+- [ ] Friends: rename; remove (the pop-up starts on No).
+- [ ] Add friend: code pop-up; the fingerprint check starts on No.
+- [ ] Pending: the Receiving switch on and off; the Accept pop-up starts on
+      Decline.
+- [ ] Send with the file browser; hide; cancel; quitting mid-send asks.
+- [ ] History tab; the command palette (`:` or Ctrl+P).
+- [ ] Classic console (`conhost`): paste, and `m` toggles the mouse.
+
+**By hand, GUI** (`beam-gui`, once it ships; ADR-0049): the same flows as the
+view, plus opening the window on Arch under Wayland and under X11, which CI
+cannot do.
 
 ## Known gaps
 

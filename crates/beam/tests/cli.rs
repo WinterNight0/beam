@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use beam::cli::{EXIT_ERROR, EXIT_NOT_IMPLEMENTED, EXIT_OK, Io, execute};
-use beam::identity::{
+use beam_core::identity::{
     HEADER, Identity, KNOWN_PEERS_NAME, PRIVATE_KEY_NAME, PUBLIC_KEY_NAME, Peer, Store,
     decode_public_key,
 };
@@ -132,7 +132,7 @@ fn whoami_reports_the_key_on_disk() {
     let key = decode_public_key(json["public_key"].as_str().expect("public_key")).expect("key");
     assert_eq!(
         json["fingerprint"],
-        beam::identity::Fingerprint::of(&key).to_string(),
+        beam_core::identity::Fingerprint::of(&key).to_string(),
         "the reported fingerprint does not match the reported key"
     );
 }
@@ -325,7 +325,7 @@ fn invite_for(key: ed25519_dalek::VerifyingKey) -> String {
         .local_addr()
         .unwrap()
         .port();
-    beam::invite::Invite {
+    beam_core::invite::Invite {
         key,
         relay: None,
         addrs: vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))],
@@ -345,11 +345,11 @@ fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
     let store = Store::new(&dir);
     let mut known = store.load_known_peers().unwrap();
     let key = known.lookup("alice").unwrap().public_key;
-    let invite: beam::invite::Invite = invite_for(key).parse().unwrap();
-    beam::invite::remember(
+    let invite: beam_core::invite::Invite = invite_for(key).parse().unwrap();
+    beam_core::invite::remember(
         known.lookup_key_mut(&key).unwrap(),
         &invite,
-        &beam::config::Relay::Disabled,
+        &beam_core::config::Relay::Disabled,
     );
     store.save_known_peers(&known).unwrap();
     let file = tmp.path().join("note.txt");
@@ -378,10 +378,10 @@ fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
     }
 
     // The attempt is in the history, as a failure to reach alice (ADR-0043).
-    let history = beam::history::read(&store);
+    let history = beam_core::history::read(&store);
     assert_eq!(history.len(), 1, "{history:?}");
-    assert_eq!(history[0].direction, beam::history::Direction::Sent);
-    assert_eq!(history[0].outcome, beam::history::Outcome::Failed);
+    assert_eq!(history[0].direction, beam_core::history::Direction::Sent);
+    assert_eq!(history[0].outcome, beam_core::history::Outcome::Failed);
     assert_eq!(history[0].file, "note.txt");
     assert_eq!(
         history[0].fingerprint,
@@ -401,7 +401,7 @@ fn send_to_a_peer_that_is_not_listening_says_how_to_re_pair() {
     );
     let cleared = run(&dir, "", &["history", "--clear", "--yes"]);
     assert_eq!(cleared.code, EXIT_OK, "{}", cleared.stderr);
-    assert!(beam::history::read(&store).is_empty());
+    assert!(beam_core::history::read(&store).is_empty());
 }
 
 /// With the relay off and no address saved there is nowhere to look; beam says
@@ -601,7 +601,7 @@ fn an_invite_that_changes_a_peers_relay_needs_a_yes() {
         .lookup("alice")
         .unwrap()
         .public_key;
-    let invite = beam::invite::Invite {
+    let invite = beam_core::invite::Invite {
         key,
         relay: Some("https://relay.example.org/".parse().unwrap()),
         addrs: vec!["203.0.113.7:7820".parse().unwrap()],
@@ -657,8 +657,8 @@ fn a_no_relay_config_with_an_advertised_address_is_accepted() {
         "relay = \"none\"\nport = 7820\nadvertise = [\"203.0.113.7:7820\"]\n",
     )
     .unwrap();
-    let config = beam::config::Config::load(&dir.join("config.toml")).unwrap();
-    assert_eq!(config.relay, beam::config::Relay::Disabled);
+    let config = beam_core::config::Config::load(&dir.join("config.toml")).unwrap();
+    assert_eq!(config.relay, beam_core::config::Relay::Disabled);
     assert_eq!(config.advertise.len(), 1);
 
     std::fs::write(dir.join("config.toml"), "advertise = [\"my-pc:7820\"]\n").unwrap();

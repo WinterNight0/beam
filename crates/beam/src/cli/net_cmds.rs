@@ -16,20 +16,20 @@ use super::terminal::Keyboard;
 use super::terminal::TerminalReporter;
 use super::transfer_cmds::{EitherReporter, ReceiveJson, SendJson, reporter_for};
 use super::{App, CommandError, Io};
-use crate::config::Config;
-use crate::history;
-use crate::identity::{Fingerprint, encode_public_key};
-use crate::invite;
-use crate::listen_status::Board;
-use crate::listener::{ListenEvent, ListenOptions};
-use crate::pairing::rotation::NewCodeReason;
-use crate::pairing::{Network, Policy, Timeouts};
-use crate::transfer::{
-    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore, RejectReason, SendOptions, TransferError,
+use crate::ui;
+use beam_core::actions::{
+    self,
+    send::{SendError, SendRequest, Step},
 };
-use crate::transport::dial::{DialError, dial_transfer, interrupt, send_on};
-use crate::transport::endpoint::{self, Bind};
-use crate::{ui, untrusted};
+use beam_core::config::Config;
+use beam_core::identity::Fingerprint;
+use beam_core::listen_status::Board;
+use beam_core::listener::{ListenEvent, ListenOptions};
+use beam_core::pairing::rotation::NewCodeReason;
+use beam_core::pairing::{Network, Policy, Timeouts};
+use beam_core::transfer::{DEFAULT_ACCEPT_TIMEOUT, DEFAULT_MAX_AGE, PartialStore};
+use beam_core::transport::endpoint::Bind;
+use beam_core::{text, untrusted};
 
 impl App {
     fn network(&self, loopback: bool) -> Result<Network, CommandError> {
@@ -55,8 +55,8 @@ impl App {
         self.store.load_known_peers()?;
         // Two receivers on one identity would split the peers between them.
         if !matches!(
-            crate::agent::status::read(&self.store),
-            crate::agent::status::Running::No
+            beam_core::agent::status::read(&self.store),
+            beam_core::agent::status::Running::No
         ) {
             return Err(CommandError::Message(
                 "the background agent is running and already receives files (answer them with \
@@ -105,7 +105,7 @@ impl App {
         let options = ListenOptions {
             out_dir: out_dir.clone(),
             accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
-            stall_timeout: crate::transfer::engine::DEFAULT_STALL_TIMEOUT,
+            stall_timeout: beam_core::transfer::engine::DEFAULT_STALL_TIMEOUT,
             pairing: policy,
             timeouts: Timeouts::default(),
             allow_pairing: true,
@@ -123,7 +123,7 @@ impl App {
         let runtime = self.runtime()?;
         // Ctrl+C stops `listen` cleanly: a sender mid-transfer is told, what
         // arrived is kept, and `whoami` stops showing the code (ADR-0041).
-        let result = runtime.block_on(crate::listener::run_until(
+        let result = runtime.block_on(beam_core::listener::run_until(
             identity,
             self.store.clone(),
             network,
@@ -151,144 +151,105 @@ impl App {
         loopback: bool,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let identity = self.store.load_identity()?;
-        let known_peers = self.store.load_known_peers()?;
-        let peer = known_peers.lookup(peer_name).ok_or_else(|| {
-            CommandError::Peer(crate::identity::PeerError::NotFound(peer_name.to_string()))
-        })?;
-        let peer_name = peer.name.clone();
-        let peer_key = peer.public_key;
-        let network = self.network(loopback)?;
-        let peer_addr = invite::peer_addr(peer, &network.relay);
-        if !file.is_file() {
-            return Err(CommandError::Message(format!(
-                "{} is not a file",
-                file.display()
-            )));
-        }
-        let mut options = SendOptions::new(file, encode_public_key(&identity.verifying_key()));
-        // The receiver decides how long its question stays open: 60 s at
-        // `beam listen`, five minutes at a background agent, whose user first
-        // has to notice a notification (ADR-0042). Each answers "expired"
-        // itself, so the sender only needs to outlast the longest.
-        options.accept_timeout = crate::agent::AGENT_ACCEPT_TIMEOUT + Duration::from_secs(15);
-        if let Some(chunk_size) = chunk_size {
-            if chunk_size == 0 {
-                return Err(CommandError::Message(
-                    "--chunk-size must be at least 1".to_string(),
-                ));
-            }
-            options.chunk_size = chunk_size;
-        }
-
-        let size = std::fs::metadata(file).map_or(0, |m| m.len());
-        let file_name = file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // How it ended, for `history.jsonl` (ADR-0043).
-        let ended: std::sync::Mutex<Option<(history::Outcome, Option<String>)>> =
-            std::sync::Mutex::new(None);
-
+        let json = self.json;
+        let request = SendRequest {
+            peer: peer_name,
+            file,
+            chunk_size,
+            bind: if loopback { Bind::Loopback } else { Bind::Any },
+        };
+        let mut reporter = reporter_for(json);
         let runtime = self.runtime()?;
-        let result = runtime.block_on(async {
-            if !self.json {
-                writeln!(io.out, "Looking for {peer_name}...")?;
-                io.out.flush()?;
-            }
-            let endpoint = endpoint::bind(&identity, &network.relay, network.bind, 0, &[])
-                .await
-                .map_err(|e| CommandError::Message(e.to_string()))?;
-            // The connection, once there is one, so Ctrl+C can tell the peer.
-            let live = std::sync::Mutex::new(None);
-            let outcome = async {
-                let connection = dial_transfer(&endpoint, peer_addr).await.map_err(|e| {
-                    *ended.lock().expect("not poisoned") =
-                        Some((history::Outcome::Failed, Some("not reachable".to_string())));
-                    unreachable_message(&peer_name, &peer_key, e)
-                })?;
-                *live.lock().expect("not poisoned") = Some(connection.clone());
-                if !self.json {
-                    writeln!(io.out, "Sending {} to {peer_name}", file.display())?;
-                    io.out.flush()?;
-                }
-                let mut reporter = reporter_for(self.json);
-                let sent = send_on(&connection, &mut options, &mut reporter).await;
-                reporter.finish();
-                *ended.lock().expect("not poisoned") = Some(history::send_outcome(&sent));
-                sent.map_err(|e| refused_message(&peer_name, e))
-            };
-            // Ctrl+C: tell the receiver, so it does not wait for a timeout,
-            // and say so here (ADR-0041).
-            let (outcome, stopped) = tokio::select! {
-                outcome = outcome => (outcome, false),
-                () = interrupted() => {
-                    let connection = live.lock().expect("not poisoned").take();
-                    if let Some(connection) = &connection {
-                        interrupt(connection);
-                    }
-                    *ended.lock().expect("not poisoned") =
-                        Some(history::stopped_outcome(connection.is_some()));
-                    (Err(interrupted_message(&peer_name, connection.is_some())), true)
-                }
-            };
-            if stopped && !self.json {
-                // End the progress line before the message.
-                writeln!(io.out)?;
-            }
-            endpoint.close().await;
-            let summary = outcome?;
-
-            if self.json {
-                super::identity_cmds::write_json(
-                    io,
-                    &SendJson {
-                        transfer_id: summary.transfer_id.to_string(),
-                        peer: peer_name.clone(),
-                        bytes_sent: summary.bytes_sent,
-                        saved_as: summary.final_name.clone(),
-                    },
-                )?;
-            } else {
-                // The name is the receiver's to choose, so it is shown safely.
-                let saved = summary
-                    .final_name
-                    .as_deref()
-                    .map(crate::untrusted::name)
-                    .unwrap_or_else(|| "the peer did not say".to_string());
-                let skipped = if summary.bytes_skipped > 0 {
-                    format!(
-                        " ({} was already there)",
-                        ui::format_bytes(summary.bytes_skipped)
-                    )
-                } else {
-                    String::new()
-                };
-                writeln!(
-                    io.out,
-                    "Sent {} to {peer_name}, saved on their side as {saved}{skipped}",
-                    ui::format_bytes(summary.bytes_sent)
-                )?;
-            }
-            io.out.flush()?;
-            Ok::<(), CommandError>(())
-        });
-        runtime.shutdown_timeout(Duration::from_secs(1));
-        if let Some((outcome, note)) = ended.into_inner().expect("not poisoned") {
-            history::record(
+        let result = {
+            let out = &mut *io.out;
+            runtime.block_on(actions::send::send(
                 &self.store,
-                &history::Entry::now(
-                    history::Direction::Sent,
-                    &peer_name,
-                    &Fingerprint::of(&peer_key).hex(),
-                    &file_name,
-                    size,
-                    outcome,
-                    note,
-                ),
-            );
+                request,
+                &mut reporter,
+                |step| {
+                    if json {
+                        return;
+                    }
+                    let _ = match step {
+                        Step::Looking { peer } => writeln!(out, "Looking for {peer}..."),
+                        Step::Sending { peer } => {
+                            writeln!(out, "Sending {} to {peer}", file.display())
+                        }
+                    };
+                    let _ = out.flush();
+                },
+                // Ctrl+C: the receiver is told, so it does not wait for a
+                // timeout (ADR-0041).
+                interrupted(),
+            ))
+        };
+        runtime.shutdown_timeout(Duration::from_secs(1));
+
+        let sent = match result {
+            Ok(sent) => {
+                reporter.finish();
+                sent
+            }
+            Err(SendError::Stopped { reached }) => {
+                if !json {
+                    // End the progress line before the message.
+                    writeln!(io.out)?;
+                }
+                return Err(interrupted_message(peer_name, reached));
+            }
+            Err(error) => {
+                if matches!(error, SendError::Refused(_)) {
+                    reporter.finish();
+                }
+                return Err(send_failed(error));
+            }
+        };
+        let (peer_name, summary) = (sent.peer, sent.summary);
+        if json {
+            super::identity_cmds::write_json(
+                io,
+                &SendJson {
+                    transfer_id: summary.transfer_id.to_string(),
+                    peer: peer_name.clone(),
+                    bytes_sent: summary.bytes_sent,
+                    saved_as: summary.final_name.clone(),
+                },
+            )?;
+        } else {
+            // The name is the receiver's to choose, so it is shown safely.
+            let saved = summary
+                .final_name
+                .as_deref()
+                .map(beam_core::untrusted::name)
+                .unwrap_or_else(|| "the peer did not say".to_string());
+            let skipped = if summary.bytes_skipped > 0 {
+                format!(
+                    " ({} was already there)",
+                    text::format_bytes(summary.bytes_skipped)
+                )
+            } else {
+                String::new()
+            };
+            writeln!(
+                io.out,
+                "Sent {} to {peer_name}, saved on their side as {saved}{skipped}",
+                text::format_bytes(summary.bytes_sent)
+            )?;
         }
-        result
+        io.out.flush()?;
+        Ok(())
+    }
+}
+
+/// A send that did not happen, as `beam send` has always said it.
+fn send_failed(error: SendError) -> CommandError {
+    match error {
+        SendError::Store(e) => CommandError::Store(e),
+        SendError::Peer(e) => CommandError::Peer(e),
+        SendError::ZeroChunkSize => {
+            CommandError::Message("--chunk-size must be at least 1".to_string())
+        }
+        other => CommandError::Message(other.to_string()),
     }
 }
 
@@ -319,72 +280,12 @@ fn interrupted_message(peer: &str, told: bool) -> CommandError {
     })
 }
 
-/// Why `send` could not reach the peer, in words that say what to do.
-pub(crate) fn unreachable_message(
-    peer: &str,
-    key: &ed25519_dalek::VerifyingKey,
-    error: DialError,
-) -> CommandError {
-    let fingerprint = Fingerprint::of(key).short();
-    CommandError::Message(match error {
-        DialError::Unreachable(why) => format!(
-            "{peer} ({fingerprint}) is not reachable ({why}).\n       \
-             Either {peer} is not running `beam listen`, {peer} is somewhere beam was not\n       \
-             told about, or {peer}'s key has changed because it ran `beam init` again.\n       \
-             beam never follows a key change by itself.\n\n       \
-             If {peer} is listening, ask for the invite it shows now and run\n           \
-             beam pair <{peer}'s invite> --name {peer}\n       \
-             That only updates where to find {peer}; it cannot change {peer}'s key.\n\n       \
-             WARNING: if {peer} now has a new key, someone could be impersonating {peer}.\n       \
-             Check the new fingerprint with {peer} in person before you re-pair:\n           \
-             beam remove {peer}\n           \
-             beam pair <{peer}'s new invite> --name {peer}"
-        ),
-        DialError::NoAddress => format!(
-            "beam does not know where to find {peer} ({fingerprint}): no relay is set in\n       \
-             config.toml and no address was saved for {peer}. Ask for the invite `beam listen`\n       \
-             shows on {peer} and run\n           \
-             beam pair <{peer}'s invite> --name {peer}"
-        ),
-        other => other.to_string(),
-    })
-}
-
-/// A refusal from the peer, said the way a person would say it.
-pub(crate) fn refused_message(peer: &str, error: TransferError) -> CommandError {
-    match error {
-        TransferError::PeerInterrupted => CommandError::Message(format!(
-            "{peer} stopped beam on their side (Ctrl+C), so the transfer was cancelled.\n       \
-             Anything {peer} already received is kept: send the same file again later to resume."
-        )),
-        TransferError::Rejected(RejectReason::Busy) => {
-            CommandError::Message(format!("{peer} is receiving another file; try again later"))
-        }
-        TransferError::Rejected(RejectReason::UnknownPeer) => CommandError::Message(format!(
-            "{peer} does not recognise this device's key.\n       \
-             Either {peer} removed this device, or this device's key changed since pairing\n       \
-             because `beam init` was run again here.\n\n       \
-             WARNING: a changed key is exactly what an impersonator would present, so {peer}\n       \
-             must not simply accept it. To re-pair, compare fingerprints in person:\n           \
-             on {peer}:  beam remove <this device>, then beam listen\n           \
-             here:     beam remove {peer}, then beam pair <{peer}'s invite> --name {peer}"
-        )),
-        TransferError::Rejected(RejectReason::Declined) => {
-            CommandError::Message(format!("{peer} declined the transfer"))
-        }
-        TransferError::Rejected(RejectReason::Expired) => CommandError::Message(format!(
-            "{peer} did not answer within a minute; the transfer was not accepted"
-        )),
-        other => other.into(),
-    }
-}
-
 /// Prints what `listen` hears. Runs on the listener's tasks, so it writes to
 /// the process's stdout and stderr directly.
 struct Screen {
     json: bool,
     out_dir: String,
-    store: crate::identity::Store,
+    store: beam_core::identity::Store,
     /// Everything `listen` prints goes through the desk, so a notice never
     /// lands in the middle of an open question without the question being
     /// drawn again (M6 item 5).
@@ -540,7 +441,7 @@ impl Screen {
                 let how = if summary.resumed {
                     format!(
                         " (resumed; {} received this time)",
-                        ui::format_bytes(summary.received_now)
+                        text::format_bytes(summary.received_now)
                     )
                 } else {
                     String::new()
@@ -548,7 +449,7 @@ impl Screen {
                 writeln!(
                     out,
                     "Received {} from {} ({}), saved as {}{}",
-                    ui::format_bytes(summary.bytes),
+                    text::format_bytes(summary.bytes),
                     untrusted::name(&summary.peer_name),
                     summary.fingerprint,
                     untrusted::name(&summary.final_name),

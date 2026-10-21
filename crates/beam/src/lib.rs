@@ -1,23 +1,12 @@
 //! beam sends files directly between two computers.
 //!
-//! A peer must be paired before it can send anything, and every incoming
-//! transfer has to be accepted by hand. There is no auto-accept.
+//! This crate is beam's front ends: the command line ([`cli`]) and the
+//! full-screen view ([`tui`]). Everything they share, and every security
+//! rule, is in `beam-core` (ADR-0048).
 //!
 //! The command implementations live in [`cli`] rather than in the binary so
 //! that they can be exercised by tests; see `docs/decisions.md` ADR-0002.
 
-pub mod agent;
 pub mod cli;
-pub mod config;
-pub(crate) mod hex;
-pub mod history;
-pub mod identity;
-pub mod invite;
-pub mod listen_status;
-pub mod listener;
-pub mod pairing;
-pub mod transfer;
-pub mod transport;
 pub mod tui;
 pub mod ui;
-pub mod untrusted;

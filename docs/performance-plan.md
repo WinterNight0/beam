@@ -122,7 +122,7 @@ Still open: items 1, 2 and 4, and item 3 with `relay = "none"`.
 
 ### Step 1: a repeatable benchmark — done
 
-`crates/beam/tests/throughput.rs`, ignored in the normal test run:
+`crates/beam-core/tests/throughput.rs`, ignored in the normal test run:
 
 ```
 cargo test --release --test throughput -- --ignored --nocapture

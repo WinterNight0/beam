@@ -10,7 +10,7 @@
 //! The point of the prototype is what is *absent*. There is no adapter type, no
 //! framing shim, no copy loop bridging two worlds. iroh hands back a QUIC
 //! stream pair that already implements `tokio::io::AsyncRead` and
-//! `AsyncWrite`, and `beam::transfer::send_file` / `receive_file` are generic
+//! `AsyncWrite`, and `beam_core::transfer::send_file` / `receive_file` are generic
 //! over exactly that. `tokio::io::join` is the whole adapter.
 //!
 //! The identity is not a second identity either: iroh's `SecretKey` is an
@@ -25,8 +25,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use beam::identity::{KnownPeers, Store, encode_public_key};
-use beam::transfer::{
+use beam_core::identity::{KnownPeers, Store, encode_public_key};
+use beam_core::transfer::{
     Prompt, PromptRequest, ReceiveOptions, SendOptions, SilentReporter, receive_file, send_file,
 };
 use iroh::endpoint::presets;
@@ -162,7 +162,7 @@ async fn listen(endpoint: &Endpoint, store: &Store, out_dir: PathBuf) -> Result<
 
 async fn send(
     endpoint: &Endpoint,
-    identity: &beam::identity::Identity,
+    identity: &beam_core::identity::Identity,
     to: &str,
     direct: &[String],
     file: &PathBuf,

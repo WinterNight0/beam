@@ -6,8 +6,8 @@
 mod agent_cmds;
 pub mod desk;
 mod history_cmds;
-pub(crate) mod identity_cmds;
-pub(crate) mod net_cmds;
+mod identity_cmds;
+mod net_cmds;
 mod pair_cmds;
 mod stubs;
 mod terminal;
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::identity::{PeerError, Store, StoreError};
+use beam_core::identity::{PeerError, Store, StoreError};
 
 /// Process exit codes.
 pub const EXIT_OK: i32 = 0;
@@ -68,10 +68,10 @@ pub enum CommandError {
     /// Boxed because a transfer error is much larger than the others, and an
     /// enum is as big as its biggest variant.
     #[error(transparent)]
-    Transfer(Box<crate::transfer::TransferError>),
+    Transfer(Box<beam_core::transfer::TransferError>),
 
     #[error(transparent)]
-    Partial(Box<crate::transfer::PartialError>),
+    Partial(Box<beam_core::transfer::PartialError>),
     #[error("{0}")]
     Message(String),
 }
@@ -339,8 +339,8 @@ pub fn start(io: &mut Io<'_>) -> i32 {
         && let Ok(dir) = Store::default_dir()
     {
         let store = Store::new(dir);
-        match crate::config::Config::load(&store.config_path()) {
-            Ok(config) if config.ui == crate::config::UiMode::Tui => {
+        match beam_core::config::Config::load(&store.config_path()) {
+            Ok(config) if config.ui == beam_core::config::UiMode::Tui => {
                 return match crate::tui::run(&store) {
                     Ok(()) => EXIT_OK,
                     Err(e) => {
@@ -442,7 +442,7 @@ where
             let _ = writeln!(
                 io.err,
                 "beam: {}",
-                crate::untrusted::lines(&err.to_string())
+                beam_core::untrusted::lines(&err.to_string())
             );
             match err {
                 CommandError::NotImplemented { .. } => EXIT_NOT_IMPLEMENTED,

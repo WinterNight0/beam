@@ -14,11 +14,11 @@
 
 use std::time::{Duration, Instant};
 
-use super::app::{App, Choice, Effect, Key, Modal, Tab, Target};
+use super::app::{App, Ask, Choice, Effect, Key, Modal, SameFingerprints, Tab, Target};
 use super::input::Input;
 use super::pairing::{Answer, Update};
-use crate::identity::MAX_NAME_LEN;
-use crate::pairing::PairingCode;
+use beam_core::identity::MAX_NAME_LEN;
+use beam_core::pairing::PairingCode;
 
 /// The longest invite the box takes; real ones are a few hundred characters.
 const MAX_INVITE: usize = 2048;
@@ -220,22 +220,23 @@ impl App {
                 input: Input::new(MAX_CODE),
                 error: None,
             }),
-            Update::AskConfirm { name, peer, own } => Some(Modal::ConfirmPair {
-                name,
-                peer,
-                own,
-                focus: Choice::No,
-            }),
-            Update::Finished(Ok((name, fingerprint))) => {
+            Update::AskConfirm { name, peer, own } => {
+                Some(Modal::ConfirmPair(Ask::new(SameFingerprints {
+                    name,
+                    peer,
+                    own,
+                })))
+            }
+            Update::Finished(Ok(super::pairing::Paired { name, fingerprint })) => {
                 self.flash = Some(format!("Paired with {name}."));
                 self.add = AddForm::default();
                 self.tab = Tab::Friends;
                 self.pending_select = Some(fingerprint);
                 None
             }
-            Update::Finished(Err(reason)) => Some(Modal::Output {
+            Update::Finished(Err(unpaired)) => Some(Modal::Output {
                 title: "Not paired".to_string(),
-                text: reason,
+                text: super::pairing::words(&unpaired),
                 scroll: 0,
                 failed: true,
             }),
@@ -295,51 +296,29 @@ impl App {
                 });
                 effect
             }
-            Modal::ConfirmPair {
-                name,
-                peer,
-                own,
-                focus,
-            } => {
-                let focus = match key {
+            Modal::ConfirmPair(mut ask) => {
+                match key {
                     Key::Esc => return self.answer_pair(false),
-                    Key::Enter => return self.answer_pair(focus == Choice::Yes),
-                    Key::Left | Key::Right | Key::Tab | Key::BackTab => flip(focus),
-                    _ => focus,
-                };
-                self.modal = Some(Modal::ConfirmPair {
-                    name,
-                    peer,
-                    own,
-                    focus,
-                });
+                    Key::Enter => return self.answer_pair(ask.focus() == Choice::Yes),
+                    Key::Left | Key::Right | Key::Tab | Key::BackTab => ask.flip(),
+                    _ => {}
+                }
+                self.modal = Some(Modal::ConfirmPair(ask));
                 None
             }
-            Modal::RelayChange {
-                name,
-                fingerprint,
-                old,
-                new,
-                invite,
-                focus,
-            } => {
-                let focus = match key {
+            Modal::RelayChange(mut ask) => {
+                match key {
                     Key::Esc => return self.keep_relay(),
-                    Key::Enter if focus == Choice::Yes => {
-                        return Some(Effect::UpdateLocation { invite });
+                    Key::Enter if ask.focus() == Choice::Yes => {
+                        return Some(Effect::UpdateLocation {
+                            invite: ask.into_question().invite,
+                        });
                     }
                     Key::Enter => return self.keep_relay(),
-                    Key::Left | Key::Right | Key::Tab | Key::BackTab => flip(focus),
-                    _ => focus,
-                };
-                self.modal = Some(Modal::RelayChange {
-                    name,
-                    fingerprint,
-                    old,
-                    new,
-                    invite,
-                    focus,
-                });
+                    Key::Left | Key::Right | Key::Tab | Key::BackTab => ask.flip(),
+                    _ => {}
+                }
+                self.modal = Some(Modal::RelayChange(ask));
                 None
             }
             other => {
@@ -379,8 +358,10 @@ impl App {
             (Modal::ConfirmPair { .. }, Some((_, Target::Button(answer)))) => {
                 self.answer_pair(answer == Choice::Yes)
             }
-            (Modal::RelayChange { invite, .. }, Some((_, Target::Button(Choice::Yes)))) => {
-                Some(Effect::UpdateLocation { invite })
+            (Modal::RelayChange(ask), Some((_, Target::Button(Choice::Yes)))) => {
+                Some(Effect::UpdateLocation {
+                    invite: ask.into_question().invite,
+                })
             }
             (Modal::RelayChange { .. }, Some((_, Target::Button(Choice::No)))) => self.keep_relay(),
             // A click beside a pop-up leaves it open.
@@ -425,13 +406,6 @@ impl App {
     fn keep_relay(&mut self) -> Option<Effect> {
         self.flash = Some("Nothing was changed.".to_string());
         None
-    }
-}
-
-fn flip(choice: Choice) -> Choice {
-    match choice {
-        Choice::Yes => Choice::No,
-        Choice::No => Choice::Yes,
     }
 }
 

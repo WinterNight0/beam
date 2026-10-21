@@ -22,14 +22,16 @@ use std::time::Duration;
 use super::desk::{DeskPrompt, PromptDesk};
 use super::terminal::Keyboard;
 use super::{App, CommandError, Io};
-use crate::config::Config;
-use crate::identity::{Identity, Peer};
-use crate::invite::{self, Invite};
-use crate::pairing::{
-    CodeSlot, Event, Network, PairError, Pairing, PairingCode, PairingError, Timeouts, join, wait,
+use crate::ui;
+use beam_core::actions::{
+    self,
+    pair::{Location, PairFailure, PairRequest},
 };
-use crate::transport::endpoint::Bind;
-use crate::{ui, untrusted};
+use beam_core::identity::Identity;
+use beam_core::invite::{self, Invite};
+use beam_core::pairing::{Event, Network, PairError, PairingCode, PairingError, Timeouts};
+use beam_core::transport::endpoint::Bind;
+use beam_core::untrusted;
 
 /// How long the joiner has to type the code.
 const CODE_ENTRY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -48,16 +50,9 @@ impl App {
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
         let identity = self.store.load_identity()?;
-        let known = self.store.load_known_peers()?;
-        let config = Config::load(&self.store.config_path())
-            .map_err(|e| CommandError::Message(e.to_string()))?;
-        let network = Network {
-            relay: config.relay,
-            bind: if loopback { Bind::Loopback } else { Bind::Any },
-            port: config.port,
-            advertise: config.advertise,
-        };
-        let timeouts = Timeouts::default();
+        self.store.load_known_peers()?;
+        let bind = if loopback { Bind::Loopback } else { Bind::Any };
+        let network = actions::pair::network(&self.store, bind).map_err(pair_failed)?;
 
         // Read the invite before anything else, so a damaged one is caught
         // without touching the network.
@@ -72,100 +67,72 @@ impl App {
         // An invite from a device that is already paired: only where to find
         // it changes. No code, no network, and never the key.
         if let Some(invite) = &invite
-            && known.lookup_key(&invite.key).is_some()
+            && let Some(location) =
+                actions::pair::already_paired(&self.store, invite).map_err(pair_failed)?
         {
-            return self.update_location(invite, name, &network, io);
+            return self.update_location(invite, location, name, io);
         }
 
         let keyboard = Keyboard::start();
-        let confirm = DeskPrompt::new(PromptDesk::terminal(keyboard.clone()), timeouts.decision);
+        let confirm = DeskPrompt::new(
+            PromptDesk::terminal(keyboard.clone()),
+            Timeouts::default().decision,
+        );
+        let read_code = || async move {
+            tokio::task::spawn_blocking(move || read_code(&keyboard))
+                .await
+                .map_err(std::io::Error::other)?
+        };
         let runtime = self.runtime()?;
-        let pairing = Pairing {
-            identity: &identity,
-            known: &known,
+        let request = PairRequest {
+            invite: invite.as_ref(),
             name: Some(name),
-            network: &network,
-            timeouts,
+            bind,
+        };
+        let result = runtime.block_on(actions::pair::pair(
+            &self.store,
+            request,
+            confirm,
+            read_code,
+            |event| show_event(io, &identity, &network, event),
+            // Ctrl+C ends the process, as it always did for `beam pair`.
+            std::future::pending(),
+        ));
+        let friend = match result {
+            Ok(friend) => friend,
+            Err(PairFailure::NotPaired(e)) => return Err(not_paired(e, wait_for_peer)),
+            Err(other) => return Err(pair_failed(other)),
         };
 
-        let result = runtime.block_on(async {
-            match &invite {
-                None => {
-                    let code = PairingCode::generate()
-                        .map_err(|e| PairError::Io(std::io::Error::other(e)))?;
-                    let slot = CodeSlot::new(code, timeouts.code_ttl);
-                    wait(&pairing, slot, confirm, |event| {
-                        show_event(io, &identity, &network, event)
-                    })
-                    .await
-                }
-                Some(invite) => {
-                    let keyboard = keyboard.clone();
-                    let read_code = || async move {
-                        tokio::task::spawn_blocking(move || read_code(&keyboard))
-                            .await
-                            .map_err(std::io::Error::other)?
-                    };
-                    join(&pairing, invite, read_code, confirm, |event| {
-                        show_event(io, &identity, &network, event)
-                    })
-                    .await
-                }
-            }
-        });
-
-        let key = result.map_err(|e| not_paired(e, wait_for_peer))?.key;
-
-        // Read the file again: it may have changed while the prompt was up.
-        let mut known = self.store.load_known_peers()?;
-        let mut peer = Peer::new(name, key);
-        if let Some(invite) = &invite {
-            invite::remember(&mut peer, invite, &network.relay);
-        }
-        let fingerprint = peer.fingerprint();
-        known.add(peer)?;
-        self.store.save_known_peers(&known)?;
-
         writeln!(io.out)?;
-        writeln!(io.out, "Paired with {name}.")?;
-        ui::field(io.out, "Fingerprint", &fingerprint.to_string())?;
+        writeln!(io.out, "Paired with {}.", friend.name)?;
+        ui::field(io.out, "Fingerprint", &friend.fingerprint.to_string())?;
         Ok(())
     }
 
-    /// Saves where an already-paired device can be found now.
+    /// Saves where an already-paired device can be found now, asking first
+    /// if that moves it to a different relay.
     fn update_location(
         &self,
         invite: &Invite,
+        location: Location,
         asked_name: &str,
-        network: &Network,
         io: &mut Io<'_>,
     ) -> Result<(), CommandError> {
-        let mut known = self.store.load_known_peers()?;
-        let peer = known
-            .lookup_key_mut(&invite.key)
-            .expect("checked by the caller");
-        let name = untrusted::name(&peer.name);
-        let fingerprint = peer.fingerprint();
-
-        // A different relay is the one change worth a question: whoever runs
-        // a relay sees when this device sends to that peer, and from where,
-        // and can block it. A peer's key is public, so anyone can make an
-        // invite that names it with their own relay (ADR-0038). Addresses
-        // alone are saved without asking: the relay still reaches the peer.
-        let old_relay = peer.attr(invite::RELAY_ATTR).map(str::to_string);
-        let new_relay = invite::relay_attr(invite, &network.relay);
-        if old_relay != new_relay {
+        let name = untrusted::name(&location.name);
+        let fingerprint = location.fingerprint;
+        if location.changes_relay() {
             let describe = |relay: &Option<String>| match relay {
                 Some(url) => url.clone(),
-                None => format!("this device's own relay ({})", network.relay),
+                None => format!("this device's own relay ({})", location.own_relay),
             };
             writeln!(
                 io.out,
                 "{name} is already paired, and this invite moves it to a different relay:"
             )?;
             ui::field(io.out, "Fingerprint", &fingerprint.to_string())?;
-            ui::field(io.out, "Relay now", &describe(&old_relay))?;
-            ui::field(io.out, "Relay after", &describe(&new_relay))?;
+            ui::field(io.out, "Relay now", &describe(&location.relay_now))?;
+            ui::field(io.out, "Relay after", &describe(&location.relay_after))?;
             writeln!(
                 io.out,
                 "Whoever runs a relay can see when you send to {name} and can block it, but \
@@ -177,12 +144,9 @@ impl App {
             }
         }
 
-        let peer = known
-            .lookup_key_mut(&invite.key)
-            .expect("checked by the caller");
-        invite::remember(peer, invite, &network.relay);
-        self.store.save_known_peers(&known)?;
-
+        // Here either the relay is unchanged or the person said yes.
+        actions::pair::save_location(&self.store, invite, location.changes_relay())
+            .map_err(pair_failed)?;
         writeln!(
             io.out,
             "{name} is already paired. Updated where to find it; its key is unchanged."
@@ -195,6 +159,16 @@ impl App {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Anything but the pairing itself going wrong, as `beam pair` says it.
+fn pair_failed(error: PairFailure) -> CommandError {
+    match error {
+        PairFailure::Store(e) => CommandError::Store(e),
+        PairFailure::Peer(e) => CommandError::Peer(e),
+        PairFailure::NotPaired(e) => not_paired(e, false),
+        other => CommandError::Message(other.to_string()),
     }
 }
 

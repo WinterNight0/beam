@@ -2482,7 +2482,8 @@ been failing after the QoL merge.
   `Cargo.lock`, so it is not a platform test.
 * Container jobs run as **root**, which ignores file permissions: no test may
   depend on a permission being enforced (none does; the private-file tests
-  check the mode bits beam sets, which still holds).
+  check the mode bits beam sets, which still holds). *Superseded by
+  ADR-0050: the tests now run as an ordinary user.*
 * Fixed while reviewing Linux-only behaviour: the file browser (ADR-0045)
   treated `D:` as a drive letter on every platform, and its test expected
   that; drive letters are now Windows-only.
@@ -2533,3 +2534,302 @@ mouse captured its own selection is off.
   `tui::app::tests::ctrl_v_reads_the_clipboard_only_where_something_is_typed`,
   `m_gives_the_mouse_to_the_terminal_and_back_but_is_a_letter_when_typing`; the
   clipboard read was run once on Windows (exit 0, about 0.3 s).
+
+## ADR-0048 — Four layers in three crates: core, actions, model, front ends
+
+**Status:** accepted (2026-10-12). Branch `RE-Arrange-Structure`, patches #1–#7.
+Prepares the GUI (SPIKE-002; its library choice will be ADR-0049).
+
+**Context.** beam had one crate. Its core was already clean of the
+terminal in most places, but three things reached up a layer (the transfer
+engine borrowed terminal formatting helpers, the view borrowed from the
+CLI, the agent printed by itself), and the flows a person runs were written
+twice: `beam send` and the view's Send were about 90 % the same code, and so
+were the two pairing flows and the two "update where a friend is" paths. A
+GUI would have made each a third copy. The rules that keep beam safe sit in
+the core, but the code *around* them (which friend's key, the relay
+question, the safe default of a pop-up) was repeated in every copy, where
+one copy could drift.
+
+### Decision
+
+Four layers, each allowed to use only the ones below it:
+
+| Layer | Crate | Holds |
+|---|---|---|
+| L1 core | `beam-core` | identity, pairing, transfer engine, transport, listener, agent, history, config, `untrusted`, `text` |
+| L2 actions | `beam-core`, `actions/` | one copy of each flow a person runs: `send`, `pair` (and "already paired"), `receive` (agent / Receiving switch settings), `inbox`, and every failed-send message |
+| L3 model | `beam-model` | what a screen shows: `Snapshot` (me, friends, last seen), `requests` (pending, Receiving switch), `sending`, and `ask` |
+| L4 front ends | `beam` (CLI + full-screen view); later `beam-gui` | words, keys, clicks, layout |
+
+* **The build enforces the layers.** `beam-core` lists no terminal or GUI
+  library and does not depend on `beam-model` or `beam`, so it cannot print,
+  draw or call a front end. `beam-model` depends on `beam-core` only.
+  Inside `beam-core`, where core and actions share a crate,
+  `tests/layers.rs` refuses any core module that names `actions` (or a
+  crate above), and any new file not placed in a layer.
+* **`Ask<Q>`**: every yes/no question that could accept a file, pair, remove
+  a friend, move a friend's relay or cut off a transfer is an `Ask`, whose
+  only constructor highlights **No** and whose highlight is private. A
+  front end, the GUI included, cannot open one on Yes.
+* **Safe entry points only.** `actions::pair::save_location` refuses a
+  relay change unless the caller says the person agreed (ADR-0038); the
+  failed-send messages come back already cleaned (ADR-0034), so no front end
+  can forget to clean them.
+* **Front ends keep their words.** Actions and model report *what happened*
+  (an error variant, a `Happened`, a `Toggle`); each front end words it, so
+  every CLI and view message reads exactly as before.
+* **Dependency versions are set once**, in the workspace `Cargo.toml`, so the
+  exact pins on `iroh` and `spake2` cannot differ between crates.
+* **Tests live with what they test**: core-only integration tests in
+  `crates/beam-core/tests`, CLI ones in `crates/beam/tests`. The S-17
+  no-discovery test scans every crate in the workspace.
+
+How it was done: safety-net tests first (a send reaches only the chosen
+friend, through the CLI and the view; the Receiving switch never pairs),
+then the layer violations, then the shared actions, then the crate split
+(pure `git mv`, then explicit `beam_core::` paths), then the model, each a
+reviewed patch with every test passing.
+
+### Consequences
+
+* A feature is written once and used by every front end. The order for a
+  new one is in CLAUDE.md ("Adding a feature"); `docs/parity.md` says which
+  front end offers what.
+* The view lost about 240 lines of duplicated flow, and the CLI/view pop-ups
+  their hand-written `focus` fields.
+* Found and fixed on the way: SECURITY.md **F-5** (the view drew a failed
+  send's message uncleaned) and the relay-change rule moved from "every
+  front end asks" to "the save refuses without a yes".
+* The GUI spike no longer pulls in the terminal libraries (its lockfile lost
+  about 440 lines).
+* Cost: three crates to keep in step, and a public API in `beam-core` and
+  `beam-model` that must stay small and safe; a type that leaves the core is
+  a promise.
+* The old Go `Makefile` (ADR-0010) is replaced: `make check` runs fmt-check,
+  clippy and test over the workspace, as CI does.
+* Found while making the suite reliable for the merge: on Windows, replacing
+  a file fails while another program has it open (an antivirus scan, an
+  indexer, a test reading `state.json`), which failed transfers. Every
+  replace now goes through `beam-core/src/replace.rs`, which retries that
+  one error for about a second on Windows only; see the test plan's "flaky
+  tests".
+
+## ADR-0049 — The GUI: iced, as a fourth crate beside the CLI and the view
+
+**Status:** accepted (2026-10-14). Branch `GUI-Experimental`, GUI EX Patch #1.
+Evidence: SPIKE-002 (`docs/spikes/gui.md`), the mockups in `spike/gui-iced`.
+
+**Context.** Even the full-screen view (ADR-0043) assumes someone at ease in
+a terminal. A desktop window is for everyone else. SPIKE-002 compared iced,
+Slint, egui, Tauri and JavaFX and prototyped iced: it builds with beam's
+MSRV and lints, its `Message` → `update` → `view` is the shape the view
+already has, it opens the OS file picker through `rfd`, it is tested
+without a screen (`iced_test`), and it falls back to a software renderer.
+JavaFX (the team's experience) was ruled out because it cannot call beam's
+Rust code: every flow and safe default would be written again in Java.
+ADR-0048 then split beam so a GUI reuses the flows (`beam-core` actions)
+and the model (`beam-model`, where every yes/no question starts on No).
+
+### Decision
+
+* **iced, pinned `=0.14.0`** (with `iced_test` for tests), and **`rfd`
+  `=0.17.2`** for the OS file and folder pickers, added in the patch that
+  first uses it. Pinned exactly like iroh: iced is not 1.0, and every minor
+  release breaks its API; an upgrade is its own reviewed commit.
+* **A fourth crate, `crates/beam-gui`** (binary `beam-gui`), a front end on
+  `beam-core` and `beam-model` only. It never uses the `beam` crate or a
+  terminal library (`crates/beam-gui/tests/layers.rs`), so every flow and
+  safe default it offers is the one the CLI and the view share.
+* **Look:** Aero's structure (sidebar, panes, framed dialogs) with the rice
+  style direction (modern, dark-friendly), from the spike's mockups.
+* **Built in steps on `GUI-Experimental`** (GUI EX Patch #1, #2, …), each
+  reviewed, with `iced_test` tests: skeleton, look and shell, friends,
+  pairing, receiving, sending, history and settings. **No release yet**:
+  the core is to grow further first. When it ships, it is a second download
+  that also contains `beam`, tagged `gui-v*`; `main` gets the GUI only then.
+* The CLI stays the reference front end (ADR-0048, `docs/parity.md`); the
+  GUI may lag a feature, never weaken a rule.
+
+### Consequences
+
+* Requirement N-1 ("terminal only, no GUI") and N-2 ("a single binary") are
+  revised: the terminal front ends still need nothing else; the GUI is an
+  optional second front end.
+* About 215 more crates in `Cargo.lock` (iced's renderers and windowing).
+  None of the existing ones changed version, so the `beam` binary's tree is
+  unchanged; `security.yml` audits the new ones with the rest.
+* `cargo build`/`cargo test` over the workspace now build the GUI too, so CI
+  takes longer. Opening a real window on Arch (Wayland or X11) needs a
+  desktop, so it is a manual check; CI builds and runs the screen-free tests.
+* Memory: the spike measured 219 MB with the GPU renderer and 33 MB with
+  the software one (the skeleton: 224 MB, debug, GPU). The default is
+  decided once the real theme exists.
+* Would reopen this: iced failing on Arch in a way that cannot be
+  configured away, or an upgrade we need costing more than a few days.
+  Then Slint, after checking its licence.
+* `spike/gui-iced` stays as the testing ground until the GUI is usable; it
+  is in `.gitignore` already, and will then be removed from the repository
+  but kept locally.
+
+## ADR-0050 — CI: when it runs, tests as an ordinary user, the minimum Rust, a weekly audit
+
+**Status:** accepted (2026-10-12). Branch `RE-Arrange-Structure`, "CI/CD
+Upgrade - Patch #1". (ADR-0049 stays reserved for the GUI library choice.)
+
+**Context.** The Linux job had failed on every run since the repository went
+up, on Ubuntu and then on Arch (ADR-0046), while Windows passed. Reading the
+logs showed why it stayed red so long: `cargo test` stops at the first test
+program that fails, so each run showed one failure and hid whatever came
+after it. Two of those failures were real Linux bugs or races (the free-space
+check on a folder not made yet, and the inbox history timing; see the test
+plan). Four more gaps:
+
+* CI ran on every push to `main` and on pull requests into *any* branch,
+  yet the planned branch flow puts work into `GUI-Experimental` for weeks
+  before `main` (ADR-0048 lands there first, the GUI after).
+* The Arch container runs as root, which ignores file permissions; a test
+  that a private file really is private would pass whatever beam did.
+* `rust-version = "1.91"` was declared but never built: every job used the
+  newest stable.
+* The dependency audit ran only when code was pushed, so an advisory
+  published against an unchanged `Cargo.lock` went unnoticed.
+
+### Decision
+
+* **When CI runs:** a pull request into `main` or `GUI-Experimental`, a push
+  to `main`, or by hand (`workflow_dispatch`). A push to another branch does
+  not: a branch is checked when it is offered for merging, or on request.
+* **Every cargo command uses `--locked`** (a run that would change
+  `Cargo.lock` fails) and `--workspace`. **Tests use `--no-fail-fast`**, so
+  one run lists every failing test.
+* **The Arch job builds and tests as an ordinary user** (`builder`), as beam
+  runs for real. Only installing packages and creating the user use root.
+  This replaces ADR-0046's "no test may depend on a permission being
+  enforced".
+* **A job builds and tests with Rust 1.91**, the declared minimum, on
+  GitHub's Ubuntu image. If a dependency ever needs newer, `rust-version` is
+  raised on purpose and documented, never the job dropped. Checked locally
+  before adding it: the whole suite passes on 1.91 with `-D warnings`.
+* **The audit moves to `security.yml`**, which runs on the same events plus
+  **weekly** (Mondays 03:17 UTC). Same rule as before: a vulnerability fails,
+  an unmaintained notice warns.
+* `actions/checkout` moves to v5.1.0 (v4 ran on Node 20, which GitHub has
+  deprecated), pinned by commit hash like every action (ADR-0038).
+
+Not now: a release build and packaging (`release.yml`, with checksums), which
+belong with the first release from `main`; required status checks on `main`,
+a repository setting once CI is green; no new security tools.
+
+### Consequences
+
+* A feature branch can be pushed freely; it is checked when its pull request
+  opens and on every push after that.
+* GitHub runs scheduled workflows, and offers the "Run workflow" button,
+  only from `main`. Until `GUI-Experimental` is merged into `main`, the
+  weekly audit does not fire and a manual run may be refused; the pull
+  request runs work from the start.
+* A test may now rely on a permission being enforced on Linux, so tests such
+  as "a receive folder beam cannot write to" become possible.
+* One more Linux job per run (the minimum Rust); the audit leaving `ci.yml`
+  keeps the total about the same.
+* Supersedes the "every push and pull request" trigger of ADR-0014 and the
+  root rule of ADR-0046; both are otherwise unchanged.
+
+## ADR-0051 — The GUI's fonts and icons are bundled: Inter, JetBrains Mono, Fluent UI System Icons
+
+**Status:** accepted (2026-10-14). GUI EX Patch #2. Assets:
+`crates/beam-gui/assets/` (sources, versions and how to rebuild in its
+`README.md`; licence texts in `LICENSES/`).
+
+**Context.** The enterprise mock-up (SPIKE-002) drew with fonts and icons
+borrowed from Windows: Segoe UI, Cascadia Mono, Segoe MDL2 Assets. Arch has
+none of them, so the same window would show a fallback font and empty boxes
+for icons. beam must look the same on both platforms (ADR-0046), and
+nothing it draws should depend on what a system has installed.
+
+### Decision
+
+* **Bundle three open asset sets** into `beam-gui` with `include_bytes!`,
+  registered with iced at start-up; nothing is fetched at run time:
+
+  | Use | Asset | Licence |
+  |---|---|---|
+  | Interface text | **Inter 4.1** (Regular, SemiBold, Bold) | SIL OFL 1.1 |
+  | Fingerprints, invites, paths | **JetBrains Mono 2.304** (Regular): `0`/`O` and `1`/`l` clearly differ, which matters when people read fingerprints aloud to compare them | SIL OFL 1.1 |
+  | Icons | **Fluent UI System Icons** (Regular, Microsoft), as a font so iced draws icons as text with no extra feature | MIT |
+
+* **The icon font is cut down** to the glyphs `src/icons.rs` names (32;
+  2.8 MB → under 7 KB), with fontTools as a one-off development tool, not a
+  dependency. `icons::tests::every_icon_is_in_the_bundled_font` parses the
+  bundled font and fails if an icon is missing from it.
+* Assets are treated like dependencies: an MIT-compatible licence, the
+  licence text committed beside them, and approval before one is added.
+* Chosen in the spike and checked on Windows 11 and on Arch Linux under
+  Niri (Wayland), where the window also showed that a tiling compositor
+  ignores the minimum window size: the layout adapts to the width instead.
+
+### Consequences
+
+* About 1.5 MB of fonts in the `beam-gui` binary; `beam` is unchanged.
+* The fonts are unmodified OFL files; OFL allows bundling them in software
+  of any licence, and forbids only selling the fonts on their own.
+* A new icon means a rebuilt subset (`assets/README.md`); the test says so
+  if it is forgotten.
+* The fonts are parsed by iced's text stack from bytes compiled into the
+  binary, never from a file a peer or a download could supply.
+* Still to come, each needing its own decision: beam's logo and the app
+  icons (window, `.exe`, Linux), part of the release work.
+
+## ADR-0052 — The GUI's renderer and its saved preferences
+
+**Status:** accepted (2026-10-16). GUI EX Patch #9. Code:
+`crates/beam-core/src/gui_prefs.rs`, `crates/beam-gui/src/renderer.rs`,
+`crates/beam-gui/src/app/prefs.rs`.
+
+**Context.** iced draws with the GPU (wgpu) by default and falls back to
+software (tiny-skia, a Rust port of Skia's CPU renderer) only when the GPU
+cannot start. Measured on beam's idle window (release build, Windows 11):
+GPU 167 MB, software 32 MB. Software only would also drop 52 crates and two
+audit warnings (SECURITY.md, `lru` and `paste`), but leaves no GPU for large
+or high-DPI screens. An old but working GPU never triggers the fallback, so
+an older computer stays on the GPU unless someone sets `ICED_BACKEND`, which
+few people will. Separately, Theme, Zoom and Highlighted answer (Patch #8)
+reset at every start.
+
+### Decision
+
+* **Keep both renderers; the GPU first** with iced's automatic fallback. No
+  dependency change.
+* **Settings → Appearance → Software rendering** ("for older computers"),
+  off by default. iced reads the renderer only from `ICED_BACKEND` before
+  the window opens, and setting a process's own environment is `unsafe` in
+  Rust 2024 (forbidden here). So `main`, before any window, starts beam
+  again with `ICED_BACKEND=tiny-skia` set for the new process only, and the
+  first process exits. The new process carries a marker
+  (`BEAM_GUI_RENDERER`), so it never restarts itself again.
+* **`ICED_BACKEND` set by the person wins**; the setting says so instead.
+* **Restart now** appears while the setting and the running window differ.
+  It closes the window the way its close button does: if a file is moving,
+  "Close beam?" asks first, starting on Stay, and Stay (or closing the
+  question) calls the restart off. If the new beam cannot start, the window
+  stays open and says so.
+* **Preferences are saved in `gui.toml`**, in the beam folder beside
+  `config.toml` (`~/.beam`, or `$BEAM_DIR`): theme, zoom, highlighted
+  answer, software rendering. Not in `config.toml`, which the command line
+  shares; `beam` never reads `gui.toml`. Read and written by
+  `beam_core::gui_prefs` (the GUI keeps to its layers: core, model, iced,
+  rfd), written whole through a temporary file. A missing file is the
+  defaults; a damaged one is reported and the defaults are used.
+* Nothing in `gui.toml` touches a rule: the highlighted answer changes only
+  colours and order, and every question's mark still starts on No (`Ask`).
+
+### Consequences
+
+* The GPU's memory is the default cost; the setting removes it on machines
+  that need it. Checked on Windows: on, the first process exits and the new
+  one draws in software (31 MB); off, beam stays on the GPU (166 MB).
+* Starting in software costs one extra, windowless process start.
+* The `lru` and `paste` audit warnings stay (GPU path), as SECURITY.md says.
+* `toml` is built without its writer in this workspace, so the four keys are
+  written by hand rather than adding that crate.

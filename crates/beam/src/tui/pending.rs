@@ -13,182 +13,94 @@
 
 use std::time::Instant;
 
-use super::app::{Agent, App, Choice, Effect, Key, Modal, Tab, Target};
-use super::inbox::{InboxUpdate, RequestView};
+use super::app::{App, Ask, Choice, Effect, Incoming, Key, Modal, StopMidTransfer, Tab, Target};
+use super::inbox::InboxUpdate;
 use super::receiving::RecvUpdate;
+use beam_model::requests::{Happened, Toggle};
 
-/// A request waiting for an answer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pending {
-    pub id: u64,
-    pub request: RequestView,
-    pub expires: Instant,
-}
-
-/// A transfer the agent is receiving now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Receiving {
-    pub done: u64,
-    pub total: u64,
-    pub relay: bool,
-}
-
-/// Who runs the receiver the Pending tab talks to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Owner {
-    /// The background agent (`beam service start`).
-    #[default]
-    Background,
-    /// This view's Receiving switch.
-    ThisView,
-    /// Another beam view's switch, in another terminal.
-    OtherView,
-}
-
-/// The Receiving switch (ADR-0044).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Switch {
-    #[default]
-    Off,
-    Starting,
-    On,
-    Stopping,
-    /// It stopped by itself, or could not start: why.
-    Failed(String),
-}
-
-/// What turning the switch on would collide with, if anything.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Taken {
-    /// The background agent already receives.
-    Agent,
-    /// Another beam view's switch is on.
-    OtherView,
-    /// `beam listen` runs in another terminal.
-    Listen,
-}
-
-/// How the view stands with the agent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Link {
-    /// Not running, or not tried yet.
-    #[default]
-    Off,
-    Connecting,
-    Connected,
-    /// It was connected and went away, or could not be reached.
-    Lost(String),
-}
+pub use beam_model::requests::{Link, Pending, Switch, Taken};
 
 impl App {
     /// Who else receives for this beam home, which makes the switch moot.
     pub fn receiving_elsewhere(&self) -> Option<Taken> {
-        let mine = matches!(
-            self.switch,
-            Switch::Starting | Switch::On | Switch::Stopping
-        );
-        match (&self.snapshot.agent, self.snapshot.owner) {
-            (Agent::Running { .. } | Agent::Unreadable, Owner::Background) if !mine => {
-                Some(Taken::Agent)
-            }
-            (Agent::Running { .. }, Owner::OtherView) => Some(Taken::OtherView),
-            _ if self.snapshot.listen_elsewhere => Some(Taken::Listen),
-            _ => None,
-        }
+        self.requests.receiving_elsewhere(&self.snapshot)
     }
 
     /// `o`, or a click on the switch.
     pub(super) fn toggle_receiving(&mut self) -> Option<Effect> {
-        match self.switch {
-            Switch::On if self.receiving.is_some() => {
-                self.modal = Some(Modal::ConfirmStop { focus: Choice::No });
+        match self.requests.toggle(&self.snapshot) {
+            Toggle::Start => Some(Effect::StartReceiving),
+            Toggle::Stop => Some(Effect::StopReceiving),
+            Toggle::AskFirst => {
+                self.modal = Some(Modal::ConfirmStop(Ask::new(StopMidTransfer)));
                 None
             }
-            Switch::On => {
-                self.switch = Switch::Stopping;
-                Some(Effect::StopReceiving)
-            }
-            Switch::Starting | Switch::Stopping => None,
-            Switch::Off | Switch::Failed(_) => {
-                if let Some(taken) = self.receiving_elsewhere() {
-                    self.flash = Some(
-                        match taken {
-                            Taken::Agent => {
-                                "The background agent already receives for you. \
-                                 `:service stop` first to receive in this view instead."
-                            }
-                            Taken::OtherView => "Another beam window is already receiving.",
-                            Taken::Listen => {
-                                "`beam listen` is receiving in another terminal. \
-                                 Stop it (Ctrl+C) to receive here."
-                            }
+            Toggle::Busy => None,
+            Toggle::Taken(taken) => {
+                self.flash = Some(
+                    match taken {
+                        Taken::Agent => {
+                            "The background agent already receives for you. \
+                             `:service stop` first to receive in this view instead."
                         }
-                        .to_string(),
-                    );
-                    return None;
-                }
-                self.switch = Switch::Starting;
-                Some(Effect::StartReceiving)
+                        Taken::OtherView => "Another beam window is already receiving.",
+                        Taken::Listen => {
+                            "`beam listen` is receiving in another terminal. \
+                             Stop it (Ctrl+C) to receive here."
+                        }
+                    }
+                    .to_string(),
+                );
+                None
             }
         }
     }
 
     /// The receiver thread moved on.
     pub fn on_switch(&mut self, update: RecvUpdate) {
+        self.requests.on_switch(&update);
         match update {
             RecvUpdate::Started { receive_dir } => {
-                self.switch = Switch::On;
                 self.flash = Some(format!(
                     "Receiving. Friends can send you files while beam is open; they go to {receive_dir}."
                 ));
             }
-            RecvUpdate::Stopped(None) => {
-                self.switch = Switch::Off;
-                self.flash = Some("Receiving is off.".to_string());
-            }
-            RecvUpdate::Stopped(Some(why)) => self.switch = Switch::Failed(why),
+            RecvUpdate::Stopped(None) => self.flash = Some("Receiving is off.".to_string()),
+            RecvUpdate::Stopped(Some(_)) => {}
         }
     }
 
-    pub(super) fn on_confirm_stop_key(&mut self, focus: Choice, key: Key) -> Option<Effect> {
-        let focus = match key {
+    pub(super) fn on_confirm_stop_key(
+        &mut self,
+        mut ask: Ask<StopMidTransfer>,
+        key: Key,
+    ) -> Option<Effect> {
+        match key {
             Key::Esc => return None,
-            Key::Enter if focus == Choice::Yes => {
-                self.switch = Switch::Stopping;
+            Key::Enter if ask.focus() == Choice::Yes => {
+                self.requests.stop();
                 return Some(Effect::StopReceiving);
             }
             Key::Enter => return None,
-            Key::Left | Key::Right | Key::Tab | Key::BackTab => match focus {
-                Choice::Yes => Choice::No,
-                Choice::No => Choice::Yes,
-            },
-            _ => focus,
-        };
-        self.modal = Some(Modal::ConfirmStop { focus });
+            Key::Left | Key::Right | Key::Tab | Key::BackTab => ask.flip(),
+            _ => {}
+        }
+        self.modal = Some(Modal::ConfirmStop(ask));
         None
     }
 
     /// What the agent said.
     pub fn on_inbox(&mut self, update: InboxUpdate) {
-        match update {
-            InboxUpdate::Connected { .. } => self.link = Link::Connected,
-            InboxUpdate::Request {
-                id,
-                request,
-                expires_in,
+        match self.requests.on_update(update, Instant::now()) {
+            Happened::Asked {
+                peer_name,
+                file_name,
             } => {
                 self.flash = Some(format!(
-                    "{} wants to send you {}. Open Pending (2) to answer.",
-                    request.peer_name, request.file_name
+                    "{peer_name} wants to send you {file_name}. Open Pending (2) to answer."
                 ));
-                self.pending.push(Pending {
-                    id,
-                    request,
-                    expires: Instant::now() + expires_in,
-                });
             }
-            InboxUpdate::Closed { id } => {
-                let was_waiting = self.forget_request(id);
+            Happened::Closed { id, was_waiting } => {
                 if was_waiting && self.close_accept(id) {
                     self.flash = Some(
                         "That request closed before you answered (expired, answered in another \
@@ -197,58 +109,31 @@ impl App {
                     );
                 }
             }
-            InboxUpdate::TooLate { .. } => {
+            Happened::TooLate => {
                 self.flash =
                     Some("That request had already closed; your answer did not count.".to_string());
             }
-            InboxUpdate::Progress { done, total, relay } => {
-                self.receiving = Some(Receiving { done, total, relay });
-            }
-            InboxUpdate::Finished { text, .. } => {
-                self.receiving = None;
-                self.flash = Some(text);
-            }
-            InboxUpdate::Gone { reason } => {
-                self.pending.clear();
-                self.receiving = None;
+            Happened::Finished { text } => self.flash = Some(text),
+            Happened::Gone => {
                 if matches!(self.modal, Some(Modal::Accept { .. })) {
                     self.modal = None;
                 }
-                self.link = Link::Lost(reason);
             }
+            Happened::Connected | Happened::Progress => {}
         }
-        self.pending_selected = self
-            .pending_selected
-            .min(self.pending.len().saturating_sub(1));
     }
 
     /// Drops requests whose time ran out, in case the agent's own "closed"
     /// never comes (it was stopped hard).
     pub fn prune_pending(&mut self, now: Instant) {
-        let expired: Vec<u64> = self
-            .pending
-            .iter()
-            .filter(|p| p.expires + std::time::Duration::from_secs(2) < now)
-            .map(|p| p.id)
-            .collect();
-        for id in expired {
-            self.forget_request(id);
+        for id in self.requests.prune(now) {
             self.close_accept(id);
         }
     }
 
-    fn forget_request(&mut self, id: u64) -> bool {
-        let before = self.pending.len();
-        self.pending.retain(|p| p.id != id);
-        self.pending_selected = self
-            .pending_selected
-            .min(self.pending.len().saturating_sub(1));
-        self.pending.len() != before
-    }
-
     /// Closes the Accept pop-up if it is for `id`; whether it was.
     fn close_accept(&mut self, id: u64) -> bool {
-        if matches!(&self.modal, Some(Modal::Accept { id: open, .. }) if *open == id) {
+        if matches!(&self.modal, Some(Modal::Accept(ask)) if ask.question().id == id) {
             self.modal = None;
             return true;
         }
@@ -257,35 +142,32 @@ impl App {
 
     /// Requests from the friend with this fingerprint, oldest first.
     pub fn pending_from(&self, fingerprint: &str) -> Vec<&Pending> {
-        self.pending
-            .iter()
-            .filter(|p| p.request.fingerprint == fingerprint)
-            .collect()
+        self.requests.from(fingerprint)
     }
 
     /// Opens the Accept pop-up for request `index` in `pending`.
     pub(super) fn open_accept(&mut self, index: usize) {
-        if let Some(p) = self.pending.get(index) {
-            self.modal = Some(Modal::Accept {
+        if let Some(p) = self.requests.waiting.get(index) {
+            self.modal = Some(Modal::Accept(Ask::new(Incoming {
                 id: p.id,
                 request: p.request.clone(),
                 expires: p.expires,
-                focus: Choice::No,
-            });
+            })));
         }
     }
 
     /// Enter on the page: answer a request, if there is one to answer here.
     pub(super) fn open_accept_here(&mut self) {
         match self.tab {
-            Tab::Pending => self.open_accept(self.pending_selected),
+            Tab::Pending => self.open_accept(self.requests.selected),
             Tab::Friends => {
                 let Some(friend) = self.selected_friend() else {
                     return;
                 };
                 let fingerprint = friend.fingerprint.clone();
                 if let Some(index) = self
-                    .pending
+                    .requests
+                    .waiting
                     .iter()
                     .position(|p| p.request.fingerprint == fingerprint)
                 {
@@ -298,40 +180,27 @@ impl App {
 
     /// Keys in the Accept pop-up. It was taken out of `self`.
     pub(super) fn on_accept_key(&mut self, modal: Modal, key: Key) -> Option<Effect> {
-        let Modal::Accept {
-            id,
-            request,
-            expires,
-            focus,
-        } = modal
-        else {
+        let Modal::Accept(mut ask) = modal else {
             self.modal = Some(modal);
             return None;
         };
-        let focus = match key {
+        let id = ask.question().id;
+        match key {
             // Later: the request keeps waiting, and expiry is a no.
             Key::Esc => return None,
-            Key::Enter => return self.answer_transfer(id, focus == Choice::Yes),
+            Key::Enter => return self.answer_transfer(id, ask.focus() == Choice::Yes),
             Key::Char('d' | 'n') => return self.answer_transfer(id, false),
-            Key::Left | Key::Right | Key::Tab | Key::BackTab => match focus {
-                Choice::Yes => Choice::No,
-                Choice::No => Choice::Yes,
-            },
-            _ => focus,
-        };
-        self.modal = Some(Modal::Accept {
-            id,
-            request,
-            expires,
-            focus,
-        });
+            Key::Left | Key::Right | Key::Tab | Key::BackTab => ask.flip(),
+            _ => {}
+        }
+        self.modal = Some(Modal::Accept(ask));
         None
     }
 
     pub(super) fn on_accept_click(&mut self, modal: Modal, hit: Option<Target>) -> Option<Effect> {
         match (&modal, hit) {
-            (Modal::Accept { id, .. }, Some(Target::Button(answer))) => {
-                self.answer_transfer(*id, answer == Choice::Yes)
+            (Modal::Accept(ask), Some(Target::Button(answer))) => {
+                self.answer_transfer(ask.question().id, answer == Choice::Yes)
             }
             _ => {
                 self.modal = Some(modal);
@@ -343,7 +212,7 @@ impl App {
     fn answer_transfer(&mut self, id: u64, accept: bool) -> Option<Effect> {
         // Gone from the list at once, so it cannot be answered twice here.
         // The agent has the last word: a late answer comes back TooLate.
-        self.forget_request(id);
+        self.requests.answered(id);
         self.modal = None;
         Some(Effect::AnswerTransfer { id, accept })
     }
@@ -354,7 +223,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::tui::app::{Agent, Snapshot};
+    use crate::tui::app::{Agent, Owner, Snapshot};
+    use crate::tui::inbox::RequestView;
+    use beam_model::requests::Receiving;
 
     fn app() -> App {
         App::new(Snapshot {
@@ -387,7 +258,7 @@ mod tests {
     fn a_request_is_listed_and_announced_but_opens_nothing_by_itself() {
         let mut app = app();
         app.on_inbox(request(7, "alice"));
-        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.requests.waiting.len(), 1);
         assert!(app.modal.is_none(), "no pop-up steals keys");
         assert!(
             app.flash
@@ -404,11 +275,8 @@ mod tests {
         app.tab = Tab::Pending;
         app.on_key(Key::Enter);
         assert!(matches!(
-            app.modal,
-            Some(Modal::Accept {
-                focus: Choice::No,
-                ..
-            })
+            &app.modal,
+            Some(Modal::Accept(ask)) if ask.focus() == Choice::No
         ));
         assert_eq!(
             app.on_key(Key::Enter),
@@ -418,7 +286,7 @@ mod tests {
             }),
             "Enter alone declines"
         );
-        assert!(app.pending.is_empty());
+        assert!(app.requests.waiting.is_empty());
     }
 
     #[test]
@@ -445,7 +313,7 @@ mod tests {
         app.on_key(Key::Enter);
         assert_eq!(app.on_key(Key::Esc), None);
         assert!(app.modal.is_none());
-        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.requests.waiting.len(), 1);
     }
 
     #[test]
@@ -463,8 +331,8 @@ mod tests {
                 .unwrap()
                 .contains("closed before you answered")
         );
-        assert_eq!(app.pending.len(), 1);
-        assert_eq!(app.pending[0].id, 8);
+        assert_eq!(app.requests.waiting.len(), 1);
+        assert_eq!(app.requests.waiting[0].id, 8);
     }
 
     #[test]
@@ -475,51 +343,54 @@ mod tests {
             total: 2,
             relay: true,
         });
-        assert!(app.receiving.is_some());
+        assert!(app.requests.receiving.is_some());
         app.on_inbox(InboxUpdate::Finished {
             ok: true,
             text: "Saved report.pdf".into(),
         });
-        assert!(app.receiving.is_none());
+        assert!(app.requests.receiving.is_none());
         assert_eq!(app.flash.as_deref(), Some("Saved report.pdf"));
 
         app.on_inbox(request(9, "alice"));
         app.on_inbox(InboxUpdate::Gone {
             reason: "stopped".into(),
         });
-        assert!(app.pending.is_empty());
-        assert_eq!(app.link, Link::Lost("stopped".into()));
+        assert!(app.requests.waiting.is_empty());
+        assert_eq!(app.requests.link, Link::Lost("stopped".into()));
     }
 
     #[test]
     fn the_switch_turns_on_and_off_and_says_so() {
         let mut app = app();
         assert_eq!(app.on_key(Key::Char('o')), Some(Effect::StartReceiving));
-        assert_eq!(app.switch, Switch::Starting);
+        assert_eq!(app.requests.switch, Switch::Starting);
         assert_eq!(app.on_key(Key::Char('o')), None, "nothing while starting");
         app.on_switch(RecvUpdate::Started {
             receive_dir: "D:/Downloads".into(),
         });
-        assert_eq!(app.switch, Switch::On);
+        assert_eq!(app.requests.switch, Switch::On);
         assert!(app.flash.as_deref().unwrap().contains("D:/Downloads"));
         assert_eq!(app.on_key(Key::Char('o')), Some(Effect::StopReceiving));
         app.on_switch(RecvUpdate::Stopped(None));
-        assert_eq!(app.switch, Switch::Off);
+        assert_eq!(app.requests.switch, Switch::Off);
     }
 
     #[test]
     fn turning_off_mid_transfer_asks_first_and_no_is_the_default() {
         let mut app = app();
-        app.switch = Switch::On;
-        app.receiving = Some(Receiving {
+        app.requests.switch = Switch::On;
+        app.requests.receiving = Some(Receiving {
             done: 1,
             total: 2,
             relay: false,
         });
         assert_eq!(app.on_key(Key::Char('o')), None);
-        assert_eq!(app.modal, Some(Modal::ConfirmStop { focus: Choice::No }));
+        assert_eq!(
+            app.modal,
+            Some(Modal::ConfirmStop(Ask::new(StopMidTransfer)))
+        );
         assert_eq!(app.on_key(Key::Enter), None, "Enter alone keeps receiving");
-        assert_eq!(app.switch, Switch::On);
+        assert_eq!(app.requests.switch, Switch::On);
         app.on_key(Key::Char('o'));
         app.on_key(Key::Left);
         assert_eq!(app.on_key(Key::Enter), Some(Effect::StopReceiving));
@@ -547,15 +418,20 @@ mod tests {
     #[test]
     fn leaving_while_a_file_arrives_asks_first() {
         let mut app = app();
-        app.switch = Switch::On;
-        app.receiving = Some(Receiving {
+        app.requests.switch = Switch::On;
+        app.requests.receiving = Some(Receiving {
             done: 1,
             total: 2,
             relay: false,
         });
         app.on_key(Key::Quit);
         assert!(!app.quit);
-        assert_eq!(app.modal, Some(Modal::ConfirmQuit { focus: Choice::No }));
+        assert_eq!(
+            app.modal,
+            Some(Modal::ConfirmQuit(Ask::new(
+                crate::tui::app::LeaveMidTransfer
+            )))
+        );
     }
 
     #[test]
@@ -563,7 +439,7 @@ mod tests {
         let mut app = app();
         app.on_key(Key::Char('o'));
         app.on_switch(RecvUpdate::Stopped(Some("port in use".into())));
-        assert_eq!(app.switch, Switch::Failed("port in use".into()));
+        assert_eq!(app.requests.switch, Switch::Failed("port in use".into()));
         assert_eq!(
             app.on_key(Key::Char('o')),
             Some(Effect::StartReceiving),
@@ -576,6 +452,6 @@ mod tests {
         let mut app = app();
         app.on_inbox(request(7, "alice"));
         app.prune_pending(Instant::now() + Duration::from_secs(400));
-        assert!(app.pending.is_empty());
+        assert!(app.requests.waiting.is_empty());
     }
 }

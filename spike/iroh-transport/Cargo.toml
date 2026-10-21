@@ -9,9 +9,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# The real engine, unmodified. If this prototype works, it works because the
-# transport trait is honest about being just AsyncRead + AsyncWrite.
-beam = { path = "../../crates/beam" }
+# The real engine (now in beam-core), unmodified. If this prototype works,
+# it works because the transport trait is honest about being just
+# AsyncRead + AsyncWrite.
+beam-core = { path = "../../crates/beam-core" }
 iroh = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs"] }
 anyhow = "1"
