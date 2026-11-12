@@ -372,20 +372,22 @@ impl Reporter for Log {
     }
 }
 
-/// Runs a real transfer whose final verification takes about a second,
-/// against a sender whose stall timeout is 300 ms.
+/// Runs a real transfer whose final verification takes about 4.8 s, against a
+/// sender whose stall timeout is 1.5 s. The times are generous on purpose: the
+/// stall timeout covers the whole transfer, and with 300 ms a busy CI runner
+/// sometimes acknowledged a chunk late and stalled before verification began.
 async fn slow_verification(
     keepalive_every: Duration,
 ) -> (Result<(), TransferError>, Vec<Progress>) {
     let s = setup();
-    // 12 MiB, so verification reads 12 blocks, each followed by a 80 ms pause.
+    // 12 MiB, so verification reads 12 blocks, each followed by a 400 ms pause.
     let bytes: Vec<u8> = (0..12 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let path = s.files.join("big.bin");
     std::fs::write(&path, &bytes).unwrap();
 
     let (mut client, server) = duplex(1024 * 1024);
     let mut send_options = SendOptions::new(&path, encode_public_key(&s.sender.verifying_key()));
-    send_options.stall_timeout = Duration::from_millis(300);
+    send_options.stall_timeout = Duration::from_millis(1500);
     let sending = tokio::spawn(async move {
         let mut log = Log::default();
         let result = send_file(&mut client, &send_options, &mut log).await;
@@ -393,8 +395,8 @@ async fn slow_verification(
     });
 
     let mut options = s.options.clone();
-    options.stall_timeout = Duration::from_secs(5);
-    options.verify_pause = Duration::from_millis(80);
+    options.stall_timeout = Duration::from_secs(20);
+    options.verify_pause = Duration::from_millis(400);
     options.keepalive_every = keepalive_every;
     let _ = receive_file(
         server,
