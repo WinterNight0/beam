@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=beam
+GenericName=File Transfer
+Comment=Send files straight to the people you pair with
+Exec=beam-gui
+Icon=beam-gui
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=send;receive;file;transfer;p2p;
+StartupWMClass=beam-gui

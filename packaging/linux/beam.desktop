@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=beam (terminal)
+GenericName=File Transfer
+Comment=beam's full-screen view in a terminal
+Exec=beam
+Icon=beam
+Terminal=true
+Categories=Network;FileTransfer;ConsoleOnly;
+Keywords=send;receive;file;transfer;p2p;

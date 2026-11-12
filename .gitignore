@@ -1,0 +1,41 @@
+# build output
+/target/
+*.pdb
+
+# local beam state accidentally created in the repo
+/.beam/
+/.beam-test/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# spike crates build into their own target directories
+/spike/*/target/
+/spike/*/*/target/
+
+# The GUI spike and mockups (SPIKE-002) are the GUI's local testing ground.
+# Files already committed stay tracked until the GUI is usable; then they
+# are removed from the repository (`git rm -r --cached spike/gui-iced`) and
+# kept on disk. New files there are never picked up (ADR-0049).
+/spike/gui-iced/
+
+# beam homes created inside the repo while testing (e.g. --beam-dir ./alice).
+# These hold private keys and peer lists; they must never be committed.
+id_ed25519
+id_ed25519.pub
+known_peers
+listen.json
+listen.lock
+agent.json
+agent.lock
+agent.log
+history.jsonl
+history.lock
+*.pem
+
+# local secrets
+.env
+.env.*

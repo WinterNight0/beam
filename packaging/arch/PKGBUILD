@@ -1,0 +1,79 @@
+# Maintainer: WinterNight0 <https://github.com/WinterNight0>
+#
+# beam for Arch Linux, built from the tagged source (ADR-0058). Two packages
+# from one build, so the desktop window stays optional as in the Windows
+# wizard (ADR-0056):
+#   beam      the command line and the full-screen view
+#   beam-gui  the desktop window; it needs beam beside it for the background
+#             agent settings, as the wizard always installs the command line
+#
+# This file is the source of the AUR package, not yet published: new AUR
+# account registration is temporarily closed (ADR-0058). Until then, run
+# `makepkg -si` here. At each release: set pkgver, reset pkgrel to 1, and run
+# `updpkgsums` once the release's tag is public.
+
+pkgbase=beam
+pkgname=(beam beam-gui)
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Identity-based peer-to-peer file transfer: you accept every file'
+arch=('x86_64')
+url='https://github.com/WinterNight0/beam'
+license=('LicenseRef-PolyForm-Strict-1.0.0' 'MIT')
+makedepends=('cargo')
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+options=('!lto')
+
+prepare() {
+    cd "$pkgbase-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgbase-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p beam -p beam-gui
+}
+
+check() {
+    cd "$pkgbase-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    # The core's unit tests: quick, and no network. The full suite runs in CI.
+    cargo test --frozen --release -p beam-core --lib
+}
+
+# Installs one program with its menu entry, icons and licences.
+_install_program() {
+    local name=$1
+    install -Dm755 "target/release/$name" "$pkgdir/usr/bin/$name"
+    install -Dm644 "packaging/linux/$name.desktop" "$pkgdir/usr/share/applications/$name.desktop"
+    local size
+    for size in 48x48 128x128 256x256; do
+        install -Dm644 "packaging/linux/icons/hicolor/$size/apps/$name.png" \
+            "$pkgdir/usr/share/icons/hicolor/$size/apps/$name.png"
+    done
+    install -Dm644 LICENSE.md "$pkgdir/usr/share/licenses/$name/LICENSE.md"
+    install -Dm644 crates/beam-core/LICENSE "$pkgdir/usr/share/licenses/$name/beam-core-MIT.txt"
+    install -Dm644 crates/beam-model/LICENSE "$pkgdir/usr/share/licenses/$name/beam-model-MIT.txt"
+}
+
+package_beam() {
+    pkgdesc='Identity-based peer-to-peer file transfer: command line and full-screen view'
+    depends=('gcc-libs' 'glibc')
+    cd "$pkgbase-$pkgver"
+    _install_program beam
+}
+
+package_beam-gui() {
+    pkgdesc='Identity-based peer-to-peer file transfer: desktop window'
+    depends=("beam=$pkgver" 'gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr')
+    optdepends=('vulkan-icd-loader: hardware-accelerated drawing'
+                'xdg-desktop-portal: the file and folder pickers')
+    cd "$pkgbase-$pkgver"
+    _install_program beam-gui
+    install -Dm644 crates/beam-gui/assets/LICENSES/* -t "$pkgdir/usr/share/licenses/beam-gui/"
+}

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>beam: third-party licences</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { white-space: pre-wrap; font-size: 13px; padding: 1rem; border: 1px solid #8884; border-radius: 6px; }
+  li { margin: 0.1rem 0; }
+  h2 { margin-top: 2.5rem; }
+</style>
+</head>
+<body>
+<h1>Third-party licences</h1>
+<p>beam is built with the open-source crates listed below. Each is used
+unmodified; its source is on crates.io at the link next to its name. beam's
+own licence is in <code>LICENSE.md</code>, and the bundled fonts and icons are
+in <code>licenses/</code>.</p>
+
+<h2>By licence</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+
+{{#each licenses}}
+<h2 id="{{id}}">{{name}}</h2>
+<p>Used by:</p>
+<ul>
+{{#each used_by}}
+  <li><a href="https://crates.io/crates/{{crate.name}}/{{crate.version}}">{{crate.name}} {{crate.version}}</a></li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+{{/each}}
+</body>
+</html>
