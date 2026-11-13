@@ -67,5 +67,15 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 
+# Debug and test builds (`cargo test` uses this profile too). Full debug info
+# made target/ grow past 100 GB; panics and backtraces still show file and
+# line with these settings, a debugger shows no variables. ADR-0059.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies: no debug info at all.
+debug = false
+
 [profile.release]
 strip = true

@@ -3164,3 +3164,36 @@ repository was in.
   reopens, the README has Arch users run `makepkg` in `packaging/arch` of a
   checkout, which builds the same packages. Publishing them is on the roadmap
   (*Now*).
+
+## ADR-0059 — Smaller debug builds
+
+**Status:** accepted (2026-11-13), 0.2.0.
+
+**Context.** The `target` folder of a working copy reached 102 GB. Most of it
+was debug output: Windows `.pdb` debug files alone were 21 GB, because every
+one of the roughly 700 crates was built with full debug info, and each test
+program carried its own copy. Cargo never deletes old builds, so each change
+added more: there were 377 builds of the `resume` test alone. Nobody on the team runs beam under a
+debugger; failures are read from test output and panic messages, which need
+file names and line numbers, not variable values.
+
+### Decision
+
+* **beam's own crates** build in debug and test mode with
+  `debug = "line-tables-only"`: panics and backtraces keep their file and
+  line, a debugger can no longer show variables.
+* **Dependencies** build with no debug info (`debug = false` under
+  `[profile.dev.package."*"]`).
+* **Incremental builds stay on**, so a small edit still rebuilds in seconds.
+* Release builds are unchanged (`strip = true`), and so is what CI checks.
+* Old builds are cleared by hand with `cargo clean`: after a Rust update,
+  after a release, or when `target` passes about 30 GB. A tool that does this
+  by age (`cargo-sweep`) can be looked at later if that becomes a chore.
+
+### Consequences
+
+* Debug output is much smaller, and linking test programs is a little faster.
+* To step through code with variables, a developer sets `debug = true` for
+  that session (for example `CARGO_PROFILE_DEV_DEBUG=true`) and gets the full
+  debug info back for that build only.
+* The first build after the change rebuilds everything once.
